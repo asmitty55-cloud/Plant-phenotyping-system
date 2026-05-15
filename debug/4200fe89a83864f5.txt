@@ -1,0 +1,4 @@
+[2026-05-15 13:23:18] Starting interrogation (APK-based)
+Triggering test capture: interrogate_1778860400.jpg
+[2026-05-15 13:23:37] Capture signal successful.
+[2026-05-15 13:23:37] Verified test file in /sdcard/PTCaptures

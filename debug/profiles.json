@@ -1,0 +1,22 @@
+{
+    "0123456789ABCDEF": {
+        "device_id": "0123456789ABCDEF",
+        "save_folder": "/sdcard/PTCaptures",
+        "extension": "jpg",
+        "delay": 5.0,
+        "sd_card": false,
+        "ok_required": false,
+        "ok_button_coords": null,
+        "shutter_success": true
+    },
+    "4200fe89a83864f5": {
+        "device_id": "4200fe89a83864f5",
+        "save_folder": "/sdcard/PTCaptures",
+        "extension": "jpg",
+        "delay": 5.0,
+        "sd_card": false,
+        "ok_required": false,
+        "ok_button_coords": null,
+        "shutter_success": true
+    }
+}
