@@ -1,15 +1,16 @@
-from pt.core.capture import capture_images
-from pt.core.processing import preprocess
-from pt.core.analysis import analyze
+"""CLI wrapper for the plant phenotyping pipeline."""
 
-def main():
-    print("Starting phenotyping pipeline...")
+import os
+import sys
 
-    frames = capture_images()
-    processed = preprocess(frames)
-    results = analyze(processed)
 
-    print("Done:", results)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from pt.pipeline.run_pipeline import main
+
 
 if __name__ == "__main__":
     main()

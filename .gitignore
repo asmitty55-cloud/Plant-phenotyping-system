@@ -1,30 +1,76 @@
+# =========================
 # Python
+# =========================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
+env/
 
-# data (CRITICAL)
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# =========================
+# Runtime outputs (pipeline-generated)
+# =========================
 data/
 datasets/
 videos/
 captures/
+images/
 output/
 analysis_debug/
+debug/
 cache/
+tmp/
 
-# binaries
-bin/
-*.exe
-*.apk
-*.mp4
+*.log
 *.db
 *.sqlite
 
-# IDE
-.vscode/
-.idea/
+# =========================
+# ML artifacts
+# =========================
+*.pt
+*.pth
+*.onnx
+*.h5
+*.joblib
 
-# OS
-Thumbs.db
-.DS_Store
+# =========================
+# Device / build artifacts
+# =========================
+bin/
+*.exe
+*.apk
+*.idsig
+
+# explicit app artifacts
+ptcapture.apk
+ptcapture.apk.idsig
+
+# =========================
+# Pipeline outputs
+# =========================
+plant_stats.json
+output-metadata.json
+
+# =========================
+# local experiment overrides
+# =========================
+.env
+*.local.yaml

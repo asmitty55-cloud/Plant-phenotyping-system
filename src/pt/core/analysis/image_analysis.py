@@ -3,7 +3,8 @@ import numpy as np
 import os
 import json
 import time
-from scripts.path_utils import get_data_root
+from pt.core.utils.path_utils import get_data_root
+from pt.core.analysis.metrics import build_metrics_snapshot
 
 # Common ArUco dictionaries to check
 DICTIONARIES = {
@@ -249,7 +250,14 @@ def process_latest_captures(captures_dir):
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "filename": files[-1],
                 "data": results,
-                "growth_rate_mm2_hr": growth_rate
+                "growth_rate_mm2_hr": growth_rate,
+                "metrics": build_metrics_snapshot(
+                    plant_id=device_id,
+                    device_id=device_id,
+                    filename=files[-1],
+                    analysis=results,
+                    growth_rate_mm2_hr=growth_rate,
+                )
             })
 
             if not history or history[-1]["filename"] != files[-1]:

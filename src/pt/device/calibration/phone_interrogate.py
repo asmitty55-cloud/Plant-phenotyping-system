@@ -1,8 +1,8 @@
 import subprocess
 import time
 import os
-from scripts.phone_logger import PhoneLogger
-import capture
+from pt.device.calibration.phone_logger import PhoneLogger
+from pt.device.capture_service import capture
 
 def run_adb(cmd):
     """Run an ADB command and return stdout, stderr."""

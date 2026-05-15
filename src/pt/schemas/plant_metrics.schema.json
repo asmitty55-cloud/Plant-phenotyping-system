@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plant-phenotyping-system.local/schemas/plant_metrics.schema.json",
+  "title": "Plant Metrics Snapshot",
+  "type": "object",
+  "required": ["schema_version", "plant_id", "captured_at", "growth", "stress", "circadian"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "plant_metrics.v1"
+    },
+    "plant_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_image": {
+      "type": "string"
+    },
+    "growth": {
+      "type": "object",
+      "required": ["canopy_area_mm2", "growth_rate_mm2_hr"],
+      "additionalProperties": false,
+      "properties": {
+        "canopy_area_mm2": {"type": "number", "minimum": 0},
+        "growth_rate_mm2_hr": {"type": "number"},
+        "scale_px_per_mm": {"type": ["number", "null"], "minimum": 0},
+        "height_mm": {"type": ["number", "null"], "minimum": 0},
+        "leaf_count": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "stress": {
+      "type": "object",
+      "required": ["score", "signals"],
+      "additionalProperties": false,
+      "properties": {
+        "score": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "signals": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "chlorosis_ratio": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "necrosis_ratio": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "wilting_index": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "color_shift_index": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+          }
+        }
+      }
+    },
+    "circadian": {
+      "type": "object",
+      "required": ["phase_hour", "amplitude", "period_hours"],
+      "additionalProperties": false,
+      "properties": {
+        "phase_hour": {"type": ["number", "null"], "minimum": 0, "maximum": 24},
+        "amplitude": {"type": ["number", "null"], "minimum": 0},
+        "period_hours": {"type": ["number", "null"], "minimum": 0},
+        "light_cycle": {"type": ["string", "null"]}
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "markers_found": {"type": "integer", "minimum": 0},
+        "marker_dictionary": {"type": ["string", "null"]},
+        "analysis_method": {"type": ["string", "null"]},
+        "debug_image": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

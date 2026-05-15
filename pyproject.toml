@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plant-phenotyping-system"
+version = "0.1.0"
+description = "Plant phenotyping capture and analysis system"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=2.0.0",
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "pandas",
+    "pyyaml",
+    "scikit-image",
+    "scipy",
+]
+
+[project.scripts]
+pt-dashboard = "pt.api.app:run_app"
+pt-run-pipeline = "pt.pipeline.run_pipeline:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pt*"]

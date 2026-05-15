@@ -4,7 +4,7 @@ import os
 import threading
 from datetime import datetime
 import json
-from scripts.path_utils import get_images_dir
+from pt.core.utils.path_utils import get_images_dir
 
 ADB = "adb"
 REMOTE_DIR = "/sdcard/PTCaptures"
@@ -30,7 +30,14 @@ def resolve_apk_path():
     print("WARNING: No APK found in default locations. Please place ptcapture.apk in C:\\Program Files\\pt or set PT_CAPTURE_APK.")
     return APK_CANDIDATES[0]
 
-APK_PATH = resolve_apk_path()
+APK_PATH = None
+
+
+def get_apk_path():
+    global APK_PATH
+    if APK_PATH is None:
+        APK_PATH = resolve_apk_path()
+    return APK_PATH
 
 os.makedirs(LOCAL_DIR, exist_ok=True)
 
@@ -56,8 +63,9 @@ def is_installed(device):
     return "com.pt.capture" in out
 
 def install_apk(device):
-    if not os.path.exists(APK_PATH):
-        print(f"ERROR: APK not found at {APK_PATH}")
+    apk_path = get_apk_path()
+    if not os.path.exists(apk_path):
+        print(f"ERROR: APK not found at {apk_path}")
         return False
 
     print(f"Applying bulletproof automation settings to {device}...")
@@ -81,7 +89,7 @@ def install_apk(device):
     # -t: allow test packages
     # -g: grant all runtime permissions (essential for Camera/Storage)
     # -d: allow version code downgrade
-    out, err = adb(["install", "-r", "-t", "-g", "-d", APK_PATH], device)
+    out, err = adb(["install", "-r", "-t", "-g", "-d", apk_path], device)
 
     if "Success" in out:
         print(f"APK installed successfully on {device}")
@@ -89,7 +97,7 @@ def install_apk(device):
     else:
         # Fallback for older devices (Pre-Android 6.0 or limited shells)
         print(f"Aggressive install failed, trying legacy fallback...")
-        out2, err2 = adb(["install", "-r", "-t", APK_PATH], device)
+        out2, err2 = adb(["install", "-r", "-t", apk_path], device)
         # Manually grant permissions for older devices
         adb(["shell", "pm", "grant", "com.pt.capture", "android.permission.CAMERA"], device)
         adb(["shell", "pm", "grant", "com.pt.capture", "android.permission.WRITE_EXTERNAL_STORAGE"], device)
@@ -101,6 +109,12 @@ def install_apk(device):
             print(f"APK install failed on {device}: {out} {err} / {out2} {err2}")
             return False
 
+
+def ensure_installed(device):
+    if is_installed(device):
+        return True
+    return install_apk(device)
+
 def uninstall_apk(device):
     print(f"Uninstalling old APK from {device}...")
     adb(["uninstall", "com.pt.capture"], device)
@@ -111,22 +125,12 @@ def uninstall_apk(device):
 def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso=-1):
     """Capture photo on single device using custom APK with advanced options"""
     try:
-        # 0. Ensure device stays offline and automation-friendly every time
-        adb(["shell", "svc", "wifi", "disable"], device)
-        adb(["shell", "svc", "data", "disable"], device)
-        adb(["shell", "settings", "put", "global", "verifier_verify_adb_installs", "0"], device)
-
         # 1. Force stop app to prevent "Fail to connect to camera"
         adb(["shell", "am", "force-stop", "com.pt.capture"], device)
 
-        # 2. Ensure APK is installed and permissions are granted
-        if not is_installed(device):
-            if not install_apk(device):
-                return False
-
-        # Manually grant permissions to be safe
-        adb(["shell", "pm", "grant", "com.pt.capture", "android.permission.CAMERA"], device)
-        adb(["shell", "pm", "grant", "com.pt.capture", "android.permission.WRITE_EXTERNAL_STORAGE"], device)
+        # 2. Installation and automation settings are setup work, not per-capture work.
+        if not ensure_installed(device):
+            return False
 
         # 3. Create remote directory
         adb(["shell", "mkdir", "-p", REMOTE_DIR], device)

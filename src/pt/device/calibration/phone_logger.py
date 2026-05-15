@@ -1,7 +1,7 @@
 import errno
 import os
 import time
-from scripts.path_utils import get_debug_dir, get_user_data_root
+from pt.core.utils.path_utils import get_debug_dir, get_user_data_root
 
 class PhoneLogger:
     def __init__(self, device_id):

@@ -2,6 +2,13 @@ import os
 import tempfile
 
 
+def _env_data_root():
+    value = os.getenv("PT_DATA_ROOT")
+    if value:
+        return os.path.abspath(os.path.expanduser(value))
+    return None
+
+
 def _is_writable_dir(path):
     try:
         os.makedirs(path, exist_ok=True)
@@ -15,7 +22,11 @@ def _is_writable_dir(path):
 
 
 def get_default_app_root():
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_root = _env_data_root()
+    if env_root:
+        return env_root
+
+    return get_user_data_root()
 
 
 def get_data_root(app_name="pt"):
