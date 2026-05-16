@@ -34,7 +34,7 @@ app = Flask(__name__)
 phone_profiles = {}
 last_capture = {}
 timelapse_running = True # Auto-start
-timelapse_interval = 120
+timelapse_interval = 180 # Increased from 120 for legacy hardware stability
 interrogation_in_progress = set()
 device_locks = {}
 

@@ -17,7 +17,7 @@ if exist com rd /s /q com
 
 REM Compile Java
 echo Compiling Java source...
-javac -d . -cp ".;%ANDROID_HOME%\platforms\%PLATFORM%\android.jar" ..\CaptureActivity.java
+javac -source 8 -target 8 -d . -cp ".;%ANDROID_HOME%\platforms\%PLATFORM%\android.jar" ..\src\pt\device\android\CaptureActivity.java
 if %errorlevel% neq 0 (
     echo ERROR: Java compilation failed
     cd ..
@@ -45,15 +45,14 @@ mkdir res\values
 echo ^<?xml version="1.0" encoding="utf-8"?^>^<resources^>^<string name="app_name"^>PT Capture^</string^>^</resources^> > res\values\strings.xml
 
 REM Package resources
-aapt package -f -M ..\AndroidManifest.xml -S res -I "%ANDROID_HOME%\platforms\%PLATFORM%\android.jar" -F PTCapture.unsigned.apk
+aapt package -f -M ..\src\pt\device\android\AndroidManifest.xml -S res -I "%ANDROID_HOME%\platforms\%PLATFORM%\android.jar" -F PTCapture.unsigned.apk
 
 REM Add classes.dex
 aapt add PTCapture.unsigned.apk classes.dex
 
 REM Sign APK (debug key)
 echo Signing APK...
-REM jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA256 -keystore "%USERPROFILE%\.android\debug.keystore" -storepass android PTCapture.unsigned.apk androiddebugkey
-call apksigner sign --ks "%USERPROFILE%\.android\debug.keystore" --ks-pass pass:android --out ..\ptcapture.apk PTCapture.unsigned.apk
+call apksigner sign --ks "%USERPROFILE%\.android\debug.keystore" --ks-pass pass:android --min-sdk-version 19 --out ..\ptcapture.apk PTCapture.unsigned.apk
 
 
 cd ..

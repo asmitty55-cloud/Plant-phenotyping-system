@@ -12,6 +12,7 @@ import android.view.SurfaceHolder;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.os.StatFs;
 import java.io.File;
 import java.io.FileOutputStream;
 
@@ -24,6 +25,26 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
     private boolean mCaptureStarted = false;
     private boolean mIsResumed = false;
     private boolean mSurfaceCreated = false;
+
+    private long getAvailableStorage() {
+        try {
+            File path = Environment.getExternalStorageDirectory();
+            StatFs stat = new StatFs(path.getPath());
+            long blockSize, availableBlocks;
+            
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                blockSize = stat.getBlockSizeLong();
+                availableBlocks = stat.getAvailableBlocksLong();
+            } else {
+                blockSize = (long) stat.getBlockSize();
+                availableBlocks = (long) stat.getAvailableBlocks();
+            }
+            return availableBlocks * blockSize;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to check storage: " + e.getMessage());
+            return -1;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -89,6 +110,13 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
 
     private void runCapture() {
         try {
+            long available = getAvailableStorage();
+            if (available != -1 && available < 10 * 1024 * 1024) { // 10MB threshold
+                Log.e(TAG, "CRITICAL: Storage Low (" + (available / (1024 * 1024)) + " MB)");
+                safeFinish();
+                return;
+            }
+
             Log.i(TAG, "Opening camera...");
             mCamera = Camera.open(0);
             mCamera.setPreviewDisplay(mHolder);

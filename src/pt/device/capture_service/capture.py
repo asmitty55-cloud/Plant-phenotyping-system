@@ -136,21 +136,19 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
         adb(["shell", "mkdir", "-p", REMOTE_DIR], device)
 
         # 4. Launch capture activity
-        print(f"Starting {mode} capture on {device} (delay=5000ms)...")
+        print(f"Starting {mode} capture on {device} (delay={delay}ms)...")
 
         cmd = ["shell", "am", "start", "-n", "com.pt.capture/.CaptureActivity",
                "--es", "name", filename,
                "--es", "mode", mode,
-               "--ei", "delay", "5000"] # Increased delay for stabilization
+               "--ei", "delay", str(delay)]
 
+        # Clear logcat before starting to avoid reading old completion signals
+        adb(["logcat", "-c"], device)
         adb(cmd, device)
 
         # 5. Wait for logcat signal
         return wait_for_capture_complete(device, filename)
-
-    except Exception as e:
-        print(f"Error capturing on {device}: {e}")
-        return False
 
     except Exception as e:
         print(f"Error capturing on {device}: {e}")
