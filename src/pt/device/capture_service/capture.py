@@ -138,6 +138,12 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
         # 4. Launch capture activity
         print(f"Starting {mode} capture on {device} (delay={delay}ms)...")
 
+        # Wake up device and dismiss keyguard if possible (best effort for automation)
+        adb(["shell", "input", "keyevent", "WAKEUP"], device)
+        adb(["shell", "input", "keyevent", "82"], device) # MENU/Unlock
+        # Horizontal swipe often unlocks many older/stock Android lockscreens
+        adb(["shell", "input", "swipe", "200", "800", "800", "800"], device)
+
         cmd = ["shell", "am", "start", "-n", "com.pt.capture/.CaptureActivity",
                "--es", "name", filename,
                "--es", "mode", mode,
