@@ -14,7 +14,20 @@ DICTIONARIES = {
     "APRILTAG_36h11": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 }
 
-MARKER_SIZE_MM = 60.0
+CHARUCO_WALL_TARGET = {
+    "name": "back_wall_charuco_letter_8_5x11",
+    "squares_x": 3,
+    "squares_y": 5,
+    "square_size_mm": 51.28,
+    "marker_size_mm": 41.18,
+    "dictionary": "4X4_50",
+}
+
+MARKER_SIZE_MM = CHARUCO_WALL_TARGET["marker_size_mm"]
+
+
+def is_capture_image(filename):
+    return filename.startswith("capture_") and filename.lower().endswith((".jpg", ".jpeg", ".png"))
 
 def get_detector_params():
     params = cv2.aruco.DetectorParameters()
@@ -36,33 +49,243 @@ def try_detect(img, dict_name, aruco_dict, params):
     corners, ids, rejected = detector.detectMarkers(img)
     return corners, ids
 
-def calculate_plant_area(frame, px_per_mm):
-    """
-    Isolates green pixels across a wide variety of shades (light to dark)
-    and calculates area in mm^2.
-    """
+
+def get_charuco_board():
+    return cv2.aruco.CharucoBoard(
+        (CHARUCO_WALL_TARGET["squares_x"], CHARUCO_WALL_TARGET["squares_y"]),
+        CHARUCO_WALL_TARGET["square_size_mm"],
+        CHARUCO_WALL_TARGET["marker_size_mm"],
+        DICTIONARIES[CHARUCO_WALL_TARGET["dictionary"]],
+    )
+
+
+def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids):
+    if charuco_corners is None or charuco_ids is None or len(charuco_ids) < 2:
+        return None
+
+    points_by_id = {
+        int(charuco_ids[i][0]): charuco_corners[i][0]
+        for i in range(len(charuco_ids))
+    }
+    squares_x = CHARUCO_WALL_TARGET["squares_x"]
+    square_size_mm = CHARUCO_WALL_TARGET["square_size_mm"]
+    scales = []
+
+    for corner_id, point in points_by_id.items():
+        right_id = corner_id + 1
+        below_id = corner_id + (squares_x - 1)
+        if right_id in points_by_id and corner_id // (squares_x - 1) == right_id // (squares_x - 1):
+            scales.append(float(np.linalg.norm(point - points_by_id[right_id]) / square_size_mm))
+        if below_id in points_by_id:
+            scales.append(float(np.linalg.norm(point - points_by_id[below_id]) / square_size_mm))
+
+    return float(np.mean(scales)) if scales else None
+
+
+def detect_charuco_target(gray, params):
+    dictionary_name = CHARUCO_WALL_TARGET["dictionary"]
+    aruco_dict = DICTIONARIES[dictionary_name]
+    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+    marker_corners, marker_ids, _ = detector.detectMarkers(gray)
+    if marker_ids is None or len(marker_ids) == 0:
+        return None
+
+    board = get_charuco_board()
+    charuco_corners = None
+    charuco_ids = None
+    charuco_scale = None
+
+    try:
+        _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+            marker_corners, marker_ids, gray, board
+        )
+        charuco_scale = estimate_scale_from_charuco_corners(charuco_corners, charuco_ids)
+    except cv2.error:
+        charuco_corners = None
+        charuco_ids = None
+
+    return {
+        "dictionary": dictionary_name,
+        "marker_corners": marker_corners,
+        "marker_ids": marker_ids,
+        "charuco_corners": charuco_corners,
+        "charuco_ids": charuco_ids,
+        "charuco_scale_px_per_mm": charuco_scale,
+    }
+
+def calculate_canopy_metrics(frame, px_per_mm):
+    """Segment canopy pixels and report calibrated area plus color features."""
     if px_per_mm is None or px_per_mm == 0:
-        return 0.0, None
+        return {
+            "canopy_area_mm2": 0.0,
+            "canopy_pixels": 0,
+            "canopy_coverage": 0.0,
+            "bounding_box": None,
+            "color_metrics": {},
+            "mask": None,
+        }
 
-    # Convert to HSV for robust color segmentation
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    b, g, r = cv2.split(frame.astype(np.float32))
 
-    # Expanded range:
-    # Hue: 25 (yellow-green) to 95 (deep forest/blue-green)
-    # Saturation/Value: Lowered to 20 to catch dark shadows and pale leaves
+    exg = (2 * g) - r - b
+    exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, exg_mask = cv2.threshold(exg_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
     lower_green = np.array([25, 20, 20])
     upper_green = np.array([95, 255, 255])
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    mask = cv2.inRange(hsv, lower_green, upper_green)
+    lower_yellow_green = np.array([18, 35, 35])
+    upper_yellow_green = np.array([105, 255, 255])
+    broad_vegetation_mask = cv2.inRange(hsv, lower_yellow_green, upper_yellow_green)
 
-    # Clean up soil noise and fill leaf gaps
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel) # Remove small soil dots
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel) # Fill small leaf holes
+    mask = cv2.bitwise_or(green_mask, cv2.bitwise_and(exg_mask, broad_vegetation_mask))
 
-    green_pixels = cv2.countNonZero(mask)
-    area_mm2 = float(green_pixels / (px_per_mm ** 2))
-    return area_mm2, mask
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    canopy_pixels = int(cv2.countNonZero(mask))
+    area_mm2 = float(canopy_pixels / (px_per_mm ** 2))
+    coverage = float(canopy_pixels / (frame.shape[0] * frame.shape[1]))
+    bbox = None
+    color_metrics = {}
+
+    if canopy_pixels > 0:
+        x, y, w, h = cv2.boundingRect(mask)
+        bbox = {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+        selected_hsv = hsv[mask > 0]
+        selected_bgr = frame[mask > 0].astype(np.float32)
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        selected_lab = lab[mask > 0].astype(np.float32)
+
+        selected_b = selected_bgr[:, 0]
+        selected_g = selected_bgr[:, 1]
+        selected_r = selected_bgr[:, 2]
+        green_index = np.mean((2 * selected_g - selected_r - selected_b) / 255.0)
+        yellow_ratio = np.mean(
+            (selected_hsv[:, 0] >= 18)
+            & (selected_hsv[:, 0] <= 42)
+            & (selected_hsv[:, 1] >= 40)
+        )
+        dark_ratio = np.mean(selected_hsv[:, 2] < 55)
+
+        color_metrics = {
+            "mean_hue": float(np.mean(selected_hsv[:, 0])),
+            "mean_saturation": float(np.mean(selected_hsv[:, 1])),
+            "mean_value": float(np.mean(selected_hsv[:, 2])),
+            "mean_lab_a": float(np.mean(selected_lab[:, 1])),
+            "mean_lab_b": float(np.mean(selected_lab[:, 2])),
+            "green_index": float(green_index),
+            "chlorosis_ratio": float(yellow_ratio),
+            "dark_tissue_ratio": float(dark_ratio),
+        }
+
+    return {
+        "canopy_area_mm2": area_mm2,
+        "canopy_pixels": canopy_pixels,
+        "canopy_coverage": coverage,
+        "bounding_box": bbox,
+        "color_metrics": color_metrics,
+        "mask": mask,
+    }
+
+
+def calculate_plant_area(frame, px_per_mm):
+    canopy = calculate_canopy_metrics(frame, px_per_mm)
+    return canopy["canopy_area_mm2"], canopy["mask"]
+
+
+def median_metric(entries, path):
+    values = []
+    for entry in entries:
+        current = entry
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if isinstance(current, (int, float)):
+            values.append(float(current))
+    return float(np.median(values)) if values else None
+
+
+def build_color_baseline(history, existing_baseline=None, max_samples=8):
+    valid = [
+        entry for entry in history
+        if entry.get("color_metrics") and entry.get("area", 0) > 0
+    ]
+    if len(valid) < 3:
+        return existing_baseline or {"status": "collecting", "samples": len(valid)}
+
+    samples = valid[:max_samples]
+    baseline = {
+        "status": "ready",
+        "samples": len(samples),
+        "canopy_area_mm2": median_metric(samples, ["area"]),
+        "green_index": median_metric(samples, ["color_metrics", "green_index"]),
+        "chlorosis_ratio": median_metric(samples, ["color_metrics", "chlorosis_ratio"]),
+        "mean_hue": median_metric(samples, ["color_metrics", "mean_hue"]),
+        "mean_saturation": median_metric(samples, ["color_metrics", "mean_saturation"]),
+        "mean_value": median_metric(samples, ["color_metrics", "mean_value"]),
+    }
+    return baseline
+
+
+def evaluate_nutrient_flags(color_metrics, baseline):
+    if not color_metrics or not baseline or baseline.get("status") != "ready":
+        return {
+            "status": "baseline_collecting",
+            "severity": "none",
+            "score": 0.0,
+            "flags": [],
+            "deltas": {},
+        }
+
+    deltas = {}
+    flags = []
+    score = 0.0
+
+    green_base = baseline.get("green_index")
+    if green_base not in (None, 0):
+        green_drop = (green_base - color_metrics.get("green_index", green_base)) / max(abs(green_base), 0.01)
+        deltas["green_index_drop_fraction"] = float(green_drop)
+        if green_drop > 0.18:
+            flags.append("green_index_drop")
+            score += min(green_drop, 0.5)
+
+    chlorosis_base = baseline.get("chlorosis_ratio")
+    if chlorosis_base is not None:
+        chlorosis_rise = color_metrics.get("chlorosis_ratio", chlorosis_base) - chlorosis_base
+        deltas["chlorosis_ratio_delta"] = float(chlorosis_rise)
+        if chlorosis_rise > 0.12:
+            flags.append("chlorosis_increase")
+            score += min(chlorosis_rise * 2.5, 0.5)
+
+    saturation_base = baseline.get("mean_saturation")
+    if saturation_base not in (None, 0):
+        saturation_drop = (saturation_base - color_metrics.get("mean_saturation", saturation_base)) / saturation_base
+        deltas["saturation_drop_fraction"] = float(saturation_drop)
+        if saturation_drop > 0.15:
+            flags.append("desaturation")
+            score += min(saturation_drop, 0.35)
+
+    severity = "none"
+    if score >= 0.55:
+        severity = "high"
+    elif score >= 0.3:
+        severity = "medium"
+    elif flags:
+        severity = "low"
+
+    return {
+        "status": "ready",
+        "severity": severity,
+        "score": float(min(score, 1.0)),
+        "flags": flags,
+        "deltas": deltas,
+    }
 
 def analyze_image(image_path):
     """
@@ -92,6 +315,7 @@ def analyze_image(image_path):
         best_ids = None
         detected_dict = None
         used_method = None
+        charuco_detection = None
 
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
 
@@ -109,6 +333,9 @@ def analyze_image(image_path):
             # 3. Sharpen Edges
             kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
             sharpened = cv2.filter2D(blurred, -1, kernel)
+
+            if charuco_detection is None:
+                charuco_detection = detect_charuco_target(sharpened, params)
 
             for dict_name, aruco_dict in DICTIONARIES.items():
                 detector = cv2.aruco.ArucoDetector(aruco_dict, params)
@@ -146,7 +373,8 @@ def analyze_image(image_path):
             "markers": [],
             "scale_px_per_mm": None,
             "dictionary": detected_dict,
-            "method": used_method
+            "method": used_method,
+            "calibration_target": CHARUCO_WALL_TARGET,
         }
 
         # Setup debug frame
@@ -174,22 +402,60 @@ def analyze_image(image_path):
                     "center": [float(center[0]), float(center[1])],
                     "px_per_mm": px_per_mm
                 })
-            results["scale_px_per_mm"] = float(np.mean(scales))
+            marker_scale = float(np.mean(scales))
+            results["scale_px_per_mm"] = marker_scale
+            results["scale_source"] = "charuco_marker_size"
 
-            # --- NEW: Plant Growth Analysis ---
-            plant_area, plant_mask = calculate_plant_area(frame, results["scale_px_per_mm"])
-            results["plant_area_mm2"] = plant_area
+            if charuco_detection and charuco_detection["charuco_scale_px_per_mm"]:
+                results["scale_px_per_mm"] = charuco_detection["charuco_scale_px_per_mm"]
+                results["scale_source"] = "charuco_corner_spacing"
+
+            if charuco_detection:
+                results["charuco_corners_found"] = (
+                    0 if charuco_detection["charuco_ids"] is None
+                    else int(len(charuco_detection["charuco_ids"]))
+                )
+
+            canopy = calculate_canopy_metrics(frame, results["scale_px_per_mm"])
+            plant_area = canopy["canopy_area_mm2"]
+            plant_mask = canopy["mask"]
+            results.update({
+                "plant_area_mm2": plant_area,
+                "canopy_area_mm2": plant_area,
+                "canopy_pixels": canopy["canopy_pixels"],
+                "canopy_coverage": canopy["canopy_coverage"],
+                "canopy_bounding_box": canopy["bounding_box"],
+                "color_metrics": canopy["color_metrics"],
+            })
 
             # Highlight plant in debug view (subtle green tint)
-            plant_overlay = np.zeros_like(debug_frame)
-            plant_overlay[plant_mask > 0] = [0, 255, 0]
-            cv2.addWeighted(debug_frame, 1.0, plant_overlay, 0.3, 0, debug_frame)
+            if plant_mask is not None:
+                plant_overlay = np.zeros_like(debug_frame)
+                plant_overlay[plant_mask > 0] = [0, 255, 0]
+                cv2.addWeighted(debug_frame, 1.0, plant_overlay, 0.3, 0, debug_frame)
+                if canopy["bounding_box"]:
+                    box = canopy["bounding_box"]
+                    cv2.rectangle(
+                        debug_frame,
+                        (box["x"], box["y"]),
+                        (box["x"] + box["width"], box["y"] + box["height"]),
+                        (0, 200, 255),
+                        2,
+                    )
 
             cv2.aruco.drawDetectedMarkers(debug_frame, best_corners, best_ids)
-            cv2.putText(debug_frame, f"{detected_dict} via {used_method}", (20, 50),
+            if charuco_detection and charuco_detection["charuco_corners"] is not None:
+                cv2.aruco.drawDetectedCornersCharuco(
+                    debug_frame,
+                    charuco_detection["charuco_corners"],
+                    charuco_detection["charuco_ids"],
+                )
+            cv2.putText(debug_frame, f"ChArUco wall: {detected_dict} via {used_method}", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(debug_frame, f"Area: {plant_area:.1f} mm^2", (20, 90),
+            cv2.putText(debug_frame, f"Canopy: {plant_area:.1f} mm^2", (20, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(debug_frame, f"Scale: {results['scale_px_per_mm']:.3f} px/mm ({results['scale_source']})", (20, 130),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         else:
             print(f"[ANALYSIS] Failed to find markers in {image_path} after trying Green, Blue, and Gray channels.")
 
@@ -221,7 +487,7 @@ def process_latest_captures(captures_dir):
     for device_id in os.listdir(captures_dir):
         device_path = os.path.join(captures_dir, device_id)
         if not os.path.isdir(device_path): continue
-        files = sorted([f for f in os.listdir(device_path) if f.endswith(".jpg")])
+        files = sorted([f for f in os.listdir(device_path) if is_capture_image(f)])
         if not files: continue
 
         results = analyze_image(os.path.join(device_path, files[-1]))
@@ -233,6 +499,8 @@ def process_latest_captures(captures_dir):
 
             history = all_stats[device_id].get("history", [])
             current_area = float(results.get("plant_area_mm2", 0))
+            baseline = build_color_baseline(history, all_stats[device_id].get("baseline"))
+            deficiency = evaluate_nutrient_flags(results.get("color_metrics"), baseline)
 
             # Calculate Growth Rate (mm2 / hour)
             growth_rate = 0.0
@@ -251,11 +519,13 @@ def process_latest_captures(captures_dir):
                 "filename": files[-1],
                 "data": results,
                 "growth_rate_mm2_hr": growth_rate,
+                "baseline": baseline,
+                "nutrient_deficiency": deficiency,
                 "metrics": build_metrics_snapshot(
                     plant_id=device_id,
                     device_id=device_id,
                     filename=files[-1],
-                    analysis=results,
+                    analysis={**results, "nutrient_deficiency": deficiency},
                     growth_rate_mm2_hr=growth_rate,
                 )
             })
@@ -265,7 +535,10 @@ def process_latest_captures(captures_dir):
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "filename": files[-1],
                     "scale": float(results["scale_px_per_mm"]) if results["scale_px_per_mm"] else None,
-                    "area": current_area
+                    "area": current_area,
+                    "canopy_coverage": results.get("canopy_coverage"),
+                    "color_metrics": results.get("color_metrics"),
+                    "nutrient_deficiency": deficiency,
                 })
                 all_stats[device_id]["history"] = history[-100:]
 

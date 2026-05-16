@@ -22,6 +22,8 @@ def build_metrics_snapshot(
     timestamp = captured_at or datetime.now(timezone.utc)
     scale = analysis.get("scale_px_per_mm")
     canopy_area = float(analysis.get("plant_area_mm2") or 0.0)
+    color_metrics = analysis.get("color_metrics") or {}
+    deficiency = analysis.get("nutrient_deficiency") or {}
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -33,16 +35,20 @@ def build_metrics_snapshot(
             "canopy_area_mm2": canopy_area,
             "growth_rate_mm2_hr": float(growth_rate_mm2_hr),
             "scale_px_per_mm": float(scale) if scale else None,
+            "canopy_coverage": analysis.get("canopy_coverage"),
             "height_mm": None,
             "leaf_count": None,
         },
         "stress": {
-            "score": None,
+            "score": deficiency.get("score"),
             "signals": {
-                "chlorosis_ratio": None,
+                "chlorosis_ratio": color_metrics.get("chlorosis_ratio"),
                 "necrosis_ratio": None,
                 "wilting_index": None,
-                "color_shift_index": None,
+                "color_shift_index": deficiency.get("score"),
+                "green_index": color_metrics.get("green_index"),
+                "deficiency_severity": deficiency.get("severity"),
+                "deficiency_flags": deficiency.get("flags") or [],
             },
         },
         "circadian": {

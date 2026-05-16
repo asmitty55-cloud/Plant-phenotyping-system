@@ -36,6 +36,34 @@ last_capture = {}
 timelapse_running = True # Auto-start
 timelapse_interval = 120
 interrogation_in_progress = set()
+device_locks = {}
+
+
+def _is_image_file(filename):
+    return filename.lower().endswith(IMAGE_EXTENSIONS)
+
+
+def _is_capture_image(filename):
+    return filename.startswith("capture_") and _is_image_file(filename)
+
+
+def _device_lock(device_id):
+    if device_id not in device_locks:
+        device_locks[device_id] = threading.Lock()
+    return device_locks[device_id]
+
+
+def _latest_capture_file(files):
+    captures = sorted([f for f in files if _is_capture_image(f)])
+    return captures[-1] if captures else None
+
+
+def _latest_reference_file(files):
+    latest_capture = _latest_capture_file(files)
+    if latest_capture:
+        return latest_capture
+    images = sorted([f for f in files if _is_image_file(f)])
+    return images[-1] if images else None
 
 def load_profiles():
     phone_profiles.clear()
@@ -165,11 +193,6 @@ def _delete_remote_file(device_id, remote_dir, filename):
     run_adb(["adb", "-s", device_id, "shell", f"rm \"{remote_dir}/{filename}\""])
 
 
-def _latest_image(files):
-    images = [f for f in files if f.lower().endswith(IMAGE_EXTENSIONS)]
-    return images[-1] if images else None
-
-
 def sync_device(device_id, logger):
     """
     Research-grade sync logic:
@@ -192,7 +215,7 @@ def sync_device(device_id, logger):
         _save_sync_state(local_device_dir, state)
         return
 
-    latest_file = _latest_image(remote_files) or remote_files[-1]
+    latest_file = _latest_reference_file(remote_files) or remote_files[-1]
 
     if is_first_sync:
         logger.log(f"New device {device_id} detected. Starting full backup of {len(remote_files)} files.", major=True)
@@ -202,18 +225,18 @@ def sync_device(device_id, logger):
         for f in remote_files:
             _pull_remote_file(device_id, remote_dir, f, backup_dir)
 
-        if latest_file.lower().endswith(IMAGE_EXTENSIONS):
+        if _is_capture_image(latest_file):
             backup_latest = os.path.join(backup_dir, latest_file)
             if os.path.exists(backup_latest):
                 shutil.copy2(backup_latest, os.path.join(local_device_dir, latest_file))
         logger.log(f"Initial sync complete. Backup in {backup_dir}.", major=True)
     else:
-        local_files = sorted([f for f in os.listdir(local_device_dir) if f.endswith(".jpg")])
+        local_files = sorted([f for f in os.listdir(local_device_dir) if _is_capture_image(f)])
         last_local = local_files[-1] if local_files else ""
 
         to_pull = [
             f for f in remote_files
-            if f.lower().endswith(IMAGE_EXTENSIONS) and f > last_local
+            if _is_capture_image(f) and f > last_local
         ]
         if to_pull:
             logger.log(f"Differential sync: {len(to_pull)} new files found for {device_id}.", major=True)
@@ -237,29 +260,36 @@ def sync_device(device_id, logger):
 
 
 def capture_and_sync(device_id):
-    ensure_device_profile(device_id)
-    logger = PhoneLogger(device_id)
-    local_device_dir = os.path.join(CAPTURES_DIR, device_id)
-    if not _load_sync_state(local_device_dir).get("initial_backup_complete"):
-        sync_device(device_id, logger)
+    lock = _device_lock(device_id)
+    if not lock.acquire(blocking=False):
+        print(f"[CAPTURE] {device_id} already has a capture in progress.")
+        return False
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"capture_{timestamp}.jpg"
+    try:
+        ensure_device_profile(device_id)
+        logger = PhoneLogger(device_id)
+        local_device_dir = os.path.join(CAPTURES_DIR, device_id)
+        if not _load_sync_state(local_device_dir).get("initial_backup_complete"):
+            sync_device(device_id, logger)
 
-    logger.log(f"Triggering capture: {filename}", major=True)
-    if capture.capture_on_device(device_id, filename):
-        sync_device(device_id, logger)
-        last_capture[device_id] = time.strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"capture_{timestamp}.jpg"
 
-        # Run plant analysis
-        try:
-            process_latest_captures(CAPTURES_DIR)
-        except Exception as e:
-            print(f"[ANALYSIS] Error: {e}")
+        logger.log(f"Triggering capture: {filename}", major=True)
+        if capture.capture_on_device(device_id, filename):
+            sync_device(device_id, logger)
+            last_capture[device_id] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        assemble_video(device_id)
-        return True
-    return False
+            try:
+                process_latest_captures(CAPTURES_DIR)
+            except Exception as e:
+                print(f"[ANALYSIS] Error: {e}")
+
+            assemble_video(device_id)
+            return True
+        return False
+    finally:
+        lock.release()
 
 def get_ffmpeg():
     # Attempt to find ffmpeg in common locations
@@ -285,7 +315,7 @@ def assemble_video(device_id):
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     if not os.path.exists(device_dir): return
 
-    images = sorted([f for f in os.listdir(device_dir) if f.endswith(".jpg")])
+    images = sorted([f for f in os.listdir(device_dir) if _is_capture_image(f)])
     if len(images) < 2: return
 
     list_file = os.path.join(device_dir, "file_list.txt")
@@ -357,17 +387,19 @@ def serve_analysis_debug(device_id):
     debug_dir = os.path.join(DATA_ROOT, "analysis_debug")
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     if not os.path.exists(device_dir): return "Not found", 404
-    files = sorted([f for f in os.listdir(device_dir) if f.endswith(".jpg")])
-    if not files: return "No images", 404
-    return send_from_directory(debug_dir, files[-1])
+    latest = _latest_capture_file(os.listdir(device_dir))
+    if not latest: return "No images", 404
+    debug_path = os.path.join(debug_dir, latest)
+    if not os.path.exists(debug_path): return "No debug image", 404
+    return send_from_directory(debug_dir, latest)
 
 @app.route("/last_frame/<device_id>")
 def serve_last_frame(device_id):
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     if not os.path.exists(device_dir): return "Not found", 404
-    files = sorted([f for f in os.listdir(device_dir) if f.endswith(".jpg")])
-    if not files: return "No images", 404
-    return send_from_directory(device_dir, files[-1])
+    latest = _latest_capture_file(os.listdir(device_dir))
+    if not latest: return "No images", 404
+    return send_from_directory(device_dir, latest)
 
 @app.route("/capture/<device_id>")
 def manual_capture(device_id):
@@ -491,10 +523,22 @@ DASHBOARD_HTML = """
                                      ? data.plant_area_mm2.toFixed(1) + ' mm²'
                                      : '0.0 mm²';
                         const rate = info.growth_rate_mm2_hr ? info.growth_rate_mm2_hr.toFixed(2) + ' mm²/hr' : '0.00 mm²/hr';
+                        const coverage = data.canopy_coverage !== undefined && data.canopy_coverage !== null
+                                     ? (data.canopy_coverage * 100).toFixed(1) + '%'
+                                     : 'N/A';
+                        const color = data.color_metrics || {};
+                        const deficiency = info.nutrient_deficiency || {};
+                        const deficiencyText = deficiency.status === 'ready'
+                                     ? `${deficiency.severity.toUpperCase()} (${(deficiency.score || 0).toFixed(2)}) ${deficiency.flags && deficiency.flags.length ? deficiency.flags.join(', ') : 'stable'}`
+                                     : 'Collecting baseline';
                         el.innerHTML = `
                             Markers Found: ${data.markers_found || 0}<br>
                             Scale: ${data.scale_px_per_mm ? data.scale_px_per_mm.toFixed(2) + ' px/mm' : 'N/A'}<br>
-                            Plant Area: ${area}<br>
+                            Canopy Area: ${area}<br>
+                            Canopy Coverage: ${coverage}<br>
+                            Green Index: ${color.green_index !== undefined ? color.green_index.toFixed(3) : 'N/A'}<br>
+                            Chlorosis Ratio: ${color.chlorosis_ratio !== undefined ? color.chlorosis_ratio.toFixed(3) : 'N/A'}<br>
+                            Deficiency: ${deficiencyText}<br>
                             Growth Rate: ${rate}<br>
                             Last Update: ${info.timestamp || 'Never'}
                         `;

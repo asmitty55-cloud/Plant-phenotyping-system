@@ -21,3 +21,8 @@ It should not be used as a device sync folder or dataset store.
 Do not commit generated files, device-specific state, binary build outputs, captures,
 videos, databases, debug logs, or dataset-like exports. Use `PT_DATA_ROOT` to point
 runtime output at durable storage outside the repo.
+
+## Calibration
+
+Current analysis expects the back-wall ChArUco target documented in
+`docs/calibration.md`.
