@@ -185,8 +185,11 @@ def _pull_remote_file(device_id, remote_dir, filename, local_dir):
     os.makedirs(local_dir, exist_ok=True)
     remote_path = f"{remote_dir}/{filename}"
     local_path = os.path.join(local_dir, filename)
-    run_adb(["adb", "-s", device_id, "pull", remote_path, local_path])
-    return local_path if os.path.exists(local_path) else None
+    out, err = run_adb(["adb", "-s", device_id, "pull", remote_path, local_path])
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+    print(f"[SYNC] Failed to pull {remote_path} from {device_id}: {err or out}")
+    return None
 
 
 def _delete_remote_file(device_id, remote_dir, filename):
@@ -301,10 +304,16 @@ def get_ffmpeg():
     ]
     for c in candidates:
         try:
-            subprocess.run([c, "-version"], capture_output=True)
-            return c
+            result = subprocess.run([c, "-version"], capture_output=True, text=True)
+            if result.returncode == 0:
+                return c
         except: continue
     return None
+
+
+def _ffmpeg_concat_path(path):
+    return os.path.abspath(path).replace("\\", "/").replace("'", "'\\''")
+
 
 def assemble_video(device_id):
     ffmpeg = get_ffmpeg()
@@ -313,32 +322,36 @@ def assemble_video(device_id):
         return
 
     device_dir = os.path.join(CAPTURES_DIR, device_id)
-    if not os.path.exists(device_dir): return
+    if not os.path.exists(device_dir):
+        print(f"[VIDEO] No capture directory for {device_id}: {device_dir}")
+        return
 
     images = sorted([f for f in os.listdir(device_dir) if _is_capture_image(f)])
-    if len(images) < 2: return
+    if len(images) < 2:
+        print(f"[VIDEO] Need at least 2 frames for {device_id}; found {len(images)} in {device_dir}.")
+        return
 
     list_file = os.path.join(device_dir, "file_list.txt")
     with open(list_file, "w") as f:
         for img in images:
-            # Use absolute paths and escape single quotes
-            img_path = os.path.abspath(os.path.join(device_dir, img)).replace("'", "'\\''")
+            img_path = _ffmpeg_concat_path(os.path.join(device_dir, img))
             f.write(f"file '{img_path}'\n")
             f.write("duration 0.1\n")
-        # Repeat last frame for a moment or just end it
-        if images:
-            img_path = os.path.abspath(os.path.join(device_dir, images[-1])).replace("'", "'\\''")
-            f.write(f"file '{img_path}'\n")
+        img_path = _ffmpeg_concat_path(os.path.join(device_dir, images[-1]))
+        f.write(f"file '{img_path}'\n")
 
     output_file = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
     # ffmpeg concat demuxer command
     cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", output_file]
 
     try:
-        subprocess.run(cmd, capture_output=True, check=True)
-        print(f"[VIDEO] Updated timelapse video for {device_id}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            print(f"[VIDEO] Updated timelapse video for {device_id}: {len(images)} frames -> {output_file}")
+        else:
+            print(f"[VIDEO] FFmpeg completed but output is missing or empty for {device_id}: {result.stderr}")
     except subprocess.CalledProcessError as e:
-        print(f"[VIDEO] FFmpeg error: {e.stderr.decode()}")
+        print(f"[VIDEO] FFmpeg error for {device_id}: {e.stderr}")
 
 def timelapse_loop():
     print("[TIMELAPSE] Starting background loop...")
@@ -614,6 +627,9 @@ def run_app():
     # Start the timelapse thread immediately
     t = threading.Thread(target=timelapse_loop, daemon=True)
     t.start()
+    print(f"[SERVER] Data root: {DATA_ROOT}")
+    print(f"[SERVER] Captures: {CAPTURES_DIR}")
+    print(f"[SERVER] Videos: {VIDEOS_DIR}")
     print("[SERVER] Starting Flask on port 5000...")
     app.run(host='0.0.0.0', port=5000)
 

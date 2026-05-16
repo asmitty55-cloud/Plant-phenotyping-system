@@ -1,13 +1,14 @@
 @echo off
 REM Plant Timelapse System - Windows Installer/Launcher
 REM This script handles installation with admin privileges and runs the application
+cd /d "%~dp0"
 
 REM Check if running as administrator
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo Requesting administrator privileges...
     REM Re-launch as admin
-    powershell -Command "Start-Process cmd -ArgumentList '/c cd /d %cd% && %0' -Verb RunAs"
+    powershell -Command "Start-Process cmd -ArgumentList '/c cd /d \"%~dp0\" && \"%~f0\"' -Verb RunAs"
     exit /b
 )
 

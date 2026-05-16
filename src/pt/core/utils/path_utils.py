@@ -1,5 +1,9 @@
 import os
+import sys
 import tempfile
+
+
+PROJECT_MARKERS = ("pyproject.toml", "main.py", "run.bat")
 
 
 def _env_data_root():
@@ -21,10 +25,30 @@ def _is_writable_dir(path):
         return False
 
 
+def _find_portable_root(start):
+    path = os.path.abspath(os.path.expanduser(start))
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+
+    while True:
+        if any(os.path.exists(os.path.join(path, marker)) for marker in PROJECT_MARKERS):
+            return path
+
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
 def get_default_app_root():
     env_root = _env_data_root()
     if env_root:
         return env_root
+
+    for start in (os.getcwd(), sys.argv[0]):
+        root = _find_portable_root(start)
+        if root:
+            return root
 
     return get_user_data_root()
 
