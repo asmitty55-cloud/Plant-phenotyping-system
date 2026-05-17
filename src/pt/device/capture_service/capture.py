@@ -11,6 +11,7 @@ REMOTE_DIR = "/sdcard/PTCaptures"
 LOCAL_DIR = get_images_dir()
 
 APK_CANDIDATES = [
+    os.path.join(os.getcwd(), "ptcapture.apk"),
     r"C:\Program Files\pt\ptcapture.apk",
     r"C:\Program Files\pt\app-debug.apk",
     r"C:\Users\c_r_a\AndroidStudioProjects\PTCapture\app\build\outputs\apk\debug\app-debug.apk",
@@ -122,7 +123,7 @@ def uninstall_apk(device):
 # -------------------------
 # Capture engine
 # -------------------------
-def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso=-1):
+def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso="auto", zoom_percent=0, focus_mode="continuous-picture", antibanding="60hz"):
     """Capture photo on single device using custom APK with advanced options"""
     try:
         # 1. Force stop app to prevent "Fail to connect to camera"
@@ -147,7 +148,12 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
         cmd = ["shell", "am", "start", "-n", "com.pt.capture/.CaptureActivity",
                "--es", "name", filename,
                "--es", "mode", mode,
-               "--ei", "delay", str(delay)]
+               "--ei", "delay", str(delay),
+               "--ei", "zoomPercent", str(int(zoom_percent)),
+               "--ei", "exposureCompensation", str(int(exposure)),
+               "--es", "iso", str(iso),
+               "--es", "focusMode", focus_mode,
+               "--es", "antibanding", antibanding]
 
         # Clear logcat before starting to avoid reading old completion signals
         adb(["logcat", "-c"], device)

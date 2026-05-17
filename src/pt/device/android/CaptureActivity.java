@@ -22,6 +22,12 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
     private SurfaceView mSurfaceView;
     private SurfaceHolder mHolder;
     private String mFileName;
+    private int mZoomPercent = 0;
+    private int mDelayMs = 5000;
+    private int mExposureCompensation = 0;
+    private String mIso = "auto";
+    private String mFocusMode = "continuous-picture";
+    private String mAntibanding = "60hz";
     private boolean mCaptureStarted = false;
     private boolean mIsResumed = false;
     private boolean mSurfaceCreated = false;
@@ -68,6 +74,15 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
 
         mFileName = getIntent().getStringExtra("name");
         if (mFileName == null) mFileName = "manual_" + System.currentTimeMillis() + ".jpg";
+        mZoomPercent = getIntent().getIntExtra("zoomPercent", 0);
+        mDelayMs = getIntent().getIntExtra("delay", 5000);
+        mExposureCompensation = getIntent().getIntExtra("exposureCompensation", 0);
+        String iso = getIntent().getStringExtra("iso");
+        if (iso != null) mIso = iso;
+        String focusMode = getIntent().getStringExtra("focusMode");
+        if (focusMode != null) mFocusMode = focusMode;
+        String antibanding = getIntent().getStringExtra("antibanding");
+        if (antibanding != null) mAntibanding = antibanding;
     }
 
     @Override
@@ -122,6 +137,7 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
 
             Log.i(TAG, "Opening camera...");
             mCamera = Camera.open(0);
+            applyCameraSettings(mCamera);
             mCamera.setPreviewDisplay(mHolder);
             mCamera.startPreview();
             
@@ -130,11 +146,58 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
                 public void run() {
                     takePicture();
                 }
-            }, 3000);
+            }, Math.max(500, mDelayMs));
 
         } catch (Exception e) {
             Log.e(TAG, "Capture failed: " + e.getMessage());
             safeFinish();
+        }
+    }
+
+    private void applyCameraSettings(Camera camera) {
+        try {
+            Camera.Parameters params = camera.getParameters();
+
+            if (params.isZoomSupported()) {
+                int maxZoom = params.getMaxZoom();
+                int clampedPercent = Math.max(0, Math.min(100, mZoomPercent));
+                int zoomValue = Math.round((maxZoom * clampedPercent) / 100.0f);
+                params.setZoom(zoomValue);
+                Log.i(TAG, "Zoom set: " + clampedPercent + "% (" + zoomValue + "/" + maxZoom + ")");
+            } else {
+                Log.i(TAG, "Zoom not supported on this device");
+            }
+
+            if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(mFocusMode)) {
+                params.setFocusMode(mFocusMode);
+                Log.i(TAG, "Focus mode set: " + mFocusMode);
+            } else if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                Log.i(TAG, "Focus mode fallback: auto");
+            }
+
+            if (params.getSupportedAntibanding() != null && params.getSupportedAntibanding().contains(mAntibanding)) {
+                params.setAntibanding(mAntibanding);
+                Log.i(TAG, "Antibanding set: " + mAntibanding);
+            }
+
+            int minExposure = params.getMinExposureCompensation();
+            int maxExposure = params.getMaxExposureCompensation();
+            int exposure = Math.max(minExposure, Math.min(maxExposure, mExposureCompensation));
+            params.setExposureCompensation(exposure);
+            Log.i(TAG, "Exposure compensation set: " + exposure + " (" + minExposure + " to " + maxExposure + ")");
+
+            if (!"auto".equals(mIso)) {
+                params.set("iso", mIso);
+                params.set("iso-speed", mIso);
+                params.set("nv-picture-iso", mIso);
+                Log.i(TAG, "ISO hint set: " + mIso);
+            }
+
+            params.setJpegQuality(95);
+            camera.setParameters(params);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to apply camera settings: " + e.getMessage());
         }
     }
 

@@ -1,0 +1,35 @@
+# Example network camera configuration for RTSP/ONVIF night-vision cameras.
+#
+# For a real local setup, copy this file to:
+#
+#   configs/network_cameras.local.yaml
+#
+# Then edit IPs, passwords, and optional phone bridge settings there. The local
+# file is ignored by git so private camera credentials do not get committed.
+network_cameras:
+  - id: rtsp_night_camera
+    name: RTSP Night Camera
+    enabled: false
+    host: 192.168.1.50
+    username: admin
+    password: ""
+    rtsp_port: 554
+    rtsp_transport: udp
+    paths:
+      - onvif1
+      - onvif2
+
+    # Optional ONVIF PTZ endpoint. Some Yoosee/ESCAM cameras expose this on
+    # port 5000. Leave blank if unsupported.
+    onvif_url: ""
+    ptz_profile_token: MainStream
+
+    # Optional fallback for cameras whose PTZ is only available in a vendor
+    # phone app. Keep these in network_cameras.local.yaml.
+    yoosee_bridge_device: ""
+    yoosee_joystick:
+      center: [360, 910]
+      up: [360, 803]
+      down: [360, 1017]
+      left: [253, 910]
+      right: [467, 910]

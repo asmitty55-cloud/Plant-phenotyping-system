@@ -37,6 +37,7 @@ analysis_debug/
 debug/
 cache/
 tmp/
+.observatory-browser/
 
 *.log
 *.db
@@ -68,9 +69,11 @@ ptcapture.apk.idsig
 # =========================
 plant_stats.json
 output-metadata.json
+reconstruction.json
 
 # =========================
 # local experiment overrides
 # =========================
 .env
 *.local.yaml
+configs/network_cameras.local.yaml

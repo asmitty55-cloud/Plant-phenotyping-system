@@ -3,8 +3,10 @@ import numpy as np
 import os
 import json
 import time
+import re
 from pt.core.utils.path_utils import get_data_root
 from pt.core.analysis.metrics import build_metrics_snapshot
+from pt.core.analysis.calibration_store import calib_store
 
 # Common ArUco dictionaries to check
 DICTIONARIES = {
@@ -24,10 +26,15 @@ CHARUCO_WALL_TARGET = {
 }
 
 MARKER_SIZE_MM = CHARUCO_WALL_TARGET["marker_size_mm"]
+CAPTURE_IMAGE_RE = re.compile(r"^capture_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+
+def get_charuco_target(device_id=None):
+    return calib_store.get_charuco_target(CHARUCO_WALL_TARGET, device_id)
 
 
 def is_capture_image(filename):
-    return filename.startswith("capture_") and filename.lower().endswith((".jpg", ".jpeg", ".png"))
+    return bool(CAPTURE_IMAGE_RE.match(filename))
 
 def get_detector_params():
     params = cv2.aruco.DetectorParameters()
@@ -50,16 +57,17 @@ def try_detect(img, dict_name, aruco_dict, params):
     return corners, ids
 
 
-def get_charuco_board():
+def get_charuco_board(device_id=None):
+    target = get_charuco_target(device_id)
     return cv2.aruco.CharucoBoard(
-        (CHARUCO_WALL_TARGET["squares_x"], CHARUCO_WALL_TARGET["squares_y"]),
-        CHARUCO_WALL_TARGET["square_size_mm"],
-        CHARUCO_WALL_TARGET["marker_size_mm"],
-        DICTIONARIES[CHARUCO_WALL_TARGET["dictionary"]],
+        (target["squares_x"], target["squares_y"]),
+        target["square_size_mm"],
+        target["marker_size_mm"],
+        DICTIONARIES[target["dictionary"]],
     )
 
 
-def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids):
+def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id=None):
     if charuco_corners is None or charuco_ids is None or len(charuco_ids) < 2:
         return None
 
@@ -67,8 +75,9 @@ def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids):
         int(charuco_ids[i][0]): charuco_corners[i][0]
         for i in range(len(charuco_ids))
     }
-    squares_x = CHARUCO_WALL_TARGET["squares_x"]
-    square_size_mm = CHARUCO_WALL_TARGET["square_size_mm"]
+    target = get_charuco_target(device_id)
+    squares_x = target["squares_x"]
+    square_size_mm = target["square_size_mm"]
     scales = []
 
     for corner_id, point in points_by_id.items():
@@ -82,15 +91,30 @@ def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids):
     return float(np.mean(scales)) if scales else None
 
 
-def detect_charuco_target(gray, params):
-    dictionary_name = CHARUCO_WALL_TARGET["dictionary"]
+def charuco_bbox(charuco_corners):
+    if charuco_corners is None or len(charuco_corners) == 0:
+        return None
+    points = charuco_corners.reshape(-1, 2)
+    x, y, w, h = cv2.boundingRect(points.astype(np.float32))
+    return {
+        "x": int(x),
+        "y": int(y),
+        "width": int(w),
+        "height": int(h),
+        "center": [float(x + w / 2), float(y + h / 2)],
+    }
+
+
+def detect_charuco_target(gray, params, device_id=None):
+    target = get_charuco_target(device_id)
+    dictionary_name = target["dictionary"]
     aruco_dict = DICTIONARIES[dictionary_name]
     detector = cv2.aruco.ArucoDetector(aruco_dict, params)
     marker_corners, marker_ids, _ = detector.detectMarkers(gray)
     if marker_ids is None or len(marker_ids) == 0:
         return None
 
-    board = get_charuco_board()
+    board = get_charuco_board(device_id)
     charuco_corners = None
     charuco_ids = None
     charuco_scale = None
@@ -99,7 +123,7 @@ def detect_charuco_target(gray, params):
         _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
             marker_corners, marker_ids, gray, board
         )
-        charuco_scale = estimate_scale_from_charuco_corners(charuco_corners, charuco_ids)
+        charuco_scale = estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id)
     except cv2.error:
         charuco_corners = None
         charuco_ids = None
@@ -111,9 +135,11 @@ def detect_charuco_target(gray, params):
         "charuco_corners": charuco_corners,
         "charuco_ids": charuco_ids,
         "charuco_scale_px_per_mm": charuco_scale,
+        "charuco_bbox": charuco_bbox(charuco_corners),
+        "target": target,
     }
 
-def calculate_canopy_metrics(frame, px_per_mm):
+def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
     """Segment canopy pixels and report calibrated area plus color features."""
     if px_per_mm is None or px_per_mm == 0:
         return {
@@ -126,6 +152,19 @@ def calculate_canopy_metrics(frame, px_per_mm):
         }
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Apply ignore regions if any
+    if device_id:
+        ignore_regions = calib_store.get_ignore_regions(device_id)
+        for x1, y1, x2, y2 in ignore_regions:
+            # Ensure within bounds
+            y1, y2 = max(0, y1), min(frame.shape[0], y2)
+            x1, x2 = max(0, x1), min(frame.shape[1], x2)
+            if y2 > y1 and x2 > x1:
+                # Black out ignored region in HSV (or set S=0, V=0)
+                hsv[y1:y2, x1:x2] = 0
+                frame[y1:y2, x1:x2] = 0
+
     b, g, r = cv2.split(frame.astype(np.float32))
 
     exg = (2 * g) - r - b
@@ -287,7 +326,28 @@ def evaluate_nutrient_flags(color_metrics, baseline):
         "deltas": deltas,
     }
 
-def analyze_image(image_path):
+
+def make_json_safe(value):
+    """Convert OpenCV/NumPy analysis output into JSON-friendly Python values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    return value
+
+
+def serialize_analysis_results(results):
+    serializable = make_json_safe({k: v for k, v in results.items() if k != "mask"})
+    mask_path = results.get("mask_path")
+    if mask_path:
+        serializable["mask_path"] = mask_path
+    return serializable
+
+def analyze_image(image_path, device_id=None):
     """
     Detects ArUco markers with aggressive multi-channel fallback for 3D prints & grow lights.
     """
@@ -335,7 +395,7 @@ def analyze_image(image_path):
             sharpened = cv2.filter2D(blurred, -1, kernel)
 
             if charuco_detection is None:
-                charuco_detection = detect_charuco_target(sharpened, params)
+                charuco_detection = detect_charuco_target(sharpened, params, device_id)
 
             for dict_name, aruco_dict in DICTIONARIES.items():
                 detector = cv2.aruco.ArucoDetector(aruco_dict, params)
@@ -374,7 +434,7 @@ def analyze_image(image_path):
             "scale_px_per_mm": None,
             "dictionary": detected_dict,
             "method": used_method,
-            "calibration_target": CHARUCO_WALL_TARGET,
+            "calibration_target": get_charuco_target(device_id),
         }
 
         # Setup debug frame
@@ -393,14 +453,20 @@ def analyze_image(image_path):
                 s4 = float(np.linalg.norm(marker_corners[3] - marker_corners[0]))
 
                 avg_side_px = (s1 + s2 + s3 + s4) / 4.0
-                px_per_mm = float(avg_side_px / MARKER_SIZE_MM)
+
+                # Check for marker size override
+                marker_size_mm = calib_store.get_marker_size(marker_id, device_id) or MARKER_SIZE_MM
+
+                px_per_mm = float(avg_side_px / marker_size_mm)
                 scales.append(px_per_mm)
 
                 center = np.mean(marker_corners, axis=0)
                 results["markers"].append({
                     "id": marker_id,
                     "center": [float(center[0]), float(center[1])],
-                    "px_per_mm": px_per_mm
+                    "corners": marker_corners.astype(float).tolist(),
+                    "px_per_mm": px_per_mm,
+                    "size_mm": marker_size_mm
                 })
             marker_scale = float(np.mean(scales))
             results["scale_px_per_mm"] = marker_scale
@@ -415,8 +481,10 @@ def analyze_image(image_path):
                     0 if charuco_detection["charuco_ids"] is None
                     else int(len(charuco_detection["charuco_ids"]))
                 )
+                results["charuco_target"] = charuco_detection.get("target")
+                results["charuco_bbox"] = charuco_detection.get("charuco_bbox")
 
-            canopy = calculate_canopy_metrics(frame, results["scale_px_per_mm"])
+            canopy = calculate_canopy_metrics(frame, results["scale_px_per_mm"], device_id)
             plant_area = canopy["canopy_area_mm2"]
             plant_mask = canopy["mask"]
             results.update({
@@ -426,6 +494,7 @@ def analyze_image(image_path):
                 "canopy_coverage": canopy["canopy_coverage"],
                 "canopy_bounding_box": canopy["bounding_box"],
                 "color_metrics": canopy["color_metrics"],
+                "mask": plant_mask,
             })
 
             # Highlight plant in debug view (subtle green tint)
@@ -465,6 +534,13 @@ def analyze_image(image_path):
         debug_path = os.path.join(debug_dir, os.path.basename(image_path))
         cv2.imwrite(debug_path, debug_frame)
         results["debug_image"] = debug_path
+
+        # Save mask for volumetric reconstruction
+        if results.get("mask") is not None:
+            mask_path = image_path.rsplit(".", 1)[0] + "_mask.png"
+            cv2.imwrite(mask_path, results["mask"])
+            results["mask_path"] = mask_path
+
         return results
     except Exception as e:
         print(f"[ANALYSIS] Error: {e}")
@@ -490,7 +566,7 @@ def process_latest_captures(captures_dir):
         files = sorted([f for f in os.listdir(device_path) if is_capture_image(f)])
         if not files: continue
 
-        results = analyze_image(os.path.join(device_path, files[-1]))
+        results = analyze_image(os.path.join(device_path, files[-1]), device_id=device_id)
         if results:
             if device_id not in all_stats: all_stats[device_id] = {"history": []}
 
@@ -517,7 +593,7 @@ def process_latest_captures(captures_dir):
             all_stats[device_id].update({
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "filename": files[-1],
-                "data": results,
+                "data": serialize_analysis_results(results),
                 "growth_rate_mm2_hr": growth_rate,
                 "baseline": baseline,
                 "nutrient_deficiency": deficiency,
@@ -525,7 +601,7 @@ def process_latest_captures(captures_dir):
                     plant_id=device_id,
                     device_id=device_id,
                     filename=files[-1],
-                    analysis={**results, "nutrient_deficiency": deficiency},
+                    analysis={**serialize_analysis_results(results), "nutrient_deficiency": deficiency},
                     growth_rate_mm2_hr=growth_rate,
                 )
             })
@@ -550,5 +626,5 @@ def process_latest_captures(captures_dir):
     if winner_id and fastest_rate > 0:
         all_stats[winner_id]["is_fastest"] = True
 
-    with open(stats_file, 'w') as f: json.dump(all_stats, f, indent=4)
+    with open(stats_file, 'w') as f: json.dump(make_json_safe(all_stats), f, indent=4)
     return all_stats
