@@ -6,8 +6,13 @@ from pt.device.capture_service import capture
 
 def run_adb(cmd):
     """Run an ADB command and return stdout, stderr."""
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
     )
     out, err = proc.communicate()
     return out.strip(), err.strip()

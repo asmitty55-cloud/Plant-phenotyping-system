@@ -6,6 +6,7 @@ import urllib.request
 from urllib.parse import quote
 
 import cv2
+import numpy as np
 import yaml
 
 from pt.core.utils.path_utils import get_captures_dir, get_data_root
@@ -15,6 +16,10 @@ CONFIG_DIR = os.path.join(get_data_root(), "configs")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.yaml")
 LOCAL_CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.local.yaml")
 DEFAULT_RTSP_PATHS = ("onvif1", "onvif2")
+
+
+def hidden_subprocess_flags():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def load_network_cameras():
@@ -60,6 +65,19 @@ def rtsp_urls(camera):
     return [f"rtsp://{auth}@{host}:{port}/{path}" for path in paths]
 
 
+def live_stream_urls(camera):
+    """Return stream URLs that are suitable for diagnostic live preview."""
+    explicit_url = camera.get("live_stream_url") or camera.get("mjpeg_url")
+    if explicit_url:
+        return [explicit_url]
+    return rtsp_urls(camera)
+
+
+def camera_has_live_stream(camera_id):
+    camera = camera_by_id(camera_id)
+    return bool(camera and live_stream_urls(camera))
+
+
 def get_ffmpeg():
     candidates = [
         os.path.join(get_data_root(), "bin", "ffmpeg.exe"),
@@ -69,7 +87,12 @@ def get_ffmpeg():
     ]
     for candidate in candidates:
         try:
-            result = subprocess.run([candidate, "-version"], capture_output=True, text=True)
+            result = subprocess.run(
+                [candidate, "-version"],
+                capture_output=True,
+                text=True,
+                creationflags=hidden_subprocess_flags(),
+            )
             if result.returncode == 0:
                 return candidate
         except OSError:
@@ -93,8 +116,45 @@ def capture_with_ffmpeg(camera, url, output_path):
         "1",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-    return result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=hidden_subprocess_flags())
+    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return False
+    if has_smeared_bottom_half(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def has_smeared_bottom_half(image_path):
+    img = cv2.imread(image_path)
+    if img is None or img.shape[0] < 20:
+        return False
+    h = img.shape[0]
+    top = img[: h // 2].astype(np.float32)
+    bottom = img[h // 2 :].astype(np.float32)
+    top_vertical_variation = float(np.mean(np.std(top, axis=0)))
+    bottom_vertical_variation = float(np.mean(np.std(bottom, axis=0)))
+    row_diffs = np.mean(np.abs(np.diff(bottom, axis=0)), axis=(1, 2))
+    repeated_row_fraction = float(np.mean(row_diffs < 1.5)) if len(row_diffs) else 0.0
+    longest_repeated_run = 0
+    current_run = 0
+    for is_repeated in row_diffs < 1.5:
+        current_run = current_run + 1 if is_repeated else 0
+        longest_repeated_run = max(longest_repeated_run, current_run)
+    longest_repeated_fraction = float(longest_repeated_run / max(1, len(row_diffs)))
+    bottom_texture = float(np.mean(np.std(bottom, axis=1)))
+    return (
+        top_vertical_variation > 5.0
+        and (
+            bottom_vertical_variation < 2.0
+            or repeated_row_fraction > 0.65
+            or longest_repeated_fraction > 0.30
+            or bottom_texture < 2.0
+        )
+    )
 
 
 def capture_network_camera(camera_id, filename=None):
@@ -137,6 +197,50 @@ def capture_network_camera(camera_id, filename=None):
 
     print(f"[NETWORK_CAMERA] Failed to capture {camera_id}; tried {len(rtsp_urls(camera))} stream URL(s).")
     return None
+
+
+def mjpeg_live_frames(camera_id, fps=3, jpeg_quality=65, max_width=960):
+    camera = camera_by_id(camera_id)
+    if not camera:
+        return
+
+    interval = 1.0 / max(1, min(float(fps), 8.0))
+    jpeg_quality = int(max(35, min(int(jpeg_quality), 90)))
+    max_width = int(max(320, min(int(max_width), 1920)))
+
+    for url in live_stream_urls(camera):
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        try:
+            while True:
+                started = time.monotonic()
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.2)
+                    continue
+
+                height, width = frame.shape[:2]
+                if width > max_width:
+                    scale = max_width / float(width)
+                    frame = cv2.resize(frame, (max_width, int(height * scale)), interpolation=cv2.INTER_AREA)
+
+                ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+                if ok:
+                    payload = encoded.tobytes()
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Cache-Control: no-store\r\n\r\n" + payload + b"\r\n"
+                    )
+
+                elapsed = time.monotonic() - started
+                if elapsed < interval:
+                    time.sleep(interval - elapsed)
+        finally:
+            cap.release()
 
 
 def _soap_username_token(username, password):
@@ -288,7 +392,7 @@ def yoosee_bridge_move(camera, direction, duration_ms=350):
         str(int(target[1])),
         str(duration_ms),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=hidden_subprocess_flags())
     if result.returncode == 0:
         return {"status": "ok", "method": "yoosee_bridge", "direction": direction}
     return {"status": "error", "method": "yoosee_bridge", "message": result.stderr or result.stdout or "ADB swipe failed"}

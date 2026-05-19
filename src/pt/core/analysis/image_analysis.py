@@ -7,6 +7,7 @@ import re
 from pt.core.utils.path_utils import get_data_root
 from pt.core.analysis.metrics import build_metrics_snapshot
 from pt.core.analysis.calibration_store import calib_store
+from pt.core.analysis.segmentation_store import segmentation_store
 
 # Common ArUco dictionaries to check
 DICTIONARIES = {
@@ -164,6 +165,13 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
                 # Black out ignored region in HSV (or set S=0, V=0)
                 hsv[y1:y2, x1:x2] = 0
                 frame[y1:y2, x1:x2] = 0
+        for polygon in calib_store.get_ignore_polygons(device_id):
+            if len(polygon) >= 3:
+                pts = np.array(polygon, dtype=np.int32)
+                poly_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(poly_mask, [pts], 255)
+                hsv[poly_mask > 0] = 0
+                frame[poly_mask > 0] = 0
 
     b, g, r = cv2.split(frame.astype(np.float32))
 
@@ -234,6 +242,64 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
 def calculate_plant_area(frame, px_per_mm):
     canopy = calculate_canopy_metrics(frame, px_per_mm)
     return canopy["canopy_area_mm2"], canopy["mask"]
+
+
+def manual_marker_measurements(device_id):
+    measurements = []
+    for marker in calib_store.get_manual_markers(device_id):
+        corners = np.array(marker.get("corners", []), dtype=np.float32)
+        if corners.shape != (4, 2):
+            continue
+        sides = [
+            float(np.linalg.norm(corners[0] - corners[1])),
+            float(np.linalg.norm(corners[1] - corners[2])),
+            float(np.linalg.norm(corners[2] - corners[3])),
+            float(np.linalg.norm(corners[3] - corners[0])),
+        ]
+        size_mm = float(marker.get("size_mm") or MARKER_SIZE_MM)
+        center = np.mean(corners, axis=0)
+        measurements.append({
+            "uid": marker.get("uid"),
+            "id": marker.get("id", "manual"),
+            "center": [float(center[0]), float(center[1])],
+            "corners": corners.astype(float).tolist(),
+            "px_per_mm": float(np.mean(sides) / size_mm),
+            "size_mm": size_mm,
+            "manual": True,
+        })
+    return measurements
+
+
+def calculate_segment_metrics(mask, px_per_mm, device_id):
+    if mask is None or px_per_mm is None or px_per_mm == 0:
+        return []
+
+    h, w = mask.shape[:2]
+    metrics = []
+    for segment in segmentation_store.list(device_id):
+        x1, y1, x2, y2 = segment.get("region", [0, 0, 0, 0])
+        x1, x2 = max(0, min(w, int(x1))), max(0, min(w, int(x2)))
+        y1, y2 = max(0, min(h, int(y1))), max(0, min(h, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        segment_mask = mask[y1:y2, x1:x2]
+        polygon = segment.get("polygon")
+        if polygon and len(polygon) >= 3:
+            poly_mask = np.zeros_like(mask)
+            pts = np.array(polygon, dtype=np.int32)
+            cv2.fillPoly(poly_mask, [pts], 255)
+            segment_mask = cv2.bitwise_and(mask, poly_mask)[y1:y2, x1:x2]
+        pixels = int(cv2.countNonZero(segment_mask))
+        metrics.append({
+            "id": segment.get("id"),
+            "name": segment.get("name") or segment.get("id"),
+            "region": [x1, y1, x2, y2],
+            "polygon": polygon,
+            "canopy_pixels": pixels,
+            "canopy_area_mm2": float(pixels / (px_per_mm ** 2)),
+            "coverage": float(pixels / ((x2 - x1) * (y2 - y1))),
+        })
+    return metrics
 
 
 def median_metric(entries, path):
@@ -366,7 +432,9 @@ def analyze_image(image_path, device_id=None):
             # 2. Pure Blue (Sometimes better if Green saturates)
             processing_variants.append(("Blue", b))
             # 3. Standard Grayscale
-            processing_variants.append(("Gray", cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            processing_variants.append(("Gray", gray))
+            processing_variants.append(("Gray inverted", cv2.bitwise_not(gray)))
         else:
             processing_variants.append(("Source", frame))
 
@@ -382,6 +450,7 @@ def analyze_image(image_path, device_id=None):
         # Create a persistent debug frame for drawing
         debug_frame = frame.copy()
 
+        best_score = -1
         for method_name, img in processing_variants:
             # 1. Enhance Contrast
             enhanced = clahe.apply(img)
@@ -394,38 +463,50 @@ def analyze_image(image_path, device_id=None):
             kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
             sharpened = cv2.filter2D(blurred, -1, kernel)
 
+            attempt_images = [
+                ("", sharpened),
+                (" threshold", cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 5)),
+            ]
+
             if charuco_detection is None:
                 charuco_detection = detect_charuco_target(sharpened, params, device_id)
 
-            for dict_name, aruco_dict in DICTIONARIES.items():
-                detector = cv2.aruco.ArucoDetector(aruco_dict, params)
-                corners, ids, rejected = detector.detectMarkers(sharpened)
+            for suffix, attempt_img in attempt_images:
+                scale_back = 1.5 if "upscaled" in suffix else 1.0
+                for dict_name, aruco_dict in DICTIONARIES.items():
+                    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+                    corners, ids, rejected = detector.detectMarkers(attempt_img)
 
-                # Draw rejected candidates for debugging if nothing found yet
-                if (ids is None or len(ids) == 0) and rejected is not None:
-                    cv2.aruco.drawDetectedMarkers(debug_frame, rejected, borderColor=(0, 0, 255))
+                    # Draw rejected candidates for debugging if nothing found yet
+                    if (ids is None or len(ids) == 0) and rejected is not None:
+                        scaled_rejected = [r / scale_back for r in rejected]
+                        cv2.aruco.drawDetectedMarkers(debug_frame, scaled_rejected, borderColor=(0, 0, 255))
 
-                # Validation: ArUco markers must be roughly square and have a reasonable ID
-                valid_corners = []
-                valid_ids = []
+                    # Validation: ArUco markers must be roughly square and have a reasonable ID
+                    valid_corners = []
+                    valid_ids = []
 
-                if ids is not None:
-                    for i, marker_corners in enumerate(corners):
-                        c = marker_corners[0]
-                        # Check "squareness" (ratio of side lengths)
-                        s1 = np.linalg.norm(c[0] - c[1])
-                        s2 = np.linalg.norm(c[1] - c[2])
-                        if s1 > 0 and 0.8 < (s1 / s2) < 1.2:
-                            valid_corners.append(marker_corners)
-                            valid_ids.append(ids[i])
+                    if ids is not None:
+                        for i, marker_corners in enumerate(corners):
+                            c = marker_corners[0] / scale_back
+                            # Perspective and oblique views can make visible tags very non-square.
+                            s1 = np.linalg.norm(c[0] - c[1])
+                            s2 = np.linalg.norm(c[1] - c[2])
+                            area = cv2.contourArea(c.astype(np.float32))
+                            if s1 > 0 and area > 80 and 0.55 < (s1 / max(s2, 1e-6)) < 1.8:
+                                valid_corners.append(np.array([c], dtype=np.float32))
+                                valid_ids.append(ids[i])
 
-                if valid_ids:
-                    best_corners = valid_corners
-                    best_ids = np.array(valid_ids)
-                    detected_dict = dict_name
-                    used_method = method_name
+                    if valid_ids and len(valid_ids) > best_score:
+                        best_score = len(valid_ids)
+                        best_corners = valid_corners
+                        best_ids = np.array(valid_ids)
+                        detected_dict = dict_name
+                        used_method = method_name + suffix
+                if best_score >= 4:
                     break
-            if best_ids is not None: break
+            if best_score >= 4:
+                break
 
         # Results packaging
         results = {
@@ -440,7 +521,12 @@ def analyze_image(image_path, device_id=None):
         # Setup debug frame
         debug_frame = frame.copy() if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-        if best_ids is not None:
+        manual_markers = manual_marker_measurements(device_id)
+
+        if best_ids is not None or manual_markers:
+            if best_ids is None:
+                best_ids = []
+                best_corners = []
             results["markers_found"] = len(best_ids)
             scales = []
             for i in range(len(best_ids)):
@@ -468,9 +554,13 @@ def analyze_image(image_path, device_id=None):
                     "px_per_mm": px_per_mm,
                     "size_mm": marker_size_mm
                 })
+            for marker in manual_markers:
+                scales.append(marker["px_per_mm"])
+                results["markers"].append(marker)
+            results["markers_found"] = len(results["markers"])
             marker_scale = float(np.mean(scales))
             results["scale_px_per_mm"] = marker_scale
-            results["scale_source"] = "charuco_marker_size"
+            results["scale_source"] = "manual_marker" if manual_markers and len(manual_markers) == len(results["markers"]) else "charuco_marker_size"
 
             if charuco_detection and charuco_detection["charuco_scale_px_per_mm"]:
                 results["scale_px_per_mm"] = charuco_detection["charuco_scale_px_per_mm"]
@@ -495,6 +585,7 @@ def analyze_image(image_path, device_id=None):
                 "canopy_bounding_box": canopy["bounding_box"],
                 "color_metrics": canopy["color_metrics"],
                 "mask": plant_mask,
+                "segments": calculate_segment_metrics(plant_mask, results["scale_px_per_mm"], device_id),
             })
 
             # Highlight plant in debug view (subtle green tint)
@@ -512,19 +603,17 @@ def analyze_image(image_path, device_id=None):
                         2,
                     )
 
-            cv2.aruco.drawDetectedMarkers(debug_frame, best_corners, best_ids)
+            if len(best_corners):
+                for marker_corners in best_corners:
+                    pts = marker_corners[0].astype(np.int32)
+                    cv2.polylines(debug_frame, [pts], True, (255, 0, 0), 2)
+            for marker in manual_markers:
+                pts = np.array(marker["corners"], dtype=np.int32)
+                cv2.polylines(debug_frame, [pts], True, (0, 0, 255), 3)
             if charuco_detection and charuco_detection["charuco_corners"] is not None:
-                cv2.aruco.drawDetectedCornersCharuco(
-                    debug_frame,
-                    charuco_detection["charuco_corners"],
-                    charuco_detection["charuco_ids"],
-                )
-            cv2.putText(debug_frame, f"ChArUco wall: {detected_dict} via {used_method}", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(debug_frame, f"Canopy: {plant_area:.1f} mm^2", (20, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(debug_frame, f"Scale: {results['scale_px_per_mm']:.3f} px/mm ({results['scale_source']})", (20, 130),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                for corner in charuco_detection["charuco_corners"].reshape(-1, 2):
+                    center = tuple(np.round(corner).astype(int))
+                    cv2.circle(debug_frame, center, 3, (0, 0, 255), -1)
         else:
             print(f"[ANALYSIS] Failed to find markers in {image_path} after trying Green, Blue, and Gray channels.")
 
@@ -612,6 +701,8 @@ def process_latest_captures(captures_dir):
                     "filename": files[-1],
                     "scale": float(results["scale_px_per_mm"]) if results["scale_px_per_mm"] else None,
                     "area": current_area,
+                    "growth_rate_mm2_hr": growth_rate,
+                    "segments": results.get("segments", []),
                     "canopy_coverage": results.get("canopy_coverage"),
                     "color_metrics": results.get("color_metrics"),
                     "nutrient_deficiency": deficiency,

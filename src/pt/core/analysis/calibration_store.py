@@ -19,6 +19,7 @@ class CalibrationStore:
             "marker_overrides": {},  # marker_id -> size_mm
             "device_overrides": {},  # device_id -> { "marker_id": size_mm, "ignore_regions": [[x1,y1,x2,y2], ...] }
             "charuco_overrides": {},
+            "manual_markers": {},
             "camera_params": {},     # device_id -> { "K": [[...]], "dist": [...], "R": [...], "T": [...] }
             "world_origin_device": None # The device ID that defines the origin
         }
@@ -27,6 +28,7 @@ class CalibrationStore:
         self.data.setdefault("marker_overrides", {})
         self.data.setdefault("device_overrides", {})
         self.data.setdefault("charuco_overrides", {})
+        self.data.setdefault("manual_markers", {})
         self.data.setdefault("camera_params", {})
 
     def save(self):
@@ -76,10 +78,25 @@ class CalibrationStore:
         self.data["device_overrides"][device_id]["ignore_regions"].append(region)
         self.save()
 
+    def add_ignore_polygon(self, device_id, polygon):
+        self._ensure_defaults()
+        if device_id not in self.data["device_overrides"]:
+            self.data["device_overrides"][device_id] = {}
+        self.data["device_overrides"][device_id].setdefault("ignore_polygons", [])
+        self.data["device_overrides"][device_id]["ignore_polygons"].append(polygon)
+        self.save()
+
+    def get_ignore_polygons(self, device_id):
+        self._ensure_defaults()
+        if device_id in self.data["device_overrides"]:
+            return self.data["device_overrides"][device_id].get("ignore_polygons", [])
+        return []
+
     def clear_ignore_regions(self, device_id):
         self._ensure_defaults()
         if device_id in self.data["device_overrides"]:
             self.data["device_overrides"][device_id]["ignore_regions"] = []
+            self.data["device_overrides"][device_id]["ignore_polygons"] = []
             self.save()
 
     def get_charuco_target(self, default_target, device_id=None):
@@ -113,5 +130,35 @@ class CalibrationStore:
     def get_camera_params(self, device_id):
         self._ensure_defaults()
         return self.data["camera_params"].get(device_id)
+
+    def add_manual_marker(self, device_id, corners, size_mm, marker_id="manual"):
+        self._ensure_defaults()
+        marker = {
+            "uid": f"manual_{len(self.data['manual_markers'].get(device_id, [])) + 1}",
+            "id": str(marker_id),
+            "corners": [[float(p[0]), float(p[1])] for p in corners],
+            "size_mm": float(size_mm),
+        }
+        self.data["manual_markers"].setdefault(device_id, []).append(marker)
+        self.save()
+        return marker
+
+    def get_manual_markers(self, device_id):
+        self._ensure_defaults()
+        return self.data["manual_markers"].get(device_id, [])
+
+    def clear_manual_markers(self, device_id):
+        self._ensure_defaults()
+        self.data["manual_markers"][device_id] = []
+        self.save()
+
+    def delete_manual_marker(self, device_id, uid):
+        self._ensure_defaults()
+        markers = self.data["manual_markers"].get(device_id, [])
+        self.data["manual_markers"][device_id] = [
+            marker for idx, marker in enumerate(markers)
+            if marker.get("uid") != uid and str(idx) != str(uid)
+        ]
+        self.save()
 
 calib_store = CalibrationStore()

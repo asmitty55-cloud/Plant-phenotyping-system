@@ -3,6 +3,7 @@
 Start Plant Observatory without a command prompt and open it in an app window.
 """
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,11 +36,46 @@ def wait_for_server(timeout=30):
 
 
 def pythonw_path():
-    exe = sys.executable
-    candidate = exe.replace("python.exe", "pythonw.exe")
-    if os.path.exists(candidate):
-        return candidate
-    return exe
+    for exe in python_candidates():
+        if python_can_run_observatory(exe):
+            candidate = exe.replace("python.exe", "pythonw.exe")
+            if os.path.exists(candidate):
+                return candidate
+            return exe
+    return sys.executable
+
+
+def python_candidates():
+    user_home = os.path.expanduser("~")
+    candidates = [
+        sys.executable,
+        os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
+        os.path.join(user_home, ".platformio", "penv", "Scripts", "python.exe"),
+        os.path.join(user_home, ".platformio", "python3", "python.exe"),
+        shutil.which("python"),
+        shutil.which("py"),
+    ]
+    seen = set()
+    for exe in candidates:
+        if not exe or exe in seen:
+            continue
+        seen.add(exe)
+        if os.path.exists(exe) or exe in {"python", "py"}:
+            yield exe
+
+
+def python_can_run_observatory(exe):
+    try:
+        result = subprocess.run(
+            [exe, "-c", "import cv2, flask"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def start_server_if_needed():

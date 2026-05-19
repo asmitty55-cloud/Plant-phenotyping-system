@@ -128,6 +128,10 @@ def reconstruct_visual_hull(device_masks, voxel_size=(100, 100, 100), world_boun
     occupied_count = np.sum(occupancy)
     voxel_vol = (x[1]-x[0]) * (y[1]-y[0]) * (z[1]-z[0])
     total_volume_mm3 = occupied_count * voxel_vol
+    occupied_points = voxels[occupancy]
+    if len(occupied_points) > 2500:
+        step = max(1, len(occupied_points) // 2500)
+        occupied_points = occupied_points[::step][:2500]
 
     return {
         "status": "ok",
@@ -136,4 +140,6 @@ def reconstruct_visual_hull(device_masks, voxel_size=(100, 100, 100), world_boun
         "grid_shape": list(voxel_size),
         "cameras_used": cameras_used,
         "skipped_devices": skipped_devices,
+        "world_bounds": world_bounds,
+        "preview_points": occupied_points.astype(float).tolist(),
     }

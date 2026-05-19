@@ -19,6 +19,11 @@ network_cameras:
       - onvif1
       - onvif2
 
+    # Optional diagnostic live preview. If omitted, the app reuses stream_url
+    # or the generated RTSP URL above and proxies it as low-rate MJPEG for the
+    # dashboard. Put real credentials only in network_cameras.local.yaml.
+    live_stream_url: ""
+
     # Optional ONVIF PTZ endpoint. Some Yoosee/ESCAM cameras expose this on
     # port 5000. Leave blank if unsupported.
     onvif_url: ""

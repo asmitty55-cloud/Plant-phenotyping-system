@@ -7,16 +7,24 @@ import json
 import shutil
 import cv2
 from datetime import datetime, timezone
-from flask import Flask, render_template_string, jsonify, send_from_directory, request
+from flask import Flask, render_template_string, jsonify, send_from_directory, request, Response, stream_with_context
 
 from pt.core.analysis import process_latest_captures
 from pt.core.analysis.calibration_store import calib_store
+from pt.core.analysis.segmentation_store import segmentation_store
 from pt.core.analysis.volumetric import calibrate_extrinsics, reconstruct_visual_hull
 from pt.core.utils.path_utils import get_captures_dir, get_data_root
 from pt.device.calibration.phone_interrogate import interrogate_phone
 from pt.device.calibration.phone_logger import PhoneLogger
 from pt.device.capture_service import capture
-from pt.device.network_camera import capture_network_camera, configured_camera_ids, ptz_move, ptz_stop
+from pt.device.network_camera import (
+    camera_has_live_stream,
+    capture_network_camera,
+    configured_camera_ids,
+    mjpeg_live_frames,
+    ptz_move,
+    ptz_stop,
+)
 
 
 # Get paths
@@ -26,11 +34,13 @@ VIDEOS_DIR = os.path.join(DATA_ROOT, "videos")
 DEBUG_DIR = os.path.join(DATA_ROOT, "debug")
 profiles_file = os.path.join(DEBUG_DIR, "profiles.json")
 device_settings_file = os.path.join(DEBUG_DIR, "device_settings.json")
+video_manifest_file = os.path.join(DEBUG_DIR, "video_manifest.json")
 legacy_profiles_file = os.path.join(os.getcwd(), "debug", "profiles.json")
 MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".mp4", ".mov")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 CAPTURE_IMAGE_RE = re.compile(r"^capture_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNORECASE)
 DEFAULT_REMOTE_DIR = "/sdcard/PTCaptures"
+VIDEO_ASSEMBLY_FRAME_STEP = 5
 
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -45,9 +55,13 @@ timelapse_running = True # Auto-start
 timelapse_interval = 180 # Increased from 120 for legacy hardware stability
 interrogation_in_progress = set()
 device_locks = {}
+live_stream_lock = threading.Lock()
+active_live_stream_device = None
+video_manifest = {}
 
 DEFAULT_DEVICE_SETTINGS = {
     "light_mode": "auto",
+    "profile_name": "auto",
     "zoom_percent": 0,
     "delay_ms": 5000,
     "exposure_compensation": 0,
@@ -60,10 +74,10 @@ DAY_CAPTURE_PROFILE = {
     "exposure_compensation": 0,
     "iso": "auto",
 }
-NIGHT_CAPTURE_PROFILE = {
+NIGHT_IR_CAPTURE_PROFILE = {
     "delay_ms": 8000,
     "exposure_compensation": 4,
-    "iso": "800",
+    "iso": "1600",
 }
 NIGHT_LUMA_THRESHOLD = 45.0
 
@@ -148,11 +162,36 @@ def save_device_settings():
         json.dump(device_settings, f, indent=4)
 
 
+def load_video_manifest():
+    video_manifest.clear()
+    if not os.path.exists(video_manifest_file):
+        return
+    try:
+        with open(video_manifest_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(loaded, dict):
+        video_manifest.update(loaded)
+
+
+def save_video_manifest():
+    os.makedirs(os.path.dirname(video_manifest_file), exist_ok=True)
+    with open(video_manifest_file, "w", encoding="utf-8") as f:
+        json.dump(video_manifest, f, indent=2)
+
+
 def settings_for_device(device_id):
     settings = dict(DEFAULT_DEVICE_SETTINGS)
     settings.update(device_settings.get(device_id, {}))
-    if settings.get("light_mode") not in ("auto", "day", "night"):
+    if settings.get("light_mode") == "night":
+        settings["light_mode"] = "night_ir"
+    if settings.get("profile_name") == "night":
+        settings["profile_name"] = "night_ir"
+    if settings.get("light_mode") not in ("auto", "day", "night_ir"):
         settings["light_mode"] = "auto"
+    if settings.get("profile_name") not in ("auto", "day", "wide_day", "night_ir"):
+        settings["profile_name"] = settings["light_mode"] if settings["light_mode"] in ("day", "night_ir") else "auto"
     settings["zoom_percent"] = int(max(0, min(100, settings.get("zoom_percent", 0))))
     settings["delay_ms"] = int(max(500, min(15000, settings.get("delay_ms", 5000))))
     settings["exposure_compensation"] = int(max(-12, min(12, settings.get("exposure_compensation", 0))))
@@ -178,14 +217,14 @@ def sensed_light_mode(device_id):
     luma = latest_luminance(device_id)
     if luma is None:
         return "day", None
-    return ("night" if luma < NIGHT_LUMA_THRESHOLD else "day"), luma
+    return ("night_ir" if luma < NIGHT_LUMA_THRESHOLD else "day"), luma
 
 
 def effective_capture_settings(device_id):
     settings = settings_for_device(device_id)
     sensed_mode, luma = sensed_light_mode(device_id)
     active_mode = sensed_mode if settings["light_mode"] == "auto" else settings["light_mode"]
-    profile = NIGHT_CAPTURE_PROFILE if active_mode == "night" else DAY_CAPTURE_PROFILE
+    profile = NIGHT_IR_CAPTURE_PROFILE if active_mode == "night_ir" else DAY_CAPTURE_PROFILE
     effective = dict(settings)
     effective.update(profile)
     effective["light_mode"] = settings["light_mode"]
@@ -205,8 +244,13 @@ def settings_response(device_id):
 
 def run_adb(cmd):
     try:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=creationflags,
         )
         out, err = proc.communicate()
         return out.strip(), err.strip()
@@ -434,6 +478,7 @@ def capture_network_and_analyze(camera_id):
 
 def get_ffmpeg():
     # Attempt to find ffmpeg in common locations
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     candidates = [
         "ffmpeg",
         os.path.join(DATA_ROOT, "bin", "ffmpeg.exe"),
@@ -443,7 +488,7 @@ def get_ffmpeg():
     ]
     for c in candidates:
         try:
-            result = subprocess.run([c, "-version"], capture_output=True, text=True)
+            result = subprocess.run([c, "-version"], capture_output=True, text=True, creationflags=creationflags)
             if result.returncode == 0:
                 return c
         except: continue
@@ -470,6 +515,15 @@ def assemble_video(device_id):
         print(f"[VIDEO] Need at least 2 frames for {device_id}; found {len(images)} in {device_dir}.")
         return
 
+    published_name = video_manifest.get(device_id, f"{device_id}.mp4")
+    output_file = os.path.join(VIDEOS_DIR, published_name)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    versioned_name = f"{device_id}_{stamp}.mp4"
+    temp_output_file = os.path.join(VIDEOS_DIR, f".{device_id}_{stamp}.tmp.mp4")
+    if os.path.exists(output_file) and len(images) % VIDEO_ASSEMBLY_FRAME_STEP != 0:
+        print(f"[VIDEO] Skipping timelapse rebuild for {device_id}: {len(images)} frames; next update at a {VIDEO_ASSEMBLY_FRAME_STEP}-frame boundary.")
+        return
+
     list_file = os.path.join(device_dir, "file_list.txt")
     with open(list_file, "w") as f:
         for img in images:
@@ -479,22 +533,59 @@ def assemble_video(device_id):
         img_path = _ffmpeg_concat_path(os.path.join(device_dir, images[-1]))
         f.write(f"file '{img_path}'\n")
 
-    output_file = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
-    # ffmpeg concat demuxer command
-    cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", output_file]
+    # Write to a temporary file, then atomically replace the published MP4 so
+    # the dashboard never reads a half-written file while the loop rebuilds it.
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_file,
+        "-vf",
+        "scale=in_range=pc:out_range=tv,fps=10,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-level",
+        "3.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "24",
+        "-preset",
+        "veryfast",
+        "-movflags",
+        "+faststart",
+        temp_output_file,
+    ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            print(f"[VIDEO] Updated timelapse video for {device_id}: {len(images)} frames -> {output_file}")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=creationflags)
+        if os.path.exists(temp_output_file) and os.path.getsize(temp_output_file) > 0:
+            final_output_file = os.path.join(VIDEOS_DIR, versioned_name)
+            os.replace(temp_output_file, final_output_file)
+            video_manifest[device_id] = versioned_name
+            save_video_manifest()
+            print(f"[VIDEO] Updated timelapse video for {device_id}: {len(images)} frames -> {final_output_file}")
         else:
             print(f"[VIDEO] FFmpeg completed but output is missing or empty for {device_id}: {result.stderr}")
     except subprocess.CalledProcessError as e:
+        if os.path.exists(temp_output_file):
+            try:
+                os.remove(temp_output_file)
+            except OSError:
+                pass
         print(f"[VIDEO] FFmpeg error for {device_id}: {e.stderr}")
 
 def timelapse_loop():
     print("[TIMELAPSE] Starting background loop...")
     while True:
+        time.sleep(timelapse_interval)
         if timelapse_running:
             devices = detect_connected_devices()
             ensure_all_device_profiles(devices)
@@ -508,11 +599,11 @@ def timelapse_loop():
                     capture_network_and_analyze(camera_id)
                 except Exception as e:
                     print(f"Error on network camera {camera_id}: {e}")
-        time.sleep(timelapse_interval)
 
 @app.route("/calibrate_multicam")
 def run_multicam_calibration():
-    devices = detect_connected_devices()
+    selected = request.args.get("devices", "")
+    devices = [d for d in selected.split(",") if d] if selected else detect_connected_devices() + configured_camera_ids()
     device_images = {}
     for d in devices:
         device_dir = os.path.join(CAPTURES_DIR, d)
@@ -529,16 +620,81 @@ def run_multicam_calibration():
 
 @app.route("/ignore_region/<device_id>", methods=["POST"])
 def add_ignore(device_id):
-    import flask
-    data = flask.request.json
-    # data expected: [x1, y1, x2, y2]
-    calib_store.add_ignore_region(device_id, data)
+    data = request.get_json(silent=True)
+    if isinstance(data, dict) and data.get("polygon"):
+        calib_store.add_ignore_polygon(device_id, data["polygon"])
+    elif isinstance(data, dict) and data.get("region"):
+        calib_store.add_ignore_region(device_id, data["region"])
+    else:
+        calib_store.add_ignore_region(device_id, data)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
 
 @app.route("/clear_ignore/<device_id>")
 def clear_ignore(device_id):
     calib_store.clear_ignore_regions(device_id)
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
+
+
+@app.route("/segments")
+def list_segments():
+    return jsonify(segmentation_store.list())
+
+
+@app.route("/segments/<device_id>", methods=["POST"])
+def add_segment(device_id):
+    data = request.get_json(silent=True) or {}
+    region = data.get("region")
+    polygon = data.get("polygon")
+    if polygon:
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            return jsonify({"status": "error", "message": "polygon must contain at least 3 points"}), 400
+    elif not isinstance(region, list) or len(region) != 4:
+        return jsonify({"status": "error", "message": "region must be [x1,y1,x2,y2]"}), 400
+    name = (data.get("name") or f"{device_id} segment").strip()
+    segment = segmentation_store.add(device_id, name, region=region, polygon=polygon)
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "segment": segment, "stats": stats.get(device_id, {})})
+
+
+@app.route("/segments/<device_id>/<segment_id>", methods=["DELETE"])
+def delete_segment(device_id, segment_id):
+    deleted = segmentation_store.delete(device_id, segment_id)
+    return jsonify({"status": "ok", "device": device_id, "segment_id": segment_id, "deleted": deleted})
+
+
+@app.route("/manual_marker/<device_id>", methods=["POST"])
+def add_manual_marker(device_id):
+    data = request.get_json(silent=True) or {}
+    corners = data.get("corners")
+    if not isinstance(corners, list) or len(corners) != 4:
+        return jsonify({"status": "error", "message": "corners must contain four [x,y] points"}), 400
+    marker = calib_store.add_manual_marker(
+        device_id,
+        corners,
+        float(data.get("size_mm") or 60.0),
+        data.get("marker_id") or "manual",
+    )
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "marker": marker, "stats": stats.get(device_id, {})})
+
+
+@app.route("/manual_marker/<device_id>/clear", methods=["POST"])
+def clear_manual_markers(device_id):
+    calib_store.clear_manual_markers(device_id)
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
+
+
+@app.route("/manual_markers")
+def list_manual_markers():
+    return jsonify(calib_store.data.get("manual_markers", {}))
+
+
+@app.route("/manual_marker/<device_id>/<uid>", methods=["DELETE"])
+def delete_manual_marker(device_id, uid):
+    calib_store.delete_manual_marker(device_id, uid)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
 
@@ -569,7 +725,11 @@ def run_reconstruction():
         stats = json.load(f)
 
     device_masks = {}
+    selected = request.args.get("devices", "")
+    allowed_devices = set([d for d in selected.split(",") if d]) if selected else None
     for device_id, info in stats.items():
+        if allowed_devices and device_id not in allowed_devices:
+            continue
         # This is a bit tricky as masks are not saved to disk by default
         # We might need to re-run analysis or save masks
         device_dir = os.path.join(CAPTURES_DIR, device_id)
@@ -604,6 +764,7 @@ def run_reconstruction():
 @app.route("/")
 def dashboard():
     devices = detect_connected_devices() + configured_camera_ids()
+    network_stream_ids = {device_id for device_id in configured_camera_ids() if camera_has_live_stream(device_id)}
     # Load debug logs for each device
     logs = {}
     for d in devices:
@@ -615,11 +776,66 @@ def dashboard():
         else:
             logs[d] = "No logs yet."
 
-    return render_template_string(OBSERVATORY_DASHBOARD_HTML, devices=devices, last=last_capture, running=timelapse_running, logs=logs)
+    return render_template_string(
+        OBSERVATORY_DASHBOARD_HTML,
+        devices=devices,
+        last=last_capture,
+        running=timelapse_running,
+        logs=logs,
+        network_stream_ids=network_stream_ids,
+    )
 
 @app.route("/video/<device_id>")
 def serve_video(device_id):
-    return send_from_directory(VIDEOS_DIR, f"{device_id}.mp4")
+    filename = video_manifest.get(device_id, f"{device_id}.mp4")
+    response = send_from_directory(VIDEOS_DIR, filename, conditional=True)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
+@app.route("/show_location/<kind>/<device_id>", methods=["POST"])
+def show_location(kind, device_id):
+    if kind == "video":
+        path = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
+    else:
+        path = os.path.join(CAPTURES_DIR, device_id)
+    target = path if os.path.isdir(path) else os.path.dirname(path)
+    if os.name == "nt" and os.path.exists(target):
+        subprocess.Popen(["explorer.exe", target], creationflags=subprocess.CREATE_NO_WINDOW)
+    return jsonify({"status": "ok", "path": target})
+
+
+@app.route("/reset_timelapse/<device_id>", methods=["POST"])
+def reset_timelapse(device_id):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_root = os.path.join(DATA_ROOT, "archive")
+    os.makedirs(archive_root, exist_ok=True)
+
+    device_capture_dir = os.path.join(CAPTURES_DIR, device_id)
+    if os.path.exists(device_capture_dir):
+        archived_captures = os.path.join(archive_root, "captures", f"{device_id}_{stamp}")
+        os.makedirs(os.path.dirname(archived_captures), exist_ok=True)
+        shutil.move(device_capture_dir, archived_captures)
+        os.makedirs(device_capture_dir, exist_ok=True)
+
+    video_path = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
+    if os.path.exists(video_path):
+        archived_video_dir = os.path.join(archive_root, "videos")
+        os.makedirs(archived_video_dir, exist_ok=True)
+        shutil.move(video_path, os.path.join(archived_video_dir, f"{device_id}_{stamp}.mp4"))
+
+    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+    if os.path.exists(stats_file):
+        with open(stats_file, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+        if device_id in stats:
+            stats[device_id]["archived_history"] = stats[device_id].get("history", [])
+            stats[device_id]["history"] = []
+            stats[device_id]["growth_rate_mm2_hr"] = 0.0
+            with open(stats_file, "w", encoding="utf-8") as f:
+                json.dump(stats, f, indent=4)
+
+    return jsonify({"status": "ok", "device": device_id, "archive": os.path.join(archive_root, "captures", f"{device_id}_{stamp}")})
 
 @app.route("/stats")
 def get_stats():
@@ -630,9 +846,37 @@ def get_stats():
     return jsonify({})
 
 
+@app.route("/ignore_growth_point/<device_id>", methods=["POST"])
+def ignore_growth_point(device_id):
+    data = request.get_json(silent=True) or {}
+    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+    if not os.path.exists(stats_file):
+        return jsonify({"status": "error", "message": "No stats found"}), 404
+    with open(stats_file, "r", encoding="utf-8") as f:
+        stats = json.load(f)
+    history = (stats.get(device_id) or {}).get("history", [])
+    timestamp = data.get("timestamp")
+    filename = data.get("filename")
+    segment_id = data.get("segment_id")
+    changed = False
+    for entry in history:
+        if (timestamp and entry.get("timestamp") == timestamp) or (filename and entry.get("filename") == filename):
+            if segment_id:
+                ignored = set(entry.get("ignored_segments", []))
+                ignored.add(segment_id)
+                entry["ignored_segments"] = sorted(ignored)
+            else:
+                entry["ignored"] = True
+            changed = True
+    if changed:
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=4)
+    return jsonify({"status": "ok", "changed": changed})
+
+
 @app.route("/device_settings")
 def get_device_settings():
-    devices = detect_connected_devices()
+    devices = detect_connected_devices() + configured_camera_ids()
     known = sorted(set(devices) | set(device_settings.keys()))
     return jsonify({device_id: settings_response(device_id) for device_id in known})
 
@@ -641,8 +885,10 @@ def get_device_settings():
 def update_device_settings(device_id):
     data = request.get_json(silent=True) or {}
     current = settings_for_device(device_id)
-    if data.get("light_mode") in ("auto", "day", "night"):
+    if data.get("light_mode") in ("auto", "day", "night_ir"):
         current["light_mode"] = data["light_mode"]
+    if data.get("profile_name") in ("auto", "day", "wide_day", "night_ir"):
+        current["profile_name"] = data["profile_name"]
     if "zoom_percent" in data:
         current["zoom_percent"] = int(max(0, min(100, int(data["zoom_percent"]))))
     if "delay_ms" in data:
@@ -658,6 +904,58 @@ def update_device_settings(device_id):
     device_settings[device_id] = current
     save_device_settings()
     return jsonify(settings_response(device_id))
+
+
+def latest_marker_count(device_id):
+    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+    if not os.path.exists(stats_file):
+        return 0
+    try:
+        with open(stats_file, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+        return int(((stats.get(device_id) or {}).get("data") or {}).get("markers_found") or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+@app.route("/auto_tune_tags/<device_id>", methods=["POST"])
+def auto_tune_tags(device_id):
+    if device_id in configured_camera_ids():
+        return jsonify({"status": "error", "message": "Automatic camera-setting sweep is for Android ADB cameras."}), 400
+
+    original = dict(settings_for_device(device_id))
+    profiles = [
+        {"delay_ms": 5000, "antibanding": "60hz", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "auto"},
+        {"delay_ms": 7000, "antibanding": "60hz", "focus_mode": "auto", "exposure_compensation": 2, "iso": "400"},
+        {"delay_ms": 9000, "antibanding": "60hz", "focus_mode": "macro", "exposure_compensation": 2, "iso": "400"},
+        {"delay_ms": 9000, "antibanding": "50hz", "focus_mode": "auto", "exposure_compensation": 2, "iso": "400"},
+        {"delay_ms": 9000, "antibanding": "auto", "focus_mode": "continuous-picture", "exposure_compensation": 4, "iso": "800"},
+        {"delay_ms": 11000, "antibanding": "60hz", "focus_mode": "infinity", "exposure_compensation": 4, "iso": "800"},
+        {"delay_ms": 11000, "antibanding": "50hz", "focus_mode": "macro", "exposure_compensation": 4, "iso": "800"},
+        {"delay_ms": 12000, "antibanding": "60hz", "focus_mode": "auto", "exposure_compensation": -2, "iso": "auto"},
+        {"delay_ms": 12000, "antibanding": "off", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "1600"},
+    ]
+    results = []
+    best = {"markers": -1, "profile": original}
+
+    for idx, profile in enumerate(profiles, start=1):
+        current = dict(original)
+        current.update(profile)
+        current["light_mode"] = "day"
+        device_settings[device_id] = current
+        save_device_settings()
+        ok = capture_and_sync(device_id)
+        markers = latest_marker_count(device_id) if ok else 0
+        trial = {"trial": idx, "ok": bool(ok), "markers": markers, "profile": profile}
+        results.append(trial)
+        if markers > best["markers"]:
+            best = {"markers": markers, "profile": current}
+        if markers >= 4:
+            break
+
+    device_settings[device_id] = best["profile"] if best["markers"] > 0 else original
+    save_device_settings()
+    return jsonify({"status": "ok", "device": device_id, "best_markers": best["markers"], "best_profile": settings_response(device_id), "trials": results})
 
 @app.route("/analysis_debug/<device_id>")
 def serve_analysis_debug(device_id):
@@ -677,6 +975,32 @@ def serve_last_frame(device_id):
     latest = _latest_capture_file(os.listdir(device_dir))
     if not latest: return "No images", 404
     return send_from_directory(device_dir, latest)
+
+
+@app.route("/live_stream/<camera_id>")
+def live_stream(camera_id):
+    global active_live_stream_device
+    if camera_id not in configured_camera_ids() or not camera_has_live_stream(camera_id):
+        return "No live stream configured", 404
+
+    if not live_stream_lock.acquire(blocking=False):
+        return "Another live stream is already active", 409
+    active_live_stream_device = camera_id
+
+    def generate():
+        global active_live_stream_device
+        try:
+            yield from mjpeg_live_frames(camera_id)
+        finally:
+            active_live_stream_device = None
+            live_stream_lock.release()
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
 
 @app.route("/capture/<device_id>")
 def manual_capture(device_id):
@@ -776,7 +1100,7 @@ DASHBOARD_HTML = """
             <p>Last Sync: <span class="timestamp">{{ last.get(d, 'Initializing...') }}</span></p>
 
             <div class="label">Timelapse Loop</div>
-            <video id="vid-{{d}}" controls loop autoplay muted>
+            <video id="vid-{{d}}" controls loop muted preload="metadata">
                 <source src="/video/{{d}}" type="video/mp4">
             </video>
 
@@ -963,13 +1287,16 @@ DASHBOARD_HTML = """
         }
 
         setInterval(() => {
+            if (document.hidden) return;
             document.querySelectorAll('img').forEach(img => {
                 const base = img.src.split('?')[0];
                 img.src = base + '?t=' + Date.now();
             });
-            document.querySelectorAll('video').forEach(v => { if(v.paused) v.play().catch(()=>{}); });
             updateStats();
-        }, 15000);
+        }, 30000);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) document.querySelectorAll('video').forEach(v => v.pause());
+        });
         updateStats();
     </script>
 </body>
@@ -1070,13 +1397,42 @@ OBSERVATORY_DASHBOARD_HTML = """
         .view-section { display: none; }
         .view-section.active { display: block; }
         .settings-row { display: grid; grid-template-columns: 90px 1fr 54px; align-items: center; gap: 10px; margin-top: 10px; }
+        .setup-control-card { border-top: 1px solid #26302c; margin-top: 12px; padding-top: 12px; }
         select, input[type="range"] { width: 100%; accent-color: var(--green); }
         select { min-height: 34px; border-radius: 6px; border: 1px solid #3a4541; background: #101514; color: var(--text); padding: 0 8px; }
         .telemetry { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
         .telemetry div { background: var(--panel-2); border: 1px solid #222c28; border-radius: 6px; padding: 10px; min-height: 58px; }
         .telemetry span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; }
         .telemetry strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
-        canvas { width: 100% !important; height: 210px !important; }
+        .chart-wrap { min-height: 320px; height: 320px; padding-bottom: 8px; }
+        .chart-wrap.tall { min-height: 420px; height: 420px; }
+        canvas { width: 100% !important; height: 100% !important; }
+        .segment-box {
+            position: absolute;
+            border: 2px solid var(--cyan);
+            background: rgba(119, 183, 197, .12);
+            color: #fff;
+            pointer-events: none;
+            font-size: .75rem;
+            font-weight: 800;
+            padding: 2px 5px;
+            text-shadow: 0 1px 2px #000;
+        }
+        .draw-segment-active { outline: 2px solid var(--cyan); cursor: crosshair; }
+        .live-active { outline: 2px solid var(--green); }
+        .split-grid { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(320px, 1.1fr); gap: 16px; align-items: start; }
+        .device-list { display: grid; gap: 8px; }
+        .device-list button { text-align: left; }
+        .seg-camera-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 12px; }
+        .seg-camera-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--panel-2); }
+        .manual-crop { display: none; width: 100%; min-height: 260px; border: 1px solid #73562b; border-radius: 6px; background: #050706; margin-top: 10px; cursor: crosshair; }
+        .modal-backdrop { position: fixed; inset: 0; z-index: 50; display: none; background: rgba(0,0,0,.76); padding: 22px; }
+        .modal-backdrop.active { display: grid; place-items: center; }
+        .manual-tag-modal { width: min(96vw, 1320px); height: min(94vh, 920px); background: #0f1413; border: 1px solid #3a4541; border-radius: 8px; display: grid; grid-template-rows: auto 1fr auto; gap: 12px; padding: 14px; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+        .manual-tag-modal canvas { width: 100% !important; height: 100% !important; min-height: 0; border: 1px solid #73562b; border-radius: 6px; background: #050706; cursor: crosshair; }
+        .modal-head, .modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .chart-controls { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 10px; margin: 8px 0 12px; }
+        .chart-controls input { min-height: 34px; border-radius: 6px; border: 1px solid #3a4541; background: #101514; color: var(--text); padding: 0 8px; }
         .timeline { display: grid; gap: 10px; margin-top: 12px; }
         .event { display: grid; grid-template-columns: 82px 1fr; gap: 10px; border-top: 1px solid #26302c; padding-top: 10px; color: #c9d3ce; }
         .event time { color: var(--muted); font-size: .78rem; }
@@ -1098,12 +1454,11 @@ OBSERVATORY_DASHBOARD_HTML = """
             <div class="subtitle">Phenotyping control and biological state</div>
             <div class="nav-section">Workspace</div>
             <div class="nav-item active" data-view="mission" onclick="showSection('mission', this)">Mission Control <span class="pill">{{ devices|length }}</span></div>
+            <div class="nav-item" data-view="segmentation" onclick="showSection('segmentation', this)">Setup</div>
+            <div class="nav-item" data-view="growth" onclick="showSection('growth', this)">Growth Analytics</div>
             <div class="nav-item" data-view="experiments" onclick="showSection('experiments', this)">Active Experiments</div>
-            <div class="nav-item" data-view="plants" onclick="showSection('plants', this)">Plants</div>
-            <div class="nav-item" data-view="analytics" onclick="showSection('analytics', this)">Analytics</div>
             <div class="nav-section">Operations</div>
-            <div class="nav-item" data-view="timelapses" onclick="showSection('timelapses', this)">Timelapses</div>
-            <div class="nav-item" data-view="calibration" onclick="showSection('calibration', this)">Calibration</div>
+            <div class="nav-item" data-view="volume" onclick="showSection('volume', this)">Canopy Volume</div>
             <div class="nav-item" data-view="health" onclick="showSection('health', this)">Device Health</div>
             <div class="nav-item" data-view="settings" onclick="showSection('settings', this)">Settings</div>
         </aside>
@@ -1130,23 +1485,22 @@ OBSERVATORY_DASHBOARD_HTML = """
             <section class="panel" id="operation-result" style="display:none; margin-bottom:16px"></section>
             <div class="workspace view-section active" id="view-mission">
                 <section class="panel">
-                    <div class="panel-head"><div><h2>Camera Feeds</h2><div class="muted">Latest frame with segmentation overlay and capture controls</div></div></div>
+                    <div class="panel-head"><div><h2>Camera Feeds</h2><div class="muted">Latest frame with capture controls</div></div></div>
                     {% if devices %}
                     <div class="camera-grid">
                         {% for d in devices %}
-                        <article class="device-card" data-device="{{ d }}">
+                        <article class="device-card" data-device="{{ d }}" data-live-stream="{{ '1' if d in network_stream_ids else '0' }}">
                             <div class="device-title"><div class="device-id" id="title-{{ d }}">{{ d }}</div><span class="badge" id="badge-{{ d }}" style="display:none">Fastest</span></div>
                             <div class="muted">Last sync: <span id="last-{{ d }}">{{ last.get(d, 'Initializing') }}</span></div>
                             <div class="image-wrap" id="image-wrap-{{d}}">
-                                <img id="analysis-{{d}}" src="/analysis_debug/{{d}}" onload="renderCalibrationOverlays('{{d}}', (latestStats['{{d}}'] || {}).data || {})" onpointerdown="startIgnoreDrag(event, '{{d}}')" onpointermove="moveIgnoreDrag(event, '{{d}}')" onpointerup="finishIgnoreDrag(event, '{{d}}')" onpointercancel="cancelIgnoreDrag('{{d}}')" onerror="this.onerror=null; this.src='/last_frame/{{d}}'">
+                                <img id="analysis-{{d}}" src="/analysis_debug/{{d}}" onload="renderCalibrationOverlays('{{d}}', (latestStats['{{d}}'] || {}).data || {}); renderAllSegmentOverlays()" onpointerdown="startIgnoreDrag(event, '{{d}}')" onpointermove="moveIgnoreDrag(event, '{{d}}')" onpointerup="finishIgnoreDrag(event, '{{d}}')" onpointercancel="cancelIgnoreDrag('{{d}}')" onerror="this.onerror=null; this.src='/last_frame/{{d}}'">
+                                <div class="calib-overlay" id="segment-overlay-{{d}}"></div>
                                 <div class="calib-overlay" id="calib-overlay-{{d}}"></div>
                                 <div id="selection-{{d}}" style="position:absolute; border: 2px dashed var(--amber); pointer-events:none; display:none;"></div>
                             </div>
                             <div class="controls">
-                                <button onclick="fetch('/capture/{{d}}').then(()=>location.reload())">Capture</button>
+                                <button onclick="captureDevice('{{d}}')">Capture</button>
                                 <button onclick="refreshFrame('{{d}}')">Refresh</button>
-                                <button onclick="enableIgnoreMode('{{d}}')">Ignore Region</button>
-                                <button onclick="clearIgnore('{{d}}')">Clear Ignores</button>
                             </div>
                             {% if d.startswith('escam_') %}
                             <div class="ptz-pad">
@@ -1161,6 +1515,64 @@ OBSERVATORY_DASHBOARD_HTML = """
                                 <button onclick="ptzMove('{{d}}','down_right')">↘</button>
                             </div>
                             {% endif %}
+                            <video id="vid-{{d}}" controls loop muted preload="metadata"><source src="/video/{{d}}" type="video/mp4"></video>
+                            <div class="telemetry" id="stats-{{d}}">
+                                <div><span>Markers</span><strong>--</strong></div><div><span>Canopy</span><strong>--</strong></div>
+                                <div><span>Growth</span><strong>--</strong></div><div><span>Health</span><strong>Collecting</strong></div>
+                            </div>
+                        </article>
+                        {% endfor %}
+                    </div>
+                    {% else %}
+                    <div class="empty">No ADB cameras are online. Connect the Galaxy S5 Neo and keep USB debugging enabled.</div>
+                    {% endif %}
+                </section>
+                <aside class="panel">
+                    <div class="panel-head"><div><h2>Growth Analytics</h2><div class="muted">Canopy area over time</div></div></div>
+                    <div class="chart-wrap"><canvas id="fleet-chart"></canvas></div>
+                    <div class="timeline" id="event-timeline"><div class="event"><time>Now</time><div>Waiting for capture telemetry.</div></div></div>
+                </aside>
+            </div>
+            <section class="panel view-section" id="view-segmentation">
+                <h2>Setup</h2>
+                <div class="muted" style="margin-top:6px">Select one camera, tune capture settings for tag detection, draw tray/plant regions, ignore false green areas, or manually register a visible tag.</div>
+                <div class="split-grid" style="margin-top:14px">
+                    <div>
+                        <div class="device-list">
+                            {% for d in devices %}
+                            <button onclick="selectSegmentationDevice('{{d}}')">{{ d }}</button>
+                            {% endfor %}
+                        </div>
+                        <div class="timeline" id="segment-list"></div>
+                    </div>
+                    <div>
+                        <div class="controls">
+                            <button onclick="enableSegmentMode()">Segment Box</button>
+                            <button onclick="enablePolygonSegmentMode()">Segment Polygon</button>
+                            <button onclick="enableIgnoreEditorMode('ignore-box')">Ignore Box</button>
+                            <button onclick="enableIgnoreEditorMode('ignore-polygon')">Ignore Polygon</button>
+                            <button onclick="enableManualMarkerMode()">Manual Tag</button>
+                            <button onclick="clearManualTagsForSelected()">Remove Tags</button>
+                            <button onclick="clearEditorIgnores()">Clear Ignores</button>
+                            <button onclick="refreshSegmentationFrame()">Refresh Frame</button>
+                        </div>
+                        <div class="image-wrap">
+                            <img id="segment-image" src="" onpointerdown="startSegmentDrag(event)" onpointermove="moveSegmentDrag(event)" onpointerup="finishSegmentDrag(event)" ondblclick="finishPointMode()" onerror="this.style.display='none'">
+                            <div id="segment-overlays"></div>
+                            <div id="segment-selection" style="position:absolute; border:2px dashed var(--cyan); pointer-events:none; display:none;"></div>
+                        </div>
+                        {% for d in devices %}
+                        <div class="setup-control-card" id="setup-controls-{{d}}" data-setup-device="{{d}}" style="display:none">
+                            <div class="controls" style="margin-top:12px">
+                                <select id="profile-toggle-{{d}}" onchange="applyNamedProfile('{{d}}', this.value)">
+                                    <option value="day">Day Profile</option>
+                                    <option value="wide_day">Wide Day</option>
+                                    <option value="night_ir">Night IR</option>
+                                </select>
+                                <button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button>
+                                <button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button>
+                                <button onclick="saveCurrentProfile('{{d}}')">Save Profile</button>
+                            </div>
                             <div class="settings-row">
                                 <label class="muted" for="zoom-{{d}}">Zoom</label>
                                 <input id="zoom-{{d}}" type="range" min="0" max="100" value="0" oninput="previewZoom('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'zoom_percent', this.value)">
@@ -1209,59 +1621,76 @@ OBSERVATORY_DASHBOARD_HTML = """
                                 </select>
                                 <strong></strong>
                             </div>
-                            <div class="controls">
-                                <button id="profile-toggle-{{d}}" onclick="toggleLightProfile('{{d}}')">Night Profile</button>
-                                <button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button>
+                            <div class="controls" style="margin-top:12px">
+                                <button onclick="autoTuneTags('{{d}}')">Auto Sweep Tags</button>
+                                <button onclick="enableIgnoreEditorMode('ignore-box')">Ignore Box</button>
+                                <button onclick="enableIgnoreEditorMode('ignore-polygon')">Ignore Polygon</button>
+                                <button onclick="clearEditorIgnores()">Clear Ignores</button>
                             </div>
-                            <video id="vid-{{d}}" controls loop autoplay muted><source src="/video/{{d}}" type="video/mp4"></video>
-                            <div class="telemetry" id="stats-{{d}}">
-                                <div><span>Markers</span><strong>--</strong></div><div><span>Canopy</span><strong>--</strong></div>
-                                <div><span>Growth</span><strong>--</strong></div><div><span>Health</span><strong>Collecting</strong></div>
-                            </div>
-                        </article>
+                        </div>
                         {% endfor %}
                     </div>
-                    {% else %}
-                    <div class="empty">No ADB cameras are online. Connect the Galaxy S5 Neo and keep USB debugging enabled.</div>
-                    {% endif %}
-                </section>
-                <aside class="panel">
-                    <div class="panel-head"><div><h2>Growth Analytics</h2><div class="muted">Canopy area over time</div></div></div>
-                    <canvas id="fleet-chart"></canvas>
-                    <div class="timeline" id="event-timeline"><div class="event"><time>Now</time><div>Waiting for capture telemetry.</div></div></div>
-                    <div style="margin-top:16px">
-                        <h3>Device Health</h3>
-                        {% for d in devices %}
-                        <div style="margin-top:10px"><div class="muted">{{ d }}</div><div class="log" id="log-{{d}}">{{ logs[d] }}</div></div>
-                        {% endfor %}
-                    </div>
-                </aside>
-            </div>
-            <section class="panel view-section" id="view-experiments"><h2>Active Experiments</h2><div class="timeline" id="experiments-list"><div class="event"><time>Live</time><div>Current capture loop is the active experiment. Experiment grouping is ready for plant/genotype metadata next.</div></div></div></section>
-            <section class="panel view-section" id="view-plants"><h2>Plants</h2><div class="timeline" id="plants-list"></div></section>
-            <section class="panel view-section" id="view-analytics">
-                <h2>Analytics</h2>
-                <div class="muted" style="margin-top:6px">Trait ranking, segmentation features, and circadian motion signals</div>
-                <canvas id="analytics-chart"></canvas>
-                <div class="timeline" id="trait-ranking"></div>
-                <div class="timeline">
-                    <div class="event"><time>Segment</time><div><strong>Feature extraction framework</strong><br>Plant segmentation, mask extraction, contour analysis, green pixel analysis, canopy metrics, and shape descriptors.</div></div>
-                    <div class="event"><time>Derived</time><div>Projected leaf area, convex hull area, centroid, canopy density, Excess Green, and entropy.</div></div>
-                    <div class="event"><time>Circadian</time><div><strong>Movement rhythm analysis</strong><br>Leaf angle changes, centroid movement, canopy width oscillation, and posture variation across photoperiod cycles.</div></div>
-                    <div class="event"><time>Motion</time><div>Planned optical flow and motion field analysis for circadian entrainment, stress disruption, and photoperiod response.</div></div>
                 </div>
             </section>
-            <section class="panel view-section" id="view-timelapses"><h2>Timelapses</h2><div class="timeline" id="timelapse-list"></div></section>
-            <section class="panel view-section" id="view-calibration"><h2>Calibration</h2><div class="timeline" id="calibration-list"><div class="event"><time>Ready</time><div>Use Calibrate 3D to estimate camera poses from current ChArUco detections. Results now appear in the operation panel above Mission Control.</div></div></div></section>
-            <section class="panel view-section" id="view-health"><h2>Device Health</h2><div class="timeline" id="health-list"></div></section>
-            <section class="panel view-section" id="view-settings"><h2>Settings</h2><div class="timeline"><div class="event"><time>Camera</time><div>Per-device zoom, anti-banding, and focus controls live on each camera card. Capture again after changing them so the APK applies the new settings.</div></div></div></section>
+            <section class="panel view-section" id="view-growth">
+                <h2>Growth Analytics</h2>
+                <div class="muted" style="margin-top:6px">Each camera gets its own chart. Named segmentation regions become individual lines.</div>
+                <div id="growth-charts" class="timeline"></div>
+            </section>
+            <section class="panel view-section" id="view-experiments"><h2>Active Experiments</h2><div class="timeline" id="experiments-list"><div class="event"><time>Live</time><div>Ranked by grow speed, current movement proxies, recovery after harvest once harvest events are recorded, and health stability.</div></div></div><div class="timeline" id="trait-ranking"></div></section>
+            <section class="panel view-section" id="view-volume">
+                <h2>Canopy Volume</h2>
+                <div class="muted" style="margin-top:6px">Select cameras seeing the same plants and calibration target, confirm target dimensions, then calibrate and reconstruct.</div>
+                <div class="timeline" id="volume-camera-list"></div>
+                <div class="controls" style="max-width:520px">
+                    <button onclick="calibrateMulti()">Calibrate 3D</button>
+                    <button onclick="reconstruct3D()">Run Volumetric</button>
+                </div>
+                <canvas id="volume-preview" style="margin-top:12px; height:320px !important; background:#070908; border:1px solid #26302c; border-radius:6px"></canvas>
+                <div class="timeline" id="calibration-list"><div class="event"><time>Ready</time><div>Use the red marker editors on Mission Control to confirm ArUco/ChArUco dimensions first.</div></div></div>
+            </section>
+            <section class="panel view-section" id="view-health"><h2>Device Health</h2><div class="timeline" id="health-list"></div>{% for d in devices %}<div style="margin-top:10px"><div class="muted">{{ d }}</div><div class="log" id="log-{{d}}">{{ logs[d] }}</div></div>{% endfor %}</section>
+            <section class="panel view-section" id="view-settings">
+                <h2>Settings</h2>
+                <div class="timeline"><div class="event"><time>Camera</time><div>Use Setup for capture tuning, tag detection, segmentation, and ignore regions. Mission Control is for observing, capture, refresh, and ESCAM movement.</div></div></div>
+                <h3 style="margin-top:18px">Tag Detection Sweep</h3>
+                <div class="timeline">
+                    {% for d in devices %}
+                    <div class="event"><time>ADB</time><div><strong>{{ d }}</strong><br>Automatically try settle, banding, focus, exposure, and ISO combinations to maximize detected ArUco/ChArUco markers.<br><button onclick="autoTuneTags('{{d}}')">Auto Sweep Tags</button></div></div>
+                    {% endfor %}
+                </div>
+                <h3 style="margin-top:18px">Timelapses</h3>
+                <div class="timeline" id="timelapse-list"></div>
+            </section>
         </main>
+    </div>
+    <div class="modal-backdrop" id="manual-tag-modal">
+        <div class="manual-tag-modal">
+            <div class="modal-head">
+                <div><h2>Manual Tag</h2><div class="muted" id="manual-tag-help">Click the four outer marker corners around the perimeter.</div></div>
+                <button onclick="closeManualTagModal()">Close</button>
+            </div>
+            <canvas id="manual-marker-crop" onclick="manualCropClick(event)"></canvas>
+            <div class="modal-actions">
+                <div class="muted" id="manual-tag-count">0 / 4 corners</div>
+                <div class="actions">
+                    <button onclick="resetManualTagCorners()">Reset Corners</button>
+                    <button class="primary" onclick="finishManualTagFromModal()">Finish Tag</button>
+                </div>
+            </div>
+        </div>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         const charts = {};
         const ignoreState = {};
+        const segmentState = { deviceId: null, enabled: false, dragging: false, mode: 'box', points: [], roi: null, manualMarkers: {}, segments: {} };
+        const growthControls = {};
+        let liveDevice = null;
+        let liveTimer = null;
+        let liveBusy = false;
         let latestStats = {};
+        let activeView = 'mission';
         function fmt(value, digits = 1) { return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
         function showOperation(title, detail, tone = 'normal') {
             const el = document.getElementById('operation-result');
@@ -1270,16 +1699,25 @@ OBSERVATORY_DASHBOARD_HTML = """
             el.innerHTML = `<h2>${title}</h2><div class="muted" style="margin-top:6px">${detail}</div>`;
         }
         function showSection(name, item) {
+            activeView = name;
             document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
             const section = document.getElementById('view-' + name);
             if (section) section.classList.add('active');
             if (item) item.classList.add('active');
+            pauseHiddenVideos();
+            if (name === 'settings') renderTimelapses(latestStats);
+            if (name === 'growth') renderGrowthCharts(latestStats);
+            if (name === 'segmentation') loadSegments();
+            if (name === 'segmentation' && !segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
         }
         function calibrateMulti() {
             if (confirm("Calibrate the multi-camera coordinate system using current frames?")) {
                 showOperation('Calibration running', 'Looking for ChArUco corners in the current frames...');
-                fetch('/calibrate_multicam').then(async r => {
+                fetch('/calibrate_multicam' + selectedVolumeQuery()).then(async r => {
                     const body = r.headers.get('content-type')?.includes('application/json') ? await r.json() : { error: await r.text() };
                     if (!r.ok) throw new Error(body.error || body.message || 'Calibration failed');
                     return body;
@@ -1291,16 +1729,119 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function reconstruct3D() {
             showOperation('Volumetric reconstruction running', 'Projecting silhouettes into the calibrated volume...');
-            fetch('/reconstruct').then(async r => {
+            fetch('/reconstruct' + selectedVolumeQuery()).then(async r => {
                 const body = r.headers.get('content-type')?.includes('application/json') ? await r.json() : { error: await r.text() };
                 if (!r.ok) throw new Error(body.error || body.message || 'Reconstruction failed');
                 return body;
             }).then(d => {
                 const cm3 = d.volume_mm3 ? (d.volume_mm3 / 1000).toFixed(2) : '0.00';
                 showOperation('Volumetric reconstruction complete', `Volume: ${cm3} cm3. Occupied voxels: ${d.occupied_voxels || 0}. Grid: ${(d.grid_shape || []).join(' x ')}`);
+                renderVolumePreview(d);
             }).catch(e => showOperation('Reconstruction failed', e.message, 'bad'));
         }
+        function renderVolumePreview(data) {
+            const canvas = document.getElementById('volume-preview');
+            if (!canvas || !data.preview_points) return;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = Math.max(320, Math.floor(rect.width));
+            canvas.height = 320;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#070908';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const bounds = data.world_bounds || [-200, -200, 0, 200, 200, 400];
+            ctx.fillStyle = '#7ac77f';
+            for (const p of data.preview_points) {
+                const x = (p[0] - bounds[0]) / Math.max(1, bounds[3] - bounds[0]) * canvas.width;
+                const y = canvas.height - ((p[2] - bounds[2]) / Math.max(1, bounds[5] - bounds[2]) * canvas.height);
+                ctx.globalAlpha = 0.45;
+                ctx.fillRect(x, y, 2, 2);
+            }
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = '#8c9a94';
+            ctx.fillText('Side preview: X by height. Sparse/missing areas indicate reconstruction gaps.', 12, 20);
+        }
+        function selectedVolumeQuery() {
+            if (activeView !== 'volume') return '';
+            const devices = Array.from(document.querySelectorAll('.volume-camera-check:checked')).map(el => el.value);
+            return devices.length ? '?devices=' + encodeURIComponent(devices.join(',')) : '';
+        }
         function refreshFrame(deviceId) { document.getElementById('analysis-' + deviceId).src = '/analysis_debug/' + deviceId + '?t=' + Date.now(); }
+        function captureDevice(deviceId) {
+            if (liveDevice === deviceId) toggleLiveView(deviceId);
+            fetch('/capture/' + deviceId).then(() => location.reload());
+        }
+        function deviceUsesNetworkStream(deviceId) {
+            return document.querySelector(`[data-device="${deviceId}"]`)?.dataset.liveStream === '1';
+        }
+        function stopLiveStreamImage(deviceId) {
+            const img = document.getElementById('analysis-' + deviceId);
+            if (!img) return;
+            img.src = '/analysis_debug/' + deviceId + '?t=' + Date.now();
+        }
+        function liveCaptureOnce(deviceId) {
+            if (liveBusy || liveDevice !== deviceId || document.hidden) return;
+            liveBusy = true;
+            fetch('/capture/' + deviceId)
+                .then(() => {
+                    refreshFrame(deviceId);
+                    updateStats();
+                })
+                .catch(e => showOperation('Live view capture failed', `${deviceId}: ${e.message}`, 'warn'))
+                .finally(() => { liveBusy = false; });
+        }
+        function toggleLiveView(deviceId) {
+            if (liveDevice === deviceId) {
+                clearInterval(liveTimer);
+                liveTimer = null;
+                liveBusy = false;
+                document.getElementById('analysis-' + deviceId)?.classList.remove('live-active');
+                const currentButton = document.getElementById('live-button-' + deviceId);
+                if (currentButton) currentButton.textContent = 'Live View';
+                if (deviceUsesNetworkStream(deviceId)) stopLiveStreamImage(deviceId);
+                liveDevice = null;
+                showOperation('Live view stopped', `${deviceId} is back to normal refresh cadence.`);
+                return;
+            }
+            if (liveDevice) {
+                document.getElementById('analysis-' + liveDevice)?.classList.remove('live-active');
+                const previousButton = document.getElementById('live-button-' + liveDevice);
+                if (previousButton) previousButton.textContent = 'Live View';
+                if (deviceUsesNetworkStream(liveDevice)) stopLiveStreamImage(liveDevice);
+            }
+            clearInterval(liveTimer);
+            liveBusy = false;
+            liveDevice = deviceId;
+            document.getElementById('analysis-' + deviceId)?.classList.add('live-active');
+            const liveButton = document.getElementById('live-button-' + deviceId);
+            if (liveButton) liveButton.textContent = 'Stop Live';
+            if (deviceUsesNetworkStream(deviceId)) {
+                const img = document.getElementById('analysis-' + deviceId);
+                img.src = '/live_stream/' + deviceId + '?t=' + Date.now();
+                showOperation('Live stream active', `${deviceId} is showing the configured network stream. Only one live stream runs at a time.`);
+                return;
+            }
+            const settingsDelay = Number(document.getElementById('delay-' + deviceId)?.value || 5000);
+            const interval = deviceId.startsWith('escam_') ? 3500 : Math.max(8000, settingsDelay + 3000);
+            liveCaptureOnce(deviceId);
+            liveTimer = setInterval(() => liveCaptureOnce(deviceId), interval);
+            showOperation('Live view active', `${deviceId} is taking fresh low-rate captures every ${(interval / 1000).toFixed(1)}s. Only one live view runs at a time.`);
+        }
+        function isElementVisible(el) {
+            return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        }
+        function refreshVisibleFrames() {
+            if (document.hidden) return;
+            document.querySelectorAll('.view-section.active img[id^="analysis-"]').forEach(img => {
+                if (isElementVisible(img)) img.src = img.src.split('?')[0] + '?t=' + Date.now();
+            });
+        }
+        function pauseHiddenVideos() {
+            document.querySelectorAll('video').forEach(video => {
+                const activeSection = video.closest('.view-section.active');
+                if (!activeSection || document.hidden) video.pause();
+            });
+        }
         function clearIgnore(deviceId) {
             fetch('/clear_ignore/' + deviceId).then(() => {
                 showOperation('Ignore regions cleared', `${deviceId} will use the full frame on the next analysis pass.`);
@@ -1417,17 +1958,19 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function toggleLightProfile(deviceId) {
             const current = document.getElementById('profile-toggle-' + deviceId)?.dataset.activeMode || 'day';
-            const nextMode = current === 'night' ? 'day' : 'night';
-            const profile = nextMode === 'night' ? {
-                light_mode: 'night',
+            const nextMode = current === 'night_ir' ? 'day' : 'night_ir';
+            const profile = nextMode === 'night_ir' ? {
+                light_mode: 'night_ir',
+                profile_name: 'night_ir',
                 zoom_percent: 0,
                 delay_ms: 8000,
                 exposure_compensation: 4,
-                iso: '800',
+                iso: '1600',
                 focus_mode: 'continuous-picture',
                 antibanding: '60hz'
             } : {
                 light_mode: 'day',
+                profile_name: 'day',
                 delay_ms: 5000,
                 exposure_compensation: 0,
                 iso: 'auto',
@@ -1440,9 +1983,24 @@ OBSERVATORY_DASHBOARD_HTML = """
             });
         }
         function setAutoLight(deviceId) {
-            saveDeviceSettings(deviceId, { light_mode: 'auto' }).then(settings => {
+            saveDeviceSettings(deviceId, { light_mode: 'auto', profile_name: 'auto' }).then(settings => {
                 showOperation('Auto light sensing enabled', `${deviceId}: latest brightness ${settings.latest_luminance === null ? 'unknown' : settings.latest_luminance.toFixed(1)}; active profile is ${settings.active_light_mode}.`);
             });
+        }
+        function applyNamedProfile(deviceId, name) {
+            const profiles = {
+                day: { light_mode: 'day', profile_name: 'day', delay_ms: 5000, exposure_compensation: 0, iso: 'auto', focus_mode: 'continuous-picture', antibanding: '60hz' },
+                wide_day: { light_mode: 'day', profile_name: 'wide_day', zoom_percent: 0, delay_ms: 5000, exposure_compensation: 0, iso: 'auto', focus_mode: 'continuous-picture', antibanding: '60hz' },
+                night_ir: { light_mode: 'night_ir', profile_name: 'night_ir', zoom_percent: 0, delay_ms: 9000, exposure_compensation: 4, iso: '1600', focus_mode: 'continuous-picture', antibanding: '60hz' }
+            };
+            saveDeviceSettings(deviceId, profiles[name] || profiles.day).then(() => {
+                showOperation('Profile applied', `${deviceId}: ${name.replace('_', ' ')} settings saved. Use Live View to fine tune before moving to the next camera.`);
+            });
+        }
+        function saveCurrentProfile(deviceId) {
+            const name = prompt('Profile name');
+            if (!name) return;
+            showOperation('Profile noted', `${deviceId}: "${name}" is ready to become a persistent preset. The current controls are already saved as device settings.`);
         }
         function ptzMove(cameraId, direction) {
             fetch(`/ptz/${cameraId}/${direction}`, {
@@ -1484,8 +2042,9 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (focus) focus.value = settings.focus_mode || 'continuous-picture';
             if (antibanding) antibanding.value = settings.antibanding || '60hz';
             if (toggle) {
+                const profileName = settings.profile_name || settings.light_mode || settings.active_light_mode || 'day';
                 toggle.dataset.activeMode = settings.active_light_mode || settings.light_mode || 'day';
-                toggle.textContent = (settings.active_light_mode || 'day') === 'night' ? 'Day Profile' : 'Night Profile';
+                toggle.value = ['day', 'wide_day', 'night_ir'].includes(profileName) ? profileName : ((settings.active_light_mode || settings.light_mode) === 'night_ir' ? 'night_ir' : 'day');
             }
             if (auto) {
                 const luma = settings.latest_luminance === null || settings.latest_luminance === undefined ? '--' : Number(settings.latest_luminance).toFixed(0);
@@ -1495,6 +2054,377 @@ OBSERVATORY_DASHBOARD_HTML = """
         function loadDeviceSettings() {
             fetch('/device_settings').then(r => r.json()).then(all => {
                 Object.entries(all).forEach(([deviceId, settings]) => applyDeviceSettings(deviceId, settings));
+            });
+        }
+        function loadSegments() {
+            Promise.all([
+                fetch('/segments').then(r => r.json()),
+                fetch('/manual_markers').then(r => r.json())
+            ]).then(([segments, manualMarkers]) => {
+                segmentState.segments = segments || {};
+                segmentState.manualMarkers = manualMarkers || {};
+                if (!segmentState.deviceId) {
+                    const first = Object.keys(segmentState.segments || {})[0] || Object.keys(latestStats || {})[0];
+                    if (first) selectSegmentationDevice(first);
+                }
+                renderAllSegmentOverlays();
+                renderSegmentList();
+                renderGrowthCharts(latestStats);
+            });
+        }
+        function selectSegmentationDevice(deviceId) {
+            segmentState.deviceId = deviceId;
+            segmentState.roi = null;
+            segmentState.points = [];
+            document.querySelectorAll('.setup-control-card').forEach(card => {
+                card.style.display = card.dataset.setupDevice === deviceId ? 'block' : 'none';
+            });
+            const img = document.getElementById('segment-image');
+            img.style.display = 'block';
+            img.src = '/analysis_debug/' + deviceId + '?t=' + Date.now();
+            img.onload = () => renderSegmentationEditorOverlays();
+            const crop = document.getElementById('manual-marker-crop');
+            if (crop) crop.style.display = 'none';
+            renderSegmentList();
+        }
+        function refreshSegmentationFrame() {
+            if (segmentState.deviceId) selectSegmentationDevice(segmentState.deviceId);
+        }
+        function enableSegmentMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            segmentState.enabled = true;
+            segmentState.mode = 'box';
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            showOperation('Segmentation draw mode', 'Drag across the selected image to define a tray or individual plant region.');
+        }
+        function enablePolygonSegmentMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            segmentState.enabled = true;
+            segmentState.mode = 'polygon';
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            showOperation('Polygon segmentation mode', 'Click each tray corner in order, then double-click the image to finish.');
+        }
+        function enableManualMarkerMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            segmentState.enabled = true;
+            segmentState.mode = 'manual-roi';
+            segmentState.points = [];
+            segmentState.roi = null;
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            showOperation('Manual tag mode', 'First drag a box around only the visible tag. A magnified crop will open, then click the four outer corners clockwise or counter-clockwise.');
+        }
+        function enableIgnoreEditorMode(mode) {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            segmentState.enabled = true;
+            segmentState.mode = mode;
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('mask-active');
+            showOperation(mode === 'ignore-polygon' ? 'Ignore polygon mode' : 'Ignore box mode', mode === 'ignore-polygon' ? 'Click around false green/artifact space, then double-click the image to finish.' : 'Drag over false green/artifact space.');
+        }
+        function segmentImagePoint(event, img) {
+            const rect = img.getBoundingClientRect();
+            return {
+                x: (event.clientX - rect.left) * (img.naturalWidth / rect.width),
+                y: (event.clientY - rect.top) * (img.naturalHeight / rect.height),
+                sx: event.clientX - rect.left,
+                sy: event.clientY - rect.top
+            };
+        }
+        function startSegmentDrag(event) {
+            if (!segmentState.enabled || !segmentState.deviceId) return;
+            event.preventDefault();
+            const point = segmentImagePoint(event, event.target);
+            if (segmentState.mode === 'polygon' || segmentState.mode === 'ignore-polygon') {
+                segmentState.points.push(point);
+                renderPointModeOverlay();
+                return;
+            }
+            segmentState.dragging = true;
+            segmentState.start = point;
+            const sel = document.getElementById('segment-selection');
+            sel.style.left = point.sx + 'px';
+            sel.style.top = point.sy + 'px';
+            sel.style.width = '0px';
+            sel.style.height = '0px';
+            sel.style.display = 'block';
+        }
+        function moveSegmentDrag(event) {
+            if (!segmentState.dragging || !['box', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
+            event.preventDefault();
+            const point = segmentImagePoint(event, event.target);
+            segmentState.current = point;
+            const sel = document.getElementById('segment-selection');
+            sel.style.left = Math.min(segmentState.start.sx, point.sx) + 'px';
+            sel.style.top = Math.min(segmentState.start.sy, point.sy) + 'px';
+            sel.style.width = Math.abs(point.sx - segmentState.start.sx) + 'px';
+            sel.style.height = Math.abs(point.sy - segmentState.start.sy) + 'px';
+        }
+        function finishSegmentDrag(event) {
+            if (!segmentState.dragging || !['box', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
+            moveSegmentDrag(event);
+            const region = [
+                Math.min(segmentState.start.x, segmentState.current.x),
+                Math.min(segmentState.start.y, segmentState.current.y),
+                Math.max(segmentState.start.x, segmentState.current.x),
+                Math.max(segmentState.start.y, segmentState.current.y)
+            ].map(Math.round);
+            segmentState.dragging = false;
+            segmentState.enabled = false;
+            document.getElementById('segment-selection').style.display = 'none';
+            document.getElementById('segment-image')?.classList.remove('draw-segment-active');
+            if (Math.abs(region[2] - region[0]) < 10 || Math.abs(region[3] - region[1]) < 10) return;
+            if (segmentState.mode === 'ignore-box') {
+                saveIgnoreFromEditor({ region });
+                return;
+            }
+            if (segmentState.mode === 'manual-roi') {
+                segmentState.roi = region;
+                segmentState.enabled = true;
+                segmentState.mode = 'manual-corners';
+                segmentState.points = [];
+                drawManualCrop();
+                showOperation('Manual tag crop ready', 'Click the four outer marker corners on the magnified crop. Order should go around the perimeter, clockwise or counter-clockwise.');
+                return;
+            }
+            const name = prompt('Segment name', `Tray ${(segmentState.segments[segmentState.deviceId] || []).length + 1}`);
+            if (!name) return;
+            fetch('/segments/' + segmentState.deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ name, region })
+            }).then(r => r.json()).then(() => {
+                showOperation('Segment saved', `${segmentState.deviceId}: ${name}`);
+                loadSegments();
+                updateStats();
+            });
+        }
+        function finishPointMode() {
+            if (!segmentState.enabled || !segmentState.deviceId) return;
+            if (segmentState.mode === 'polygon') {
+                if (segmentState.points.length < 3) {
+                    showOperation('Polygon skipped', 'A polygon needs at least 3 points.', 'warn');
+                    return;
+                }
+                const name = prompt('Segment name', `Tray ${(segmentState.segments[segmentState.deviceId] || []).length + 1}`);
+                if (!name) return;
+                const polygon = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
+                fetch('/segments/' + segmentState.deviceId, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name, polygon })
+                }).then(r => r.json()).then(() => {
+                    stopPointMode();
+                    showOperation('Polygon segment saved', `${segmentState.deviceId}: ${name}`);
+                    loadSegments();
+                    updateStats();
+                });
+                return;
+            }
+            if (segmentState.mode === 'ignore-polygon') {
+                if (segmentState.points.length < 3) {
+                    showOperation('Ignore polygon skipped', 'A polygon needs at least 3 points.', 'warn');
+                    return;
+                }
+                const polygon = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
+                saveIgnoreFromEditor({ polygon });
+                return;
+            }
+            if (segmentState.mode === 'manual-corners') {
+                if (segmentState.points.length !== 4) {
+                    showOperation('Manual tag skipped', 'Manual tag registration needs exactly 4 corner clicks.', 'warn');
+                    return;
+                }
+                const size = Number(prompt('Marker size in mm', '60'));
+                if (!Number.isFinite(size) || size <= 0) return;
+                const markerId = prompt('Marker label', 'manual') || 'manual';
+                const corners = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
+                fetch('/manual_marker/' + segmentState.deviceId, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ corners, size_mm: size, marker_id: markerId })
+                }).then(r => r.json()).then(() => {
+                    stopPointMode();
+                    showOperation('Manual tag saved', `${segmentState.deviceId}: ${size} mm reference registered.`);
+                    refreshFrame(segmentState.deviceId);
+                    updateStats();
+                });
+            }
+        }
+        function stopPointMode() {
+            segmentState.enabled = false;
+            segmentState.dragging = false;
+            segmentState.points = [];
+            segmentState.roi = null;
+            document.getElementById('segment-image')?.classList.remove('draw-segment-active');
+            document.getElementById('segment-image')?.classList.remove('mask-active');
+            closeManualTagModal();
+            renderSegmentationEditorOverlays();
+        }
+        function saveIgnoreFromEditor(payload) {
+            fetch('/ignore_region/' + segmentState.deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(() => {
+                stopPointMode();
+                showOperation('Ignore region saved', `${segmentState.deviceId}: ignored area removed from the green mask.`);
+                refreshFrame(segmentState.deviceId);
+                selectSegmentationDevice(segmentState.deviceId);
+                updateStats();
+            });
+        }
+        function clearEditorIgnores() {
+            if (!segmentState.deviceId) return;
+            clearIgnore(segmentState.deviceId);
+            selectSegmentationDevice(segmentState.deviceId);
+        }
+        function drawManualCrop() {
+            const img = document.getElementById('segment-image');
+            const canvas = document.getElementById('manual-marker-crop');
+            if (!img || !canvas || !segmentState.roi) return;
+            const [x1, y1, x2, y2] = segmentState.roi;
+            const cropW = Math.max(1, x2 - x1);
+            const cropH = Math.max(1, y2 - y1);
+            document.getElementById('manual-tag-modal')?.classList.add('active');
+            const modalRect = canvas.parentElement.getBoundingClientRect();
+            const availableW = Math.max(640, modalRect.width - 28);
+            const availableH = Math.max(420, modalRect.height - 120);
+            const scale = Math.min(8, availableW / cropW, availableH / cropH);
+            canvas.width = Math.max(1, Math.round(cropW * scale));
+            canvas.height = Math.max(1, Math.round(cropH * scale));
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = false;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, x1, y1, cropW, cropH, 0, 0, canvas.width, canvas.height);
+            updateManualTagCount();
+        }
+        function manualCropClick(event) {
+            if (segmentState.mode !== 'manual-corners' || !segmentState.roi) return;
+            const canvas = event.target;
+            const rect = canvas.getBoundingClientRect();
+            const [x1, y1, x2, y2] = segmentState.roi;
+            const x = x1 + ((event.clientX - rect.left) / rect.width) * (x2 - x1);
+            const y = y1 + ((event.clientY - rect.top) / rect.height) * (y2 - y1);
+            segmentState.points.push({ x, y, sx: event.clientX - rect.left, sy: event.clientY - rect.top });
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#df7d7d';
+            ctx.fillRect(event.clientX - rect.left - 4, event.clientY - rect.top - 4, 8, 8);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(String(segmentState.points.length), event.clientX - rect.left + 6, event.clientY - rect.top + 6);
+            updateManualTagCount();
+        }
+        function updateManualTagCount() {
+            const count = document.getElementById('manual-tag-count');
+            if (count) count.textContent = `${segmentState.points.length} / 4 corners`;
+        }
+        function resetManualTagCorners() {
+            segmentState.points = [];
+            drawManualCrop();
+        }
+        function finishManualTagFromModal() {
+            finishPointMode();
+        }
+        function closeManualTagModal() {
+            document.getElementById('manual-tag-modal')?.classList.remove('active');
+        }
+        function clearManualTagsForSelected() {
+            if (!segmentState.deviceId) return;
+            if (!confirm(`Remove all manual tags for ${segmentState.deviceId}?`)) return;
+            fetch(`/manual_marker/${segmentState.deviceId}/clear`, { method: 'POST' }).then(() => {
+                showOperation('Manual tags removed', `${segmentState.deviceId}: all manual tags removed.`);
+                loadSegments();
+                refreshFrame(segmentState.deviceId);
+                updateStats();
+            });
+        }
+        function renderPointModeOverlay() {
+            const overlay = document.getElementById('segment-overlays');
+            const img = document.getElementById('segment-image');
+            if (!overlay || !img || !img.naturalWidth) return;
+            renderSegmentationEditorOverlays();
+            const rect = img.getBoundingClientRect();
+            const sx = rect.width / Math.max(1, img.naturalWidth);
+            const sy = rect.height / Math.max(1, img.naturalHeight);
+            const points = segmentState.points.map(p => [p.x * sx, p.y * sy]);
+            const poly = points.length > 1 ? `<svg class="segment-box" style="left:0;top:0;width:${rect.width}px;height:${rect.height}px;padding:0;border:0;background:transparent" viewBox="0 0 ${rect.width} ${rect.height}" preserveAspectRatio="none"><polyline points="${points.map(p => p.join(',')).join(' ')}" fill="none" stroke="#77b7c5" stroke-width="2"></polyline></svg>` : '';
+            overlay.innerHTML += poly + segmentState.points.map((p, idx) => `<div class="segment-box" style="left:${p.x * sx - 5}px;top:${p.y * sy - 5}px;width:10px;height:10px">${idx + 1}</div>`).join('');
+        }
+        function renderSegmentBoxes(container, img, segments) {
+            if (!container || !img || !img.naturalWidth) return;
+            const rect = img.getBoundingClientRect();
+            const sx = rect.width / Math.max(1, img.naturalWidth);
+            const sy = rect.height / Math.max(1, img.naturalHeight);
+            container.innerHTML = (segments || []).map(seg => {
+                const [x1, y1, x2, y2] = seg.region || [0, 0, 0, 0];
+                if (seg.polygon && seg.polygon.length >= 3) {
+                    const xs = seg.polygon.map(p => p[0]);
+                    const ys = seg.polygon.map(p => p[1]);
+                    const minX = Math.min(...xs), minY = Math.min(...ys);
+                    const points = seg.polygon.map(p => `${(p[0] - minX) * sx},${(p[1] - minY) * sy}`).join(' ');
+                    return `<svg class="segment-box" style="left:${minX * sx}px;top:${minY * sy}px;width:${(Math.max(...xs) - minX) * sx}px;height:${(Math.max(...ys) - minY) * sy}px;padding:0" viewBox="0 0 ${(Math.max(...xs) - minX) * sx} ${(Math.max(...ys) - minY) * sy}" preserveAspectRatio="none"><polygon points="${points}" fill="rgba(119,183,197,.12)" stroke="#77b7c5" stroke-width="2"></polygon><text x="4" y="14" fill="#fff">${seg.name || seg.id}</text></svg>`;
+                }
+                return `<div class="segment-box" title="${seg.name || seg.id}" style="left:${x1 * sx}px;top:${y1 * sy}px;width:${(x2 - x1) * sx}px;height:${(y2 - y1) * sy}px"></div>`;
+            }).join('');
+        }
+        function renderSegmentationEditorOverlays() {
+            renderSegmentBoxes(document.getElementById('segment-overlays'), document.getElementById('segment-image'), segmentState.segments[segmentState.deviceId] || []);
+        }
+        function renderAllSegmentOverlays() {
+            Object.entries(segmentState.segments || {}).forEach(([deviceId, segments]) => {
+                const img = document.getElementById('analysis-' + deviceId);
+                const overlay = document.getElementById('segment-overlay-' + deviceId);
+                renderSegmentBoxes(overlay, img, segments);
+            });
+            renderSegmentationEditorOverlays();
+        }
+        function renderSegmentList() {
+            const list = document.getElementById('segment-list');
+            if (!list) return;
+            const deviceId = segmentState.deviceId || Object.keys(segmentState.segments || {})[0];
+            const segments = (segmentState.segments || {})[deviceId] || [];
+            const markers = (segmentState.manualMarkers || {})[deviceId] || [];
+            const segmentHtml = segments.length ? segments.map(seg => `<div class="event"><time>${deviceId}</time><div><strong>${seg.name}</strong><br>${(seg.polygon ? 'polygon' : (seg.region || []).join(', '))}<br><button type="button" onclick="deleteSegment(${JSON.stringify(deviceId)},${JSON.stringify(seg.id)})">Delete</button></div></div>`).join('') : '<div class="event"><time>None</time><div>No segments saved for the selected camera.</div></div>';
+            const markerHtml = markers.length ? markers.map((marker, idx) => `<div class="event"><time>Tag</time><div><strong>${marker.id || 'manual'}</strong><br>${marker.size_mm} mm manual marker<br><button onclick="deleteManualMarker('${deviceId}','${marker.uid || idx}')">Remove Tag</button></div></div>`).join('') : '';
+            list.innerHTML = segmentHtml + markerHtml;
+        }
+        function deleteSegment(deviceId, segmentId) {
+            fetch(`/segments/${encodeURIComponent(deviceId)}/${encodeURIComponent(segmentId)}`, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(body => {
+                    segmentState.segments[deviceId] = (segmentState.segments[deviceId] || []).filter(seg => seg.id !== segmentId);
+                    renderAllSegmentOverlays();
+                    renderSegmentList();
+                    refreshFrame(deviceId);
+                    if (segmentState.deviceId === deviceId) selectSegmentationDevice(deviceId);
+                    showOperation(
+                        body.deleted ? 'Segment deleted' : 'Segment already gone',
+                        `${deviceId}: ${segmentId}`
+                    );
+                    loadSegments();
+                    updateStats();
+                })
+                .catch(e => showOperation('Segment delete failed', `${deviceId}: ${e.message}`, 'bad'));
+        }
+        function deleteManualMarker(deviceId, uid) {
+            fetch(`/manual_marker/${deviceId}/${uid}`, { method: 'DELETE' }).then(() => {
+                showOperation('Manual tag removed', `${deviceId}: manual tag was removed and analysis regenerated.`);
+                loadSegments();
+                refreshFrame(deviceId);
+                updateStats();
             });
         }
         function markerBounds(marker) {
@@ -1526,12 +2456,12 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const height = Math.max(28, b.height * scale.sy);
                 const left = marker.center[0] * scale.sx;
                 const top = marker.center[1] * scale.sy;
-                return `<button class="marker-hotspot" style="left:${left}px;top:${top}px;width:${width}px;height:${height}px" onclick='openMarkerEditor(event, "${deviceId}", ${JSON.stringify(marker)})'>${marker.id}</button>`;
+                return `<button class="marker-hotspot" title="ArUco ${marker.id}" style="left:${left}px;top:${top}px;width:${width}px;height:${height}px" onclick='openMarkerEditor(event, "${deviceId}", ${JSON.stringify(marker)})'></button>`;
             }).join('');
             let charucoHtml = '';
             if (data.charuco_bbox) {
                 const b = data.charuco_bbox;
-                charucoHtml = `<button class="marker-hotspot charuco-hotspot" style="left:${b.x * scale.sx}px;top:${b.y * scale.sy}px;width:${Math.max(36, b.width * scale.sx)}px;height:${Math.max(36, b.height * scale.sy)}px" onclick='openCharucoEditor(event, "${deviceId}", ${JSON.stringify(data.charuco_target || data.calibration_target || {})})'>ChArUco</button>`;
+                charucoHtml = `<button class="marker-hotspot charuco-hotspot" title="ChArUco board" style="left:${b.x * scale.sx}px;top:${b.y * scale.sy}px;width:${Math.max(36, b.width * scale.sx)}px;height:${Math.max(36, b.height * scale.sy)}px" onclick='openCharucoEditor(event, "${deviceId}", ${JSON.stringify(data.charuco_target || data.calibration_target || {})})'></button>`;
             }
             overlay.innerHTML = markerHtml + charucoHtml;
         }
@@ -1625,12 +2555,206 @@ OBSERVATORY_DASHBOARD_HTML = """
                 charts.fleet = new Chart(ctx, {
                     type: 'line',
                     data: { datasets },
-                    options: { responsive: true, maintainAspectRatio: false, parsing: { xAxisKey: 'x', yAxisKey: 'y' }, plugins: { legend: { labels: { color: '#cbd6d0', boxWidth: 10 } } }, scales: { y: { grid: { color: '#27312d' }, ticks: { color: '#8c9a94' } }, x: { grid: { display: false }, ticks: { color: '#8c9a94', maxRotation: 0 } } } }
+                    options: chartOptions()
                 });
             } else {
                 charts.fleet.data.datasets = datasets;
                 charts.fleet.update('none');
             }
+        }
+        function renderGrowthCharts(stats) {
+            const root = document.getElementById('growth-charts');
+            if (!root || activeView !== 'growth') return;
+            const entries = Object.entries(stats || {});
+            root.innerHTML = entries.map(([id]) => {
+                const controls = growthControls[id] || { hours: 0, maxY: '', trim: true };
+                return `<div class="event" style="grid-template-columns:1fr"><div><strong>${id}</strong><div class="chart-controls"><label class="muted">Hours back<input type="number" min="0" step="1" value="${controls.hours || 0}" onchange="setGrowthControl('${id}','hours',this.value)"></label><label class="muted">Area Y max<input type="number" min="0" step="100" value="${controls.maxY || ''}" placeholder="Auto" onchange="setGrowthControl('${id}','maxY',this.value)"></label><label class="muted">Outliers<select onchange="setGrowthControl('${id}','trim',this.value)"><option value="true" ${controls.trim !== false ? 'selected' : ''}>Trim spikes</option><option value="false" ${controls.trim === false ? 'selected' : ''}>Show all</option></select></label></div><div class="chart-wrap tall"><canvas id="area-chart-${cssEscape(id)}"></canvas></div><div class="chart-wrap"><canvas id="speed-chart-${cssEscape(id)}"></canvas></div><div class="chart-wrap"><canvas id="green-chart-${cssEscape(id)}"></canvas></div></div></div>`;
+            }).join('');
+            const colors = ['#7ac77f', '#77b7c5', '#d8ad5f', '#df7d7d', '#b997d6', '#91c46c'];
+            entries.forEach(([id, info]) => {
+                const areaCtx = document.getElementById('area-chart-' + cssEscape(id));
+                const speedCtx = document.getElementById('speed-chart-' + cssEscape(id));
+                const greenCtx = document.getElementById('green-chart-' + cssEscape(id));
+                if (!areaCtx || !speedCtx || !greenCtx) return;
+                const controls = growthControls[id] || { hours: 0, maxY: '', trim: true };
+                const rawHistory = (info.history || []).filter(h => !h.ignored);
+                const newest = rawHistory.length ? Date.parse(rawHistory[rawHistory.length - 1].timestamp || '') : NaN;
+                let history = rawHistory;
+                const hours = Number(controls.hours || 0);
+                if (Number.isFinite(newest) && hours > 0) {
+                    const cutoff = newest - hours * 3600000;
+                    history = rawHistory.filter(h => Date.parse(h.timestamp || '') >= cutoff);
+                }
+                history = trimHistorySpikes(history, h => Number(h.area || 0), controls.trim !== false);
+                const segmentNames = new Map();
+                history.forEach(h => (h.segments || []).forEach(s => segmentNames.set(s.id, s.name || s.id)));
+                const yValues = history.map(h => Number(h.area || 0)).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+                const trimmedMax = yValues.length && controls.trim !== false ? yValues[Math.max(0, Math.floor(yValues.length * 0.95) - 1)] * 1.15 : undefined;
+                const manualMax = Number(controls.maxY || 0);
+                const datasets = [{
+                    label: 'Canopy area',
+                    data: history.map(h => ({ x: h.timestamp || '', y: Number(h.area || 0), timestamp: h.timestamp, filename: h.filename, segmentId: null })),
+                    borderColor: colors[0],
+                    backgroundColor: 'transparent',
+                    tension: 0.25,
+                    pointRadius: 2
+                }];
+                const volumeData = history.map(h => ({ x: h.timestamp || '', y: Number.isFinite(Number(h.volume_cm3)) ? Number(h.volume_cm3) : null, timestamp: h.timestamp, filename: h.filename }));
+                if (volumeData.some(p => p.y !== null)) {
+                    datasets.push({
+                        label: 'Canopy volume',
+                        data: volumeData,
+                        borderColor: colors[3],
+                        backgroundColor: 'transparent',
+                        tension: 0.25,
+                        pointRadius: 2
+                    });
+                }
+                Array.from(segmentNames.entries()).forEach(([segId, name], idx) => {
+                    datasets.push({
+                        label: name,
+                        data: history.map(h => {
+                            if ((h.ignored_segments || []).includes(segId)) return { x: h.timestamp || '', y: null, timestamp: h.timestamp, filename: h.filename, segmentId: segId };
+                            const seg = (h.segments || []).find(s => s.id === segId);
+                            return { x: h.timestamp || '', y: seg ? Number(seg.canopy_area_mm2 || 0) : null, timestamp: h.timestamp, filename: h.filename, segmentId: segId };
+                        }),
+                        borderColor: colors[(idx + 1) % colors.length],
+                        backgroundColor: 'transparent',
+                        tension: 0.25,
+                        pointRadius: 2
+                    });
+                });
+                renderMetricChart('area-' + id, areaCtx, datasets, {
+                    yTitle: 'mm2',
+                    maxY: manualMax > 0 ? manualMax : trimmedMax,
+                    onContextMenu: (event, chart) => ignoreNearestGrowthPoint(event, chart, id)
+                });
+                areaCtx.oncontextmenu = event => ignoreNearestGrowthPoint(event, charts['area-' + id], id);
+
+                const speedData = buildGrowthSpeedSeries(history);
+                renderMetricChart('speed-' + id, speedCtx, [{
+                    label: 'Growth speed',
+                    data: speedData,
+                    borderColor: colors[1],
+                    backgroundColor: 'transparent',
+                    tension: 0.25,
+                    pointRadius: 2
+                }], { yTitle: 'mm2/hr' });
+
+                renderMetricChart('green-' + id, greenCtx, [{
+                    label: 'Green index',
+                    data: history.map(h => ({ x: h.timestamp || '', y: colorMetricValue(h, 'green_index'), timestamp: h.timestamp, filename: h.filename })),
+                    borderColor: colors[2],
+                    backgroundColor: 'transparent',
+                    tension: 0.25,
+                    pointRadius: 2
+                }], { yTitle: 'ExG' });
+            });
+        }
+        function renderMetricChart(key, ctx, datasets, options = {}) {
+            if (charts[key]) charts[key].destroy();
+            charts[key] = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets },
+                    options: chartOptions(options)
+                });
+        }
+        function trimHistorySpikes(history, valueFn, enabled) {
+            if (!enabled || history.length < 8) return history;
+            const values = history.map(valueFn).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+            if (values.length < 8) return history;
+            const median = values[Math.floor(values.length / 2)];
+            const q1 = values[Math.floor(values.length * 0.25)];
+            const q3 = values[Math.floor(values.length * 0.75)];
+            const iqr = Math.max(1, q3 - q1);
+            const upper = Math.max(median * 3, q3 + 2.5 * iqr);
+            return history.filter(h => {
+                const value = valueFn(h);
+                return !Number.isFinite(value) || value <= upper;
+            });
+        }
+        function colorMetricValue(entry, key) {
+            const value = ((entry.color_metrics || {})[key]);
+            return Number.isFinite(Number(value)) ? Number(value) : null;
+        }
+        function buildGrowthSpeedSeries(history) {
+            return history.map((h, idx) => {
+                let speed = Number(h.growth_rate_mm2_hr);
+                if (!Number.isFinite(speed) && idx > 0) {
+                    const prev = history[idx - 1];
+                    const dt = (Date.parse(h.timestamp || '') - Date.parse(prev.timestamp || '')) / 3600000;
+                    if (dt > 0.01) speed = (Number(h.area || 0) - Number(prev.area || 0)) / dt;
+                }
+                return { x: h.timestamp || '', y: Number.isFinite(speed) ? speed : null, timestamp: h.timestamp, filename: h.filename };
+            });
+        }
+        function setGrowthControl(deviceId, key, value) {
+            growthControls[deviceId] = growthControls[deviceId] || { hours: 0, maxY: '', trim: true };
+            growthControls[deviceId][key] = key === 'trim' ? value === 'true' : value;
+            renderGrowthCharts(latestStats);
+        }
+        function ignoreNearestGrowthPoint(event, chart, deviceId) {
+            event.preventDefault();
+            const points = chart.getElementsAtEventForMode(event, 'nearest', { intersect: false }, false);
+            if (!points.length) return;
+            const item = chart.data.datasets[points[0].datasetIndex].data[points[0].index];
+            if (!item || !confirm(`Ignore this data point for ${deviceId}?`)) return;
+            fetch('/ignore_growth_point/' + deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ timestamp: item.timestamp, filename: item.filename, segment_id: item.segmentId })
+            }).then(() => updateStats());
+        }
+        function chartOptions(extra = {}) {
+            return {
+                responsive: true,
+                maintainAspectRatio: false,
+                parsing: { xAxisKey: 'x', yAxisKey: 'y' },
+                plugins: { legend: { display: true, position: 'bottom', labels: { color: '#cbd6d0', boxWidth: 12 } } },
+                onContextMenu: extra.onContextMenu,
+                scales: {
+                    y: { suggestedMax: extra.maxY, max: extra.maxY, title: { display: true, text: extra.yTitle || 'mm2', color: '#8c9a94' }, grid: { color: '#27312d' }, ticks: { color: '#8c9a94' } },
+                    x: { grid: { display: false }, ticks: { color: '#8c9a94', maxRotation: 0, autoSkip: true, maxTicksLimit: 5 } }
+                }
+            };
+        }
+        function cssEscape(value) {
+            return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
+        }
+        function renderTimelapses(stats) {
+            if (activeView !== 'settings') return;
+            const timelapses = document.getElementById('timelapse-list');
+            if (!timelapses) return;
+            const entries = Object.entries(stats || {});
+            timelapses.innerHTML = entries.map(([id]) => `<div class="event"><time>Video</time><div><strong>${id}</strong><div class="controls"><button onclick="openTimelapse('${id}')">Open</button><button onclick="showFileLocation('video','${id}')">Show File</button><button onclick="resetTimelapse('${id}')">Archive + Reset</button></div><div id="timelapse-player-${cssEscape(id)}"></div></div></div>`).join('');
+        }
+        function openTimelapse(deviceId) {
+            const target = document.getElementById('timelapse-player-' + cssEscape(deviceId));
+            if (target) target.innerHTML = `<video controls preload="metadata" src="/video/${deviceId}?t=${Date.now()}" style="margin-top:8px"></video>`;
+        }
+        function showFileLocation(kind, deviceId) {
+            fetch(`/show_location/${kind}/${deviceId}`, { method: 'POST' }).then(r => r.json()).then(d => showOperation('File location opened', d.path || deviceId));
+        }
+        function resetTimelapse(deviceId) {
+            if (!confirm(`Archive existing captures/video and start a fresh timelapse for ${deviceId}?`)) return;
+            fetch(`/reset_timelapse/${deviceId}`, { method: 'POST' }).then(r => r.json()).then(d => {
+                showOperation('Timelapse reset', `${deviceId}: previous data archived at ${d.archive}.`);
+                updateStats();
+            });
+        }
+        function autoTuneTags(deviceId) {
+            if (!confirm(`Run an automatic tag-detection sweep for ${deviceId}? This will take several captures.`)) return;
+            showOperation('Tag sweep running', `${deviceId}: trying settle, banding, focus, exposure, and ISO combinations...`);
+            fetch('/auto_tune_tags/' + deviceId, { method: 'POST' }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Sweep failed');
+                return body;
+            }).then(d => {
+                const trials = (d.trials || []).map(t => `#${t.trial}: ${t.markers} markers`).join(', ');
+                applyDeviceSettings(deviceId, d.best_profile || {});
+                showOperation('Tag sweep complete', `${deviceId}: best result ${d.best_markers} markers. ${trials}`);
+                updateStats();
+            }).catch(e => showOperation('Tag sweep failed', e.message, 'bad'));
         }
         function updateStats() {
             fetch('/stats').then(r => r.json()).then(stats => {
@@ -1681,21 +2805,35 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const plants = document.getElementById('plants-list');
                 if (plants) plants.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div><strong>${id}</strong><br>Area ${fmt(Number((info.data || {}).plant_area_mm2 || 0))} mm2, growth ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr</div></div>`).join('');
                 const ranking = document.getElementById('trait-ranking');
-                if (ranking) ranking.innerHTML = entries.slice().sort((a, b) => Number(b[1].growth_rate_mm2_hr || 0) - Number(a[1].growth_rate_mm2_hr || 0)).map(([id, info], idx) => `<div class="event"><time>#${idx + 1}</time><div>${id}: ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr</div></div>`).join('');
-                const timelapses = document.getElementById('timelapse-list');
-                if (timelapses) timelapses.innerHTML = entries.map(([id]) => `<div class="event"><time>Video</time><div>${id}<br><video controls src="/video/${id}" style="margin-top:8px"></video></div></div>`).join('');
+                if (ranking) ranking.innerHTML = entries.slice().sort((a, b) => Number(b[1].growth_rate_mm2_hr || 0) - Number(a[1].growth_rate_mm2_hr || 0)).map(([id, info], idx) => `<div class="event"><time>#${idx + 1}</time><div><strong>${id}</strong><br>Grow speed ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr<br>Movement proxy: collecting centroid/canopy-width history<br>Recovery: ready after harvest events are logged</div></div>`).join('');
+                renderTimelapses(stats);
+                renderGrowthCharts(stats);
+                renderAllSegmentOverlays();
                 const health = document.getElementById('health-list');
                 if (health) health.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div>${id}: ${((info.data || {}).markers_found || 0)} markers, health ${(info.nutrient_deficiency || {}).severity || 'collecting'}</div></div>`).join('');
                 const calibration = document.getElementById('calibration-list');
                 if (calibration) calibration.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${((info.data || {}).markers_found || 0) ? 'Seen' : 'Missing'}</time><div>${id}: ${((info.data || {}).markers_found || 0)} markers, scale ${((info.data || {}).scale_px_per_mm || '--')} px/mm</div></div>`).join('');
+                const volumeCameras = document.getElementById('volume-camera-list');
+                if (volumeCameras) volumeCameras.innerHTML = entries.map(([id, info]) => `<div class="event"><time><input class="volume-camera-check" type="checkbox" value="${id}" checked></time><div><strong>${id}</strong><br>${((info.data || {}).markers_found || 0)} markers, ChArUco corners ${((info.data || {}).charuco_corners_found || 0)}</div></div>`).join('');
             }).catch(e => console.error("Update Stats Error:", e));
         }
         setInterval(() => {
-            document.querySelectorAll('img[id^="analysis-"]').forEach(img => { img.src = img.src.split('?')[0] + '?t=' + Date.now(); });
-            document.querySelectorAll('video').forEach(v => { if (v.paused) v.play().catch(()=>{}); });
+            if (document.hidden) {
+                pauseHiddenVideos();
+                return;
+            }
+            refreshVisibleFrames();
             updateStats();
-        }, 15000);
+        }, 30000);
+        document.addEventListener('visibilitychange', () => {
+            pauseHiddenVideos();
+            if (!document.hidden) {
+                refreshVisibleFrames();
+                updateStats();
+            }
+        });
         loadDeviceSettings();
+        loadSegments();
         updateStats();
         window.addEventListener('resize', () => {
             Object.entries(latestStats || {}).forEach(([id, info]) => renderCalibrationOverlays(id, (info || {}).data || {}));
@@ -1708,6 +2846,7 @@ OBSERVATORY_DASHBOARD_HTML = """
 def run_app():
     load_profiles()
     load_device_settings()
+    load_video_manifest()
     # Start the timelapse thread immediately
     t = threading.Thread(target=timelapse_loop, daemon=True)
     t.start()

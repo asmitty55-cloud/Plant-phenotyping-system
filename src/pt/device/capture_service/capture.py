@@ -45,12 +45,25 @@ os.makedirs(LOCAL_DIR, exist_ok=True)
 # -------------------------
 # ADB helpers
 # -------------------------
+def hidden_subprocess_flags():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def adb(cmd, device=None):
     base = [ADB]
     if device:
         base += ["-s", device]
-    result = subprocess.run(base + cmd, capture_output=True, text=True)
-    return result.stdout, result.stderr
+    try:
+        result = subprocess.run(
+            base + cmd,
+            capture_output=True,
+            text=True,
+            creationflags=hidden_subprocess_flags(),
+            timeout=25,
+        )
+        return result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return "", f"ADB timeout: {' '.join(base + cmd)}"
 
 def get_devices():
     out, _ = adb(["devices"])
