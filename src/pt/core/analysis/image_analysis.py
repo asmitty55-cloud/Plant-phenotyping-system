@@ -7,6 +7,8 @@ import re
 from pt.core.utils.path_utils import get_data_root
 from pt.core.analysis.metrics import build_metrics_snapshot
 from pt.core.analysis.calibration_store import calib_store
+from pt.core.analysis.charuco_catalog import default_target, load_catalog
+from pt.core.analysis.metric_store import refresh_rollups, upsert_history_point
 from pt.core.analysis.segmentation_store import segmentation_store
 
 # Common ArUco dictionaries to check
@@ -17,21 +19,25 @@ DICTIONARIES = {
     "APRILTAG_36h11": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 }
 
-CHARUCO_WALL_TARGET = {
-    "name": "back_wall_charuco_letter_8_5x11",
-    "squares_x": 3,
-    "squares_y": 5,
-    "square_size_mm": 51.28,
-    "marker_size_mm": 41.18,
-    "dictionary": "4X4_50",
-}
+CHARUCO_WALL_TARGET = default_target()
 
 MARKER_SIZE_MM = CHARUCO_WALL_TARGET["marker_size_mm"]
 CAPTURE_IMAGE_RE = re.compile(r"^capture_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNORECASE)
+MAX_HISTORY_ENTRIES = 10000
+SCALE_REJECT_RATIO_LOW = 0.65
+SCALE_REJECT_RATIO_HIGH = 1.55
 
 
 def get_charuco_target(device_id=None):
     return calib_store.get_charuco_target(CHARUCO_WALL_TARGET, device_id)
+
+
+def get_charuco_targets(device_id=None):
+    targets = [calib_store.get_charuco_target(target, device_id) for target in load_catalog()]
+    override = calib_store.get_charuco_target(CHARUCO_WALL_TARGET, device_id)
+    if override.get("ids") not in [target.get("ids") for target in targets]:
+        targets.append(override)
+    return targets
 
 
 def is_capture_image(filename):
@@ -58,17 +64,20 @@ def try_detect(img, dict_name, aruco_dict, params):
     return corners, ids
 
 
-def get_charuco_board(device_id=None):
-    target = get_charuco_target(device_id)
-    return cv2.aruco.CharucoBoard(
+def get_charuco_board(device_id=None, target=None):
+    target = target or get_charuco_target(device_id)
+    args = [
         (target["squares_x"], target["squares_y"]),
         target["square_size_mm"],
         target["marker_size_mm"],
         DICTIONARIES[target["dictionary"]],
-    )
+    ]
+    if target.get("ids"):
+        args.append(np.array(target["ids"], dtype=np.int32))
+    return cv2.aruco.CharucoBoard(*args)
 
 
-def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id=None):
+def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id=None, target=None):
     if charuco_corners is None or charuco_ids is None or len(charuco_ids) < 2:
         return None
 
@@ -76,7 +85,7 @@ def estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id=
         int(charuco_ids[i][0]): charuco_corners[i][0]
         for i in range(len(charuco_ids))
     }
-    target = get_charuco_target(device_id)
+    target = target or get_charuco_target(device_id)
     squares_x = target["squares_x"]
     square_size_mm = target["square_size_mm"]
     scales = []
@@ -107,38 +116,51 @@ def charuco_bbox(charuco_corners):
 
 
 def detect_charuco_target(gray, params, device_id=None):
-    target = get_charuco_target(device_id)
-    dictionary_name = target["dictionary"]
+    targets = get_charuco_targets(device_id)
+    dictionary_name = targets[0]["dictionary"]
     aruco_dict = DICTIONARIES[dictionary_name]
     detector = cv2.aruco.ArucoDetector(aruco_dict, params)
     marker_corners, marker_ids, _ = detector.detectMarkers(gray)
     if marker_ids is None or len(marker_ids) == 0:
         return None
 
-    board = get_charuco_board(device_id)
-    charuco_corners = None
-    charuco_ids = None
-    charuco_scale = None
-
-    try:
-        _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-            marker_corners, marker_ids, gray, board
-        )
-        charuco_scale = estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id)
-    except cv2.error:
+    best = None
+    for target in targets:
+        board = get_charuco_board(device_id, target)
         charuco_corners = None
         charuco_ids = None
+        charuco_scale = None
+        try:
+            _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
+                marker_corners, marker_ids, gray, board
+            )
+            charuco_scale = estimate_scale_from_charuco_corners(charuco_corners, charuco_ids, device_id, target)
+        except cv2.error:
+            charuco_corners = None
+            charuco_ids = None
+        score = 0 if charuco_ids is None else len(charuco_ids)
+        candidate = {
+            "score": score,
+            "dictionary": target["dictionary"],
+            "marker_corners": marker_corners,
+            "marker_ids": marker_ids,
+            "charuco_corners": charuco_corners,
+            "charuco_ids": charuco_ids,
+            "charuco_scale_px_per_mm": charuco_scale,
+            "charuco_bbox": charuco_bbox(charuco_corners),
+            "target": target,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
 
-    return {
-        "dictionary": dictionary_name,
-        "marker_corners": marker_corners,
-        "marker_ids": marker_ids,
-        "charuco_corners": charuco_corners,
-        "charuco_ids": charuco_ids,
-        "charuco_scale_px_per_mm": charuco_scale,
-        "charuco_bbox": charuco_bbox(charuco_corners),
-        "target": target,
-    }
+    if best is None:
+        return None
+    best.pop("score", None)
+    best["available_targets"] = [
+        {"name": target.get("name"), "ids": target.get("ids"), "square_size_mm": target.get("square_size_mm"), "marker_size_mm": target.get("marker_size_mm")}
+        for target in targets
+    ]
+    return best
 
 def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
     """Segment canopy pixels and report calibrated area plus color features."""
@@ -664,6 +686,44 @@ def process_latest_captures(captures_dir):
 
             history = all_stats[device_id].get("history", [])
             current_area = float(results.get("plant_area_mm2", 0))
+            detected_scale = float(results["scale_px_per_mm"]) if results.get("scale_px_per_mm") else None
+            stable_scale = all_stats[device_id].get("stable_scale_px_per_mm")
+            if not stable_scale:
+                recent_scales = [
+                    float(entry.get("scale"))
+                    for entry in all_stats[device_id].get("history", [])[-24:]
+                    if entry.get("scale") and not entry.get("scale_rejected")
+                ]
+                if len(recent_scales) >= 5:
+                    stable_scale = float(np.median(recent_scales))
+                    all_stats[device_id]["stable_scale_px_per_mm"] = stable_scale
+
+            scale_rejected = False
+            if detected_scale and stable_scale:
+                ratio = detected_scale / stable_scale
+                if ratio < SCALE_REJECT_RATIO_LOW or ratio > SCALE_REJECT_RATIO_HIGH:
+                    correction = (detected_scale / stable_scale) ** 2
+                    current_area *= correction
+                    results["plant_area_mm2"] = current_area
+                    results["canopy_area_mm2"] = current_area
+                    results["scale_px_per_mm_detected"] = detected_scale
+                    results["scale_px_per_mm"] = stable_scale
+                    results["scale_rejected"] = True
+                    results["scale_reject_reason"] = f"detected scale {detected_scale:.4f} px/mm differed from stable {stable_scale:.4f} px/mm"
+                    scale_rejected = True
+                    for segment in results.get("segments", []):
+                        if "canopy_area_mm2" in segment:
+                            segment["canopy_area_mm2"] = float(segment["canopy_area_mm2"]) * correction
+                else:
+                    all_stats[device_id]["stable_scale_px_per_mm"] = float(np.median([
+                        stable_scale,
+                        *[
+                            float(entry.get("scale"))
+                            for entry in all_stats[device_id].get("history", [])[-12:]
+                            if entry.get("scale") and not entry.get("scale_rejected")
+                        ],
+                        detected_scale,
+                    ]))
             baseline = build_color_baseline(history, all_stats[device_id].get("baseline"))
             deficiency = evaluate_nutrient_flags(results.get("color_metrics"), baseline)
 
@@ -696,18 +756,23 @@ def process_latest_captures(captures_dir):
             })
 
             if not history or history[-1]["filename"] != files[-1]:
-                history.append({
+                history_entry = {
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "filename": files[-1],
                     "scale": float(results["scale_px_per_mm"]) if results["scale_px_per_mm"] else None,
+                    "detected_scale": detected_scale,
+                    "scale_rejected": scale_rejected,
                     "area": current_area,
                     "growth_rate_mm2_hr": growth_rate,
                     "segments": results.get("segments", []),
                     "canopy_coverage": results.get("canopy_coverage"),
                     "color_metrics": results.get("color_metrics"),
                     "nutrient_deficiency": deficiency,
-                })
-                all_stats[device_id]["history"] = history[-100:]
+                }
+                history.append(history_entry)
+                upsert_history_point(device_id, history_entry)
+                refresh_rollups(device_id)
+                all_stats[device_id]["history"] = history[-MAX_HISTORY_ENTRIES:]
 
             if growth_rate > fastest_rate:
                 fastest_rate = growth_rate

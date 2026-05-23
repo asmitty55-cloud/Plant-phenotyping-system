@@ -1,5 +1,6 @@
 import os
 import json
+from pt.core.analysis.charuco_catalog import wall_marker_size
 from pt.core.utils.path_utils import get_data_root
 
 CALIBRATION_FILE = os.path.join(get_data_root(), "debug", "calibration.json")
@@ -38,15 +39,20 @@ class CalibrationStore:
 
     def get_marker_size(self, marker_id, device_id=None):
         self._ensure_defaults()
+        marker_text = str(marker_id)
         # 1. Check device-specific override
         if device_id and device_id in self.data["device_overrides"]:
             dev_over = self.data["device_overrides"][device_id]
-            if str(marker_id) in dev_over.get("marker_overrides", {}):
-                return dev_over["marker_overrides"][str(marker_id)]
+            if marker_text in dev_over.get("marker_overrides", {}):
+                return dev_over["marker_overrides"][marker_text]
 
         # 2. Check global marker override
-        if str(marker_id) in self.data["marker_overrides"]:
-            return self.data["marker_overrides"][str(marker_id)]
+        if marker_text in self.data["marker_overrides"]:
+            return self.data["marker_overrides"][marker_text]
+
+        catalog_size = wall_marker_size(marker_id)
+        if catalog_size:
+            return catalog_size
 
         return None
 
@@ -115,6 +121,10 @@ class CalibrationStore:
         for field in ("square_size_mm", "marker_size_mm"):
             if field in target_update:
                 current[field] = float(target_update[field])
+        if "ids" in target_update and isinstance(target_update["ids"], list):
+            current["ids"] = [int(v) for v in target_update["ids"]]
+        if "name" in target_update:
+            current["name"] = str(target_update["name"])
         self.save()
 
     def set_camera_params(self, device_id, K, dist, R=None, T=None):

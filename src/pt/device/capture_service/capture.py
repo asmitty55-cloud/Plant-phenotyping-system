@@ -9,6 +9,7 @@ from pt.core.utils.path_utils import get_images_dir
 ADB = "adb"
 REMOTE_DIR = "/sdcard/PTCaptures"
 LOCAL_DIR = get_images_dir()
+REQUIRED_APK_VERSION_CODE = 2026052002
 
 APK_CANDIDATES = [
     os.path.join(os.getcwd(), "ptcapture.apk"),
@@ -76,6 +77,27 @@ def is_installed(device):
     out, _ = adb(["shell", "pm", "list", "packages"], device)
     return "com.pt.capture" in out
 
+
+def installed_apk_version_code(device):
+    out, _ = adb(["shell", "dumpsys", "package", "com.pt.capture"], device)
+    for token in out.replace("\r", " ").replace("\n", " ").split():
+        if token.startswith("versionCode="):
+            raw = token.split("=", 1)[1].split()[0]
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if digits:
+                return int(digits)
+    return None
+
+
+def apk_needs_update(device):
+    installed_version = installed_apk_version_code(device)
+    if installed_version is None:
+        return True
+    if installed_version < REQUIRED_APK_VERSION_CODE:
+        print(f"PTCapture APK on {device} is stale: {installed_version} < {REQUIRED_APK_VERSION_CODE}")
+        return True
+    return False
+
 def install_apk(device):
     apk_path = get_apk_path()
     if not os.path.exists(apk_path):
@@ -125,7 +147,7 @@ def install_apk(device):
 
 
 def ensure_installed(device):
-    if is_installed(device):
+    if is_installed(device) and not apk_needs_update(device):
         return True
     return install_apk(device)
 
@@ -136,7 +158,7 @@ def uninstall_apk(device):
 # -------------------------
 # Capture engine
 # -------------------------
-def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso="auto", zoom_percent=0, focus_mode="continuous-picture", antibanding="60hz"):
+def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso="auto", zoom_percent=0, focus_mode="continuous-picture", antibanding="60hz", white_balance="daylight"):
     """Capture photo on single device using custom APK with advanced options"""
     try:
         # 1. Force stop app to prevent "Fail to connect to camera"
@@ -166,7 +188,8 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
                "--ei", "exposureCompensation", str(int(exposure)),
                "--es", "iso", str(iso),
                "--es", "focusMode", focus_mode,
-               "--es", "antibanding", antibanding]
+               "--es", "antibanding", antibanding,
+               "--es", "whiteBalance", white_balance]
 
         # Clear logcat before starting to avoid reading old completion signals
         adb(["logcat", "-c"], device)
@@ -197,6 +220,51 @@ def wait_for_capture_complete(device, filename):
 
     print(f"Timeout waiting for capture on {device}")
     return False
+
+
+def wait_for_log_signal(device, signal, timeout=30):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        out, _ = adb(["logcat", "-d", "-s", "PTCapture"], device)
+        if signal in out:
+            return out
+        time.sleep(0.5)
+    return ""
+
+
+def probe_capabilities(device):
+    """Ask the APK to report Camera1/Camera2 capabilities and return JSON data."""
+    if not ensure_installed(device):
+        return {"error": "apk_install_failed"}
+
+    adb(["shell", "mkdir", "-p", REMOTE_DIR], device)
+    adb(["shell", "rm", f"{REMOTE_DIR}/capabilities.json"], device)
+    adb(["logcat", "-c"], device)
+
+    cmd = [
+        "shell", "am", "start", "-n", "com.pt.capture/.CaptureActivity",
+        "--es", "mode", "probe",
+        "--es", "name", "capabilities.json",
+    ]
+    adb(cmd, device)
+    log = wait_for_log_signal(device, "CAPABILITY_COMPLETE:capabilities.json", timeout=30)
+    if not log:
+        return {"error": "capability_probe_timeout"}
+
+    local_path = os.path.join(LOCAL_DIR, f"{device}_capabilities.json")
+    adb(["pull", f"{REMOTE_DIR}/capabilities.json", local_path], device)
+    if not os.path.exists(local_path):
+        return {"error": "capability_file_missing"}
+
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return {"error": f"capability_json_invalid: {e}"}
+
+    data["host_time_ms"] = int(time.time() * 1000)
+    data["installed_version_code"] = installed_apk_version_code(device)
+    return data
 
 def pull_photo(device, filename):
     """Pull captured photo from device"""

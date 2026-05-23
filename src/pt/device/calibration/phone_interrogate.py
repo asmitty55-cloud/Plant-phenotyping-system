@@ -38,14 +38,26 @@ def interrogate_phone(device_id):
         "ok_required": False,
         "ok_button_coords": None,
         "shutter_success": False,
+        "capabilities": {},
     }
 
     # 1. Ensure APK is installed
-    if not capture.is_installed(device_id):
-        logger.log("APK not found, installing...", major=False)
-        if not capture.install_apk(device_id):
-            logger.log("Failed to install APK during interrogation.", major=True)
-            return profile
+    if not capture.ensure_installed(device_id):
+        logger.log("Failed to install/update APK during interrogation.", major=True)
+        return profile
+
+    logger.log("Probing camera capabilities...", major=False)
+    capabilities = capture.probe_capabilities(device_id)
+    profile["capabilities"] = capabilities
+    if capabilities.get("error"):
+        logger.log(f"Capability probe failed: {capabilities['error']}", major=True)
+    else:
+        c1 = capabilities.get("camera1", {})
+        c2 = capabilities.get("camera2", {})
+        logger.log(
+            f"Capabilities: Camera1={c1.get('available')} Camera2={c2.get('available')}",
+            major=True,
+        )
 
     # 2. Trigger a test capture
     test_filename = f"interrogate_{int(time.time())}.jpg"
