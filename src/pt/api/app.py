@@ -36,11 +36,13 @@ DEBUG_DIR = os.path.join(DATA_ROOT, "debug")
 profiles_file = os.path.join(DEBUG_DIR, "profiles.json")
 device_settings_file = os.path.join(DEBUG_DIR, "device_settings.json")
 device_aliases_file = os.path.join(DEBUG_DIR, "device_aliases.json")
+device_metadata_file = os.path.join(DEBUG_DIR, "device_metadata.json")
 video_manifest_file = os.path.join(DEBUG_DIR, "video_manifest.json")
 legacy_profiles_file = os.path.join(os.getcwd(), "debug", "profiles.json")
 MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".mp4", ".mov")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 CAPTURE_IMAGE_RE = re.compile(r"^capture_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNORECASE)
+NIGHT_PLACEHOLDER_RE = re.compile(r"^night_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNORECASE)
 DEFAULT_REMOTE_DIR = "/sdcard/PTCaptures"
 VIDEO_ASSEMBLY_FRAME_STEP = 5
 
@@ -53,6 +55,7 @@ app = Flask(__name__)
 phone_profiles = {}
 device_settings = {}
 device_aliases = {}
+device_metadata = {}
 last_capture = {}
 timelapse_running = True # Auto-start
 timelapse_interval = 180 # Increased from 120 for legacy hardware stability
@@ -61,6 +64,8 @@ device_locks = {}
 live_stream_lock = threading.Lock()
 active_live_stream_device = None
 video_manifest = {}
+video_locks = {}
+night_skip_started = {}
 
 DEFAULT_DEVICE_SETTINGS = {
     "light_mode": "auto",
@@ -73,6 +78,9 @@ DEFAULT_DEVICE_SETTINGS = {
     "antibanding": "60hz",
     "white_balance": "daylight",
     "display_rotation_deg": 0,
+    "collect_night_frames": True,
+    "measurement_locked": False,
+    "measurement_locked_at": "",
 }
 DAY_CAPTURE_PROFILE = {
     "delay_ms": 5000,
@@ -97,10 +105,69 @@ def _is_capture_image(filename):
     return bool(CAPTURE_IMAGE_RE.match(filename))
 
 
+def _is_night_placeholder(filename):
+    return bool(NIGHT_PLACEHOLDER_RE.match(filename))
+
+
+def _is_video_frame(filename):
+    return _is_capture_image(filename) or _is_night_placeholder(filename)
+
+
+def _frame_timestamp(filename):
+    match = re.match(r"^(capture|night)_(\d{8})_(\d{6})\.(jpg|jpeg|png)$", filename, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(f"{match.group(2)}_{match.group(3)}", "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def _frame_files_for_device(device_id, start_dt=None, end_dt=None):
+    device_dir = os.path.join(CAPTURES_DIR, device_id)
+    if not os.path.exists(device_dir):
+        return []
+    frames = []
+    for filename in os.listdir(device_dir):
+        if not _is_video_frame(filename):
+            continue
+        stamp = _frame_timestamp(filename)
+        if stamp is None:
+            continue
+        if start_dt and stamp < start_dt:
+            continue
+        if end_dt and stamp > end_dt:
+            continue
+        frames.append((stamp, filename))
+    return [filename for _, filename in sorted(frames)]
+
+
 def _device_lock(device_id):
     if device_id not in device_locks:
         device_locks[device_id] = threading.Lock()
     return device_locks[device_id]
+
+
+def _video_lock(device_id):
+    if device_id not in video_locks:
+        video_locks[device_id] = threading.Lock()
+    return video_locks[device_id]
+
+
+def _safe_video_id(device_id):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", device_id)
+
+
+def _video_current_name(device_id):
+    return f"{_safe_video_id(device_id)}.mp4"
+
+
+def _video_playback_name(device_id):
+    return f"{_safe_video_id(device_id)}_playback.mp4"
+
+
+def _custom_video_name(device_id, start_label, end_label):
+    return f"{_safe_video_id(device_id)}_custom_{start_label}_{end_label}.mp4"
 
 
 def _latest_capture_file(files):
@@ -190,6 +257,25 @@ def save_device_aliases():
         json.dump(device_aliases, f, indent=2)
 
 
+def load_device_metadata():
+    device_metadata.clear()
+    if not os.path.exists(device_metadata_file):
+        return
+    try:
+        with open(device_metadata_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(loaded, dict):
+        device_metadata.update(loaded)
+
+
+def save_device_metadata():
+    os.makedirs(os.path.dirname(device_metadata_file), exist_ok=True)
+    with open(device_metadata_file, "w", encoding="utf-8") as f:
+        json.dump(device_metadata, f, indent=2)
+
+
 def load_video_manifest():
     video_manifest.clear()
     if not os.path.exists(video_manifest_file):
@@ -200,7 +286,8 @@ def load_video_manifest():
     except (OSError, json.JSONDecodeError):
         return
     if isinstance(loaded, dict):
-        video_manifest.update(loaded)
+        for device_id in loaded:
+            video_manifest[device_id] = _video_playback_name(device_id)
 
 
 def save_video_manifest():
@@ -224,6 +311,9 @@ def settings_for_device(device_id):
     settings["delay_ms"] = int(max(500, min(15000, settings.get("delay_ms", 5000))))
     settings["exposure_compensation"] = int(max(-12, min(12, settings.get("exposure_compensation", 0))))
     settings["display_rotation_deg"] = float(settings.get("display_rotation_deg", 0.0)) % 360.0
+    settings["collect_night_frames"] = bool(settings.get("collect_night_frames", True))
+    settings["measurement_locked"] = bool(settings.get("measurement_locked", False))
+    settings["measurement_locked_at"] = str(settings.get("measurement_locked_at") or "")
     if str(settings.get("iso", "auto")) not in ("auto", "100", "200", "400", "800", "1600"):
         settings["iso"] = "auto"
     if settings.get("white_balance") not in ("auto", "daylight", "cloudy-daylight", "fluorescent", "incandescent", "shade", "twilight", "warm-fluorescent"):
@@ -272,6 +362,50 @@ def settings_response(device_id):
     response["active_light_mode"] = active_mode
     response["latest_luminance"] = luma
     return response
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def create_night_placeholder(device_id, timestamp, duration_seconds):
+    device_dir = os.path.join(CAPTURES_DIR, device_id)
+    os.makedirs(device_dir, exist_ok=True)
+    filename = f"night_{timestamp}.jpg"
+    path = os.path.join(device_dir, filename)
+    latest_capture = _latest_capture_file(os.listdir(device_dir))
+    frame = cv2.imread(os.path.join(device_dir, latest_capture), cv2.IMREAD_COLOR) if latest_capture else None
+    if frame is None:
+        frame = cv2.UMat(720, 1280, cv2.CV_8UC3).get()
+    else:
+        frame = cv2.resize(frame, (1280, 720))
+        frame = (frame * 0.12).astype("uint8")
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (1280, 720), (8, 14, 12), -1)
+    frame = cv2.addWeighted(overlay, 0.78, frame, 0.22, 0)
+    lines = [
+        "Night interval",
+        f"{device_aliases.get(device_id, device_id)}",
+        f"Duration: {_format_duration(duration_seconds)}",
+        "Night frame collection disabled",
+    ]
+    y = 230
+    for idx, text in enumerate(lines):
+        scale = 1.7 if idx == 0 else 1.0
+        thickness = 3 if idx == 0 else 2
+        size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0]
+        x = max(24, (1280 - size[0]) // 2)
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (188, 214, 198), thickness, cv2.LINE_AA)
+        y += 78 if idx == 0 else 52
+    cv2.imwrite(path, frame)
+    return filename
 
 def run_adb(cmd):
     try:
@@ -465,9 +599,19 @@ def capture_and_sync(device_id):
 
         settings = effective_capture_settings(device_id)
         logger.log(
-            f"Triggering capture: {filename} light={settings['active_light_mode']} mode={settings['light_mode']} luma={settings['latest_luminance']} zoom={settings['zoom_percent']}% focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}",
+            f"Triggering capture: {filename} light={settings['active_light_mode']} mode={settings['light_mode']} luma={settings['latest_luminance']} collect_night={settings['collect_night_frames']} zoom={settings['zoom_percent']}% focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}",
             major=True,
         )
+        if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
+            now = time.time()
+            started = night_skip_started.setdefault(device_id, now)
+            placeholder = create_night_placeholder(device_id, timestamp, now - started)
+            last_capture[device_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            logger.log(f"Night capture skipped; wrote timelapse placeholder {placeholder}.", major=True)
+            assemble_video(device_id)
+            return True
+
+        night_skip_started.pop(device_id, None)
         if capture.capture_on_device(
             device_id,
             filename,
@@ -502,6 +646,15 @@ def capture_network_and_analyze(camera_id):
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
+        settings = effective_capture_settings(camera_id)
+        if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
+            now = time.time()
+            started = night_skip_started.setdefault(camera_id, now)
+            create_night_placeholder(camera_id, timestamp, now - started)
+            last_capture[camera_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            assemble_video(camera_id)
+            return True
+        night_skip_started.pop(camera_id, None)
         if capture_network_camera(camera_id, filename):
             last_capture[camera_id] = time.strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -537,42 +690,32 @@ def _ffmpeg_concat_path(path):
     return os.path.abspath(path).replace("\\", "/").replace("'", "'\\''")
 
 
-def assemble_video(device_id):
+def _render_video_from_frames(device_id, images, output_file):
     ffmpeg = get_ffmpeg()
     if not ffmpeg:
-        print(f"[VIDEO] FFmpeg not found. Cannot assemble video for {device_id}.")
-        return
+        return False, "FFmpeg not found."
 
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     if not os.path.exists(device_dir):
-        print(f"[VIDEO] No capture directory for {device_id}: {device_dir}")
-        return
+        return False, f"No capture directory for {device_id}: {device_dir}"
 
-    images = sorted([f for f in os.listdir(device_dir) if _is_capture_image(f)])
     if len(images) < 2:
-        print(f"[VIDEO] Need at least 2 frames for {device_id}; found {len(images)} in {device_dir}.")
-        return
+        return False, f"Need at least 2 frames; found {len(images)}."
 
-    published_name = video_manifest.get(device_id, f"{device_id}.mp4")
-    output_file = os.path.join(VIDEOS_DIR, published_name)
+    build_dir = os.path.join(VIDEOS_DIR, ".build")
+    os.makedirs(build_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    versioned_name = f"{device_id}_{stamp}.mp4"
-    temp_output_file = os.path.join(VIDEOS_DIR, f".{device_id}_{stamp}.tmp.mp4")
-    if os.path.exists(output_file) and len(images) % VIDEO_ASSEMBLY_FRAME_STEP != 0:
-        print(f"[VIDEO] Skipping timelapse rebuild for {device_id}: {len(images)} frames; next update at a {VIDEO_ASSEMBLY_FRAME_STEP}-frame boundary.")
-        return
-
-    list_file = os.path.join(device_dir, "file_list.txt")
-    with open(list_file, "w") as f:
+    safe_id = _safe_video_id(device_id)
+    list_file = os.path.join(build_dir, f"{safe_id}_{stamp}.txt")
+    temp_output_file = os.path.join(build_dir, f"{safe_id}_{stamp}.tmp.mp4")
+    with open(list_file, "w", encoding="utf-8") as f:
         for img in images:
             img_path = _ffmpeg_concat_path(os.path.join(device_dir, img))
             f.write(f"file '{img_path}'\n")
-            f.write("duration 0.1\n")
+            f.write("duration 1.0\n" if _is_night_placeholder(img) else "duration 0.1\n")
         img_path = _ffmpeg_concat_path(os.path.join(device_dir, images[-1]))
         f.write(f"file '{img_path}'\n")
 
-    # Write to a temporary file, then atomically replace the published MP4 so
-    # the dashboard never reads a half-written file while the loop rebuilds it.
     cmd = [
         ffmpeg,
         "-y",
@@ -605,20 +748,77 @@ def assemble_video(device_id):
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=creationflags)
         if os.path.exists(temp_output_file) and os.path.getsize(temp_output_file) > 0:
-            final_output_file = os.path.join(VIDEOS_DIR, versioned_name)
-            os.replace(temp_output_file, final_output_file)
-            video_manifest[device_id] = versioned_name
-            save_video_manifest()
-            print(f"[VIDEO] Updated timelapse video for {device_id}: {len(images)} frames -> {final_output_file}")
-        else:
-            print(f"[VIDEO] FFmpeg completed but output is missing or empty for {device_id}: {result.stderr}")
+            os.replace(temp_output_file, output_file)
+            return True, result.stderr or "ok"
+        return False, f"FFmpeg completed but output is missing or empty: {result.stderr}"
     except subprocess.CalledProcessError as e:
+        return False, e.stderr
+    finally:
         if os.path.exists(temp_output_file):
             try:
                 os.remove(temp_output_file)
             except OSError:
                 pass
-        print(f"[VIDEO] FFmpeg error for {device_id}: {e.stderr}")
+        if os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except OSError:
+                pass
+
+
+def _refresh_playback_mirror(device_id):
+    current_file = os.path.join(VIDEOS_DIR, _video_current_name(device_id))
+    playback_file = os.path.join(VIDEOS_DIR, _video_playback_name(device_id))
+    if not os.path.exists(current_file):
+        return False
+
+    build_dir = os.path.join(VIDEOS_DIR, ".build")
+    os.makedirs(build_dir, exist_ok=True)
+    temp_playback = os.path.join(build_dir, f"{_safe_video_id(device_id)}_playback.tmp.mp4")
+    try:
+        shutil.copy2(current_file, temp_playback)
+        os.replace(temp_playback, playback_file)
+        video_manifest[device_id] = _video_playback_name(device_id)
+        save_video_manifest()
+        return True
+    except OSError as e:
+        print(f"[VIDEO] Playback mirror is locked for {device_id}; canonical video updated and mirror will catch up later: {e}")
+        return False
+    finally:
+        if os.path.exists(temp_playback):
+            try:
+                os.remove(temp_playback)
+            except OSError:
+                pass
+
+
+def assemble_video(device_id):
+    with _video_lock(device_id):
+        device_dir = os.path.join(CAPTURES_DIR, device_id)
+        if not os.path.exists(device_dir):
+            print(f"[VIDEO] No capture directory for {device_id}: {device_dir}")
+            return
+
+        images = _frame_files_for_device(device_id)
+        if len(images) < 2:
+            print(f"[VIDEO] Need at least 2 frames for {device_id}; found {len(images)} in {device_dir}.")
+            return
+
+        output_file = os.path.join(VIDEOS_DIR, _video_current_name(device_id))
+        playback_file = os.path.join(VIDEOS_DIR, _video_playback_name(device_id))
+        if os.path.exists(output_file) and len(images) % VIDEO_ASSEMBLY_FRAME_STEP != 0:
+            if not os.path.exists(playback_file):
+                _refresh_playback_mirror(device_id)
+            print(f"[VIDEO] Skipping timelapse rebuild for {device_id}: {len(images)} frames; next update at a {VIDEO_ASSEMBLY_FRAME_STEP}-frame boundary.")
+            return
+
+        ok, message = _render_video_from_frames(device_id, images, output_file)
+        if ok:
+            mirror_ok = _refresh_playback_mirror(device_id)
+            mirror_note = "playback mirror updated" if mirror_ok else "playback mirror deferred"
+            print(f"[VIDEO] Updated timelapse video for {device_id}: {len(images)} frames -> {output_file} ({mirror_note})")
+        else:
+            print(f"[VIDEO] FFmpeg error for {device_id}: {message}")
 
 def timelapse_loop():
     print("[TIMELAPSE] Starting background loop...")
@@ -856,11 +1056,23 @@ def dashboard():
         logs=logs,
         network_stream_ids=network_stream_ids,
         device_aliases=device_aliases,
+        device_metadata=device_metadata,
     )
 
 @app.route("/video/<device_id>")
 def serve_video(device_id):
-    filename = video_manifest.get(device_id, f"{device_id}.mp4")
+    filename = video_manifest.get(device_id, _video_playback_name(device_id))
+    if not os.path.exists(os.path.join(VIDEOS_DIR, filename)):
+        filename = _video_current_name(device_id)
+    response = send_from_directory(VIDEOS_DIR, filename, conditional=True)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
+@app.route("/video_custom/<filename>")
+def serve_custom_video(filename):
+    if not filename.endswith(".mp4") or "/" in filename or "\\" in filename:
+        return "Invalid video filename", 400
     response = send_from_directory(VIDEOS_DIR, filename, conditional=True)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
@@ -910,6 +1122,49 @@ def load_dashboard_stats():
     return stats
 
 
+def _parse_local_datetime(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+@app.route("/custom_timelapse/<device_id>", methods=["POST"])
+def custom_timelapse(device_id):
+    payload = request.get_json(silent=True) or request.form or {}
+    start_dt = _parse_local_datetime(payload.get("start"))
+    end_dt = _parse_local_datetime(payload.get("end"))
+    if not start_dt or not end_dt:
+        return jsonify({"status": "error", "message": "Choose a start and end date/time."}), 400
+    if end_dt <= start_dt:
+        return jsonify({"status": "error", "message": "End must be after start."}), 400
+
+    frames = _frame_files_for_device(device_id, start_dt, end_dt)
+    if len(frames) < 2:
+        return jsonify({"status": "error", "message": f"Only {len(frames)} frame(s) found in that range."}), 400
+
+    start_label = start_dt.strftime("%Y%m%d_%H%M")
+    end_label = end_dt.strftime("%Y%m%d_%H%M")
+    filename = _custom_video_name(device_id, start_label, end_label)
+    output_file = os.path.join(VIDEOS_DIR, filename)
+    ok, message = _render_video_from_frames(device_id, frames, output_file)
+    if not ok:
+        return jsonify({"status": "error", "message": message}), 500
+    return jsonify({
+        "status": "ok",
+        "device": device_id,
+        "frames": len(frames),
+        "filename": filename,
+        "url": f"/video_custom/{filename}",
+        "path": output_file,
+    })
+
+
 @app.route("/reset_timelapse/<device_id>", methods=["POST"])
 def reset_timelapse(device_id):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -923,11 +1178,16 @@ def reset_timelapse(device_id):
         shutil.move(device_capture_dir, archived_captures)
         os.makedirs(device_capture_dir, exist_ok=True)
 
-    video_path = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
-    if os.path.exists(video_path):
-        archived_video_dir = os.path.join(archive_root, "videos")
-        os.makedirs(archived_video_dir, exist_ok=True)
-        shutil.move(video_path, os.path.join(archived_video_dir, f"{device_id}_{stamp}.mp4"))
+    archived_video_dir = os.path.join(archive_root, "videos")
+    for video_name in (_video_current_name(device_id), _video_playback_name(device_id)):
+        video_path = os.path.join(VIDEOS_DIR, video_name)
+        if os.path.exists(video_path):
+            os.makedirs(archived_video_dir, exist_ok=True)
+            base, ext = os.path.splitext(video_name)
+            shutil.move(video_path, os.path.join(archived_video_dir, f"{base}_{stamp}{ext}"))
+    if device_id in video_manifest:
+        video_manifest[device_id] = _video_playback_name(device_id)
+        save_video_manifest()
 
     stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
     if os.path.exists(stats_file):
@@ -1075,6 +1335,27 @@ def update_device_alias(device_id):
     return jsonify({"status": "ok", "device": device_id, "alias": device_aliases.get(device_id, "")})
 
 
+@app.route("/device_metadata")
+def get_device_metadata():
+    return jsonify(device_metadata)
+
+
+@app.route("/device_metadata/<device_id>", methods=["POST"])
+def update_device_metadata(device_id):
+    data = request.get_json(silent=True) or {}
+    current = dict(device_metadata.get(device_id, {}))
+    if "chamber" in data:
+        current["chamber"] = str(data.get("chamber") or "").strip()[:80]
+    if "role" in data:
+        role = str(data.get("role") or "").strip()
+        current["role"] = role if role in ("tray", "wall", "overview", "night_vision", "calibration", "other") else "other"
+    if "notes" in data:
+        current["notes"] = str(data.get("notes") or "").strip()[:240]
+    device_metadata[device_id] = current
+    save_device_metadata()
+    return jsonify({"status": "ok", "device": device_id, "metadata": current})
+
+
 @app.route("/ignore_growth_point/<device_id>", methods=["POST"])
 def ignore_growth_point(device_id):
     data = request.get_json(silent=True) or {}
@@ -1179,6 +1460,11 @@ def update_device_settings(device_id):
         current["exposure_compensation"] = int(max(-12, min(12, int(data["exposure_compensation"]))))
     if "display_rotation_deg" in data:
         current["display_rotation_deg"] = float(data["display_rotation_deg"]) % 360.0
+    if "collect_night_frames" in data:
+        current["collect_night_frames"] = bool(data["collect_night_frames"])
+    if "measurement_locked" in data:
+        current["measurement_locked"] = bool(data["measurement_locked"])
+        current["measurement_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if current["measurement_locked"] else ""
     if str(data.get("iso")) in ("auto", "100", "200", "400", "800", "1600"):
         current["iso"] = str(data["iso"])
     if data.get("focus_mode") in ("continuous-picture", "auto", "infinity", "macro", "fixed"):
@@ -1689,6 +1975,22 @@ OBSERVATORY_DASHBOARD_HTML = """
         .view-section.active { display: block; }
         .settings-row { display: grid; grid-template-columns: 90px 1fr 54px; align-items: center; gap: 10px; margin-top: 10px; }
         .setup-control-card { border-top: 1px solid #26302c; margin-top: 12px; padding-top: 12px; }
+        .setup-workbench { display: grid; grid-template-columns: minmax(220px, .55fr) minmax(360px, 1.05fr) minmax(300px, .75fr); gap: 14px; align-items: start; margin-top: 14px; }
+        .setup-stage { display: grid; gap: 12px; }
+        .setup-mode-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px; }
+        .setup-mode-tabs button { min-height: 40px; padding: 6px 8px; }
+        .setup-mode-tabs button.active { border-color: var(--green); background: #18231e; color: var(--text); }
+        .setup-panel { display: none; border: 1px solid #26302c; border-radius: 8px; padding: 12px; background: var(--panel-2); }
+        .setup-panel.active { display: block; }
+        .setup-panel h3 { margin: 0 0 8px; }
+        .setup-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+        .setup-summary div { border: 1px solid #26302c; border-radius: 6px; padding: 9px; background: #0d1311; }
+        .setup-summary span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; }
+        .setup-summary strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+        .setup-checklist { display: grid; gap: 8px; }
+        .setup-checklist div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #26302c; padding-top: 8px; }
+        .setup-checklist .ok { color: var(--green); font-weight: 800; }
+        .setup-checklist .warn { color: var(--amber); font-weight: 800; }
         select, input[type="range"] { width: 100%; accent-color: var(--green); }
         select { min-height: 34px; border-radius: 6px; border: 1px solid #3a4541; background: #101514; color: var(--text); padding: 0 8px; }
         .telemetry { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
@@ -1742,7 +2044,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         @media (max-width: 980px) {
             .shell { grid-template-columns: 1fr; }
             .sidebar { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-            .workspace, .summary { grid-template-columns: 1fr; }
+            .workspace, .summary, .setup-workbench { grid-template-columns: 1fr; }
             .topbar { flex-direction: column; }
             .actions { justify-content: flex-start; }
         }
@@ -1851,122 +2153,88 @@ OBSERVATORY_DASHBOARD_HTML = """
             </div>
             <section class="panel view-section" id="view-segmentation">
                 <h2>Connected Devices</h2>
-                <div class="split-grid" style="margin-top:14px">
-                    <div>
+                <div class="setup-workbench">
+                    <aside>
                         <div class="device-list">
                             {% for d in devices %}
                             <button onclick="selectSegmentationDevice('{{d}}')" title="Select this connected camera for setup, segmentation, and calibration."><span id="device-button-label-{{d}}">{{ device_aliases.get(d, d) }}</span><br><small class="muted">{{ d }}</small></button>
                             {% endfor %}
                         </div>
-                        <div class="timeline" id="segment-list"></div>
-                    </div>
-                    <div>
-                        <div class="controls">
-                            <button onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region to track separately in Growth Analytics.">Segment Box</button>
-                            <button onclick="enablePolygonSegmentMode()" title="Click around a skewed tray or plant region, then double-click to finish.">Segment Polygon</button>
-                            <button onclick="enableIgnoreEditorMode('ignore-box')" title="Drag a rectangle over false green areas so they are removed from canopy measurements.">Ignore Box</button>
-                            <button onclick="enableIgnoreEditorMode('ignore-polygon')" title="Click a polygon around false green areas, then double-click to finish.">Ignore Polygon</button>
-                            <button onclick="enableManualMarkerMode()" title="Drag a crop around a visible marker, then click the four corners in the popup for a manual scale reference.">Manual Tag</button>
-                            <button onclick="calibrateSelectedAruco()" title="Use the selected device's current ArUco or ChArUco scale as the stable calibration reference.">Calibrate ArUco</button>
-                            <button id="greenmask-toggle" onclick="toggleGreenMask()" title="Switch the setup image between the green analysis overlay and the raw latest frame.">Greenmask On</button>
-                            <button onclick="clearSegmentsForSelected()" title="Remove every saved segment for the selected device.">Clear Segments</button>
-                            <button onclick="clearManualTagsForSelected()" title="Remove all manually registered marker tags for the selected device.">Clear Tags</button>
-                            <button onclick="clearEditorIgnores()" title="Remove all ignored regions for the selected device.">Clear Ignores</button>
-                            <button onclick="refreshSegmentationFrame()" title="Reload the selected setup frame from disk.">Refresh Frame</button>
-                        </div>
+                        <div class="timeline" id="setup-checklist"></div>
+                    </aside>
+                    <div class="setup-stage">
+                        <div class="setup-summary" id="setup-summary"></div>
                         <div class="image-wrap">
                             <img id="segment-image" src="" onpointerdown="startSegmentDrag(event)" onpointermove="moveSegmentDrag(event)" onpointerup="finishSegmentDrag(event)" ondblclick="finishPointMode()" onerror="this.style.display='none'">
                             <div id="segment-overlays"></div>
                             <div id="segment-selection" style="position:absolute; border:2px dashed var(--cyan); pointer-events:none; display:none;"></div>
                         </div>
-                        {% for d in devices %}
-                        <div class="setup-control-card" id="setup-controls-{{d}}" data-setup-device="{{d}}" style="display:none">
-                            <div class="settings-row">
-                                <label class="muted" for="alias-{{d}}">Name</label>
-                                <input id="alias-{{d}}" type="text" value="{{ device_aliases.get(d, '') }}" placeholder="{{ d }}" title="Local display name only. This does not rename capture folders or device IDs." onchange="saveDeviceAlias('{{d}}', this.value)">
-                                <strong></strong>
-                            </div>
-                            <div class="controls" style="margin-top:12px">
-                                <select id="profile-toggle-{{d}}" onchange="applyNamedProfile('{{d}}', this.value)">
-                                    <option value="day">Day Profile</option>
-                                    <option value="wide_day">Wide Day</option>
-                                    <option value="night_ir">Night IR</option>
-                                </select>
-                                <button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button>
-                                <button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button>
-                                <button onclick="saveCurrentProfile('{{d}}')">Save Profile</button>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="zoom-{{d}}">Zoom</label>
-                                <input id="zoom-{{d}}" type="range" min="0" max="100" value="0" oninput="previewZoom('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'zoom_percent', this.value)">
-                                <strong id="zoom-value-{{d}}">0%</strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="delay-{{d}}">Settle</label>
-                                <input id="delay-{{d}}" type="range" min="500" max="15000" step="500" value="5000" oninput="previewDelay('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'delay_ms', this.value)">
-                                <strong id="delay-value-{{d}}">5.0s</strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="antibanding-{{d}}">Banding</label>
-                                <select id="antibanding-{{d}}" onchange="saveDeviceSetting('{{d}}', 'antibanding', this.value)">
-                                    <option value="60hz">60 Hz</option>
-                                    <option value="50hz">50 Hz</option>
-                                    <option value="auto">Auto</option>
-                                    <option value="off">Off</option>
-                                </select>
-                                <strong></strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="white-balance-{{d}}">WB</label>
-                                <select id="white-balance-{{d}}" onchange="saveDeviceSetting('{{d}}', 'white_balance', this.value)">
-                                    <option value="daylight">Daylight</option>
-                                    <option value="cloudy-daylight">Cloudy</option>
-                                    <option value="fluorescent">Fluorescent</option>
-                                    <option value="incandescent">Incandescent</option>
-                                    <option value="shade">Shade</option>
-                                    <option value="twilight">Twilight</option>
-                                    <option value="warm-fluorescent">Warm Fluor.</option>
-                                    <option value="auto">Auto</option>
-                                </select>
-                                <strong></strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="focus-{{d}}">Focus</label>
-                                <select id="focus-{{d}}" onchange="saveDeviceSetting('{{d}}', 'focus_mode', this.value)">
-                                    <option value="continuous-picture">Continuous</option>
-                                    <option value="auto">Auto</option>
-                                    <option value="macro">Macro</option>
-                                    <option value="infinity">Infinity</option>
-                                    <option value="fixed">Fixed</option>
-                                </select>
-                                <strong></strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="exposure-{{d}}">Exposure</label>
-                                <input id="exposure-{{d}}" type="range" min="-12" max="12" step="1" value="0" oninput="previewExposure('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'exposure_compensation', this.value)">
-                                <strong id="exposure-value-{{d}}">0</strong>
-                            </div>
-                            <div class="settings-row">
-                                <label class="muted" for="iso-{{d}}">ISO</label>
-                                <select id="iso-{{d}}" onchange="saveDeviceSetting('{{d}}', 'iso', this.value)">
-                                    <option value="auto">Auto</option>
-                                    <option value="100">100</option>
-                                    <option value="200">200</option>
-                                    <option value="400">400</option>
-                                    <option value="800">800</option>
-                                    <option value="1600">1600</option>
-                                </select>
-                                <strong></strong>
-                            </div>
-                            <div class="controls" style="margin-top:12px">
-                                <button onclick="autoTuneTags('{{d}}')">Auto Sweep Tags</button>
-                                <button onclick="enableIgnoreEditorMode('ignore-box')">Ignore Box</button>
-                                <button onclick="enableIgnoreEditorMode('ignore-polygon')">Ignore Polygon</button>
-                                <button onclick="clearEditorIgnores()">Clear Ignores</button>
+                        <div class="timeline" id="segment-list"></div>
+                    </div>
+                    <aside>
+                        <div class="setup-mode-tabs">
+                            <button class="active" data-setup-mode="onboarding" onclick="showSetupMode('onboarding')">Onboard</button>
+                            <button data-setup-mode="tune" onclick="showSetupMode('tune')">Tune</button>
+                            <button data-setup-mode="segmentation" onclick="showSetupMode('segmentation')">Segment</button>
+                            <button data-setup-mode="qa" onclick="showSetupMode('qa')">QA</button>
+                        </div>
+                        <div class="setup-panel active" data-setup-panel="onboarding">
+                            <h3>Onboarding</h3>
+                            <div class="muted">Name the device, assign a chamber and role, then confirm a capture works.</div>
+                            <div id="setup-onboarding-controls"></div>
+                        </div>
+                        <div class="setup-panel" data-setup-panel="tune">
+                            <h3>Tune & Calibrate</h3>
+                            <div class="muted">Optimize camera settings for tag detection, green measurement, and movement tracking, then lock the fixed rig setup.</div>
+                            <div id="setup-tune-controls"></div>
+                            <div class="timeline" id="setup-tune-steps"></div>
+                            <div class="controls">
+                                <button onclick="captureSelectedSetupFrame()" title="Capture one fresh frame using the current settings.">Test Frame</button>
+                                <button onclick="autoTuneSelectedTags()" title="Sweep capture settings to maximize tag detection.">Auto Sweep Tags</button>
+                                <button onclick="calibrateSelectedAruco()" title="Use the selected device's current marker scale as stable reference.">Accept Scale</button>
+                                <button onclick="enableManualMarkerMode()" title="Crop and click a visible marker by hand.">Manual Tag</button>
+                                <button onclick="clearManualTagsForSelected()" title="Remove all manual tags for this device.">Clear Tags</button>
+                                <button class="primary" onclick="lockSelectedMeasurementSetup()" title="Mark the current camera, calibration, greenmask, and motion setup as fixed.">Lock Setup</button>
                             </div>
                         </div>
+                        <div class="setup-panel" data-setup-panel="segmentation">
+                            <h3>Segmentation</h3>
+                            <div class="muted">Define trays/plants and exclude false green areas.</div>
+                            <div class="controls">
+                                <button onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region.">Segment Box</button>
+                                <button onclick="enablePolygonSegmentMode()" title="Click around a skewed tray, then double-click.">Segment Polygon</button>
+                                <button onclick="enableIgnoreEditorMode('ignore-box')" title="Drag over false green/artifact space.">Ignore Box</button>
+                                <button onclick="enableIgnoreEditorMode('ignore-polygon')" title="Click around false green/artifact space, then double-click.">Ignore Polygon</button>
+                                <button id="greenmask-toggle" onclick="toggleGreenMask()" title="Switch between green overlay and raw frame.">Greenmask On</button>
+                                <button onclick="clearSegmentsForSelected()" title="Remove every saved segment.">Clear Segments</button>
+                                <button onclick="clearEditorIgnores()" title="Remove ignored regions.">Clear Ignores</button>
+                                <button onclick="refreshSegmentationFrame()" title="Reload the selected frame.">Refresh Frame</button>
+                            </div>
+                        </div>
+                        <div class="setup-panel" data-setup-panel="qa">
+                            <h3>Measurement QA</h3>
+                            <div class="muted">Check whether the current measurement is believable.</div>
+                            <div id="setup-qa-panel" class="timeline"></div>
+                        </div>
+                        <div id="setup-device-controls-source" style="display:none">
+                        {% for d in devices %}
+                        <div class="setup-control-card" id="setup-controls-{{d}}" data-setup-device="{{d}}">
+                            <div class="settings-row"><label class="muted" for="alias-{{d}}">Name</label><input id="alias-{{d}}" type="text" value="{{ device_aliases.get(d, '') }}" placeholder="{{ d }}" title="Local display name only. This does not rename capture folders or device IDs." onchange="saveDeviceAlias('{{d}}', this.value)"><strong></strong></div>
+                            <div class="settings-row"><label class="muted" for="chamber-{{d}}">Chamber</label><input id="chamber-{{d}}" type="text" value="{{ (device_metadata.get(d, {}) or {}).get('chamber', '') }}" placeholder="Chamber A" onchange="saveDeviceMetadata('{{d}}', 'chamber', this.value)"><strong></strong></div>
+                            <div class="settings-row"><label class="muted" for="role-{{d}}">Role</label><select id="role-{{d}}" onchange="saveDeviceMetadata('{{d}}', 'role', this.value)">{% set role = (device_metadata.get(d, {}) or {}).get('role', 'tray') %}<option value="tray" {{ 'selected' if role == 'tray' else '' }}>Tray</option><option value="wall" {{ 'selected' if role == 'wall' else '' }}>Wall</option><option value="overview" {{ 'selected' if role == 'overview' else '' }}>Overview</option><option value="night_vision" {{ 'selected' if role == 'night_vision' else '' }}>Night vision</option><option value="calibration" {{ 'selected' if role == 'calibration' else '' }}>Calibration</option><option value="other" {{ 'selected' if role == 'other' else '' }}>Other</option></select><strong></strong></div>
+                            <div class="controls" style="margin-top:12px"><select id="profile-toggle-{{d}}" onchange="applyNamedProfile('{{d}}', this.value)"><option value="day">Day Profile</option><option value="wide_day">Wide Day</option><option value="night_ir">Night IR</option></select><button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button><button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button><button onclick="saveCurrentProfile('{{d}}')">Save Profile</button></div>
+                            <label class="settings-row" title="When off, this device skips real night captures and contributes a one-second labeled night placeholder to its timelapse instead."><span class="muted">Night frames</span><input id="collect-night-{{d}}" type="checkbox" onchange="saveDeviceSetting('{{d}}', 'collect_night_frames', this.checked)"><strong id="collect-night-label-{{d}}">Collect</strong></label>
+                            <div class="settings-row"><label class="muted" for="zoom-{{d}}">Zoom</label><input id="zoom-{{d}}" type="range" min="0" max="100" value="0" oninput="previewZoom('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'zoom_percent', this.value)"><strong id="zoom-value-{{d}}">0%</strong></div>
+                            <div class="settings-row"><label class="muted" for="delay-{{d}}">Settle</label><input id="delay-{{d}}" type="range" min="500" max="15000" step="500" value="5000" oninput="previewDelay('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'delay_ms', this.value)"><strong id="delay-value-{{d}}">5.0s</strong></div>
+                            <div class="settings-row"><label class="muted" for="antibanding-{{d}}">Banding</label><select id="antibanding-{{d}}" onchange="saveDeviceSetting('{{d}}', 'antibanding', this.value)"><option value="60hz">60 Hz</option><option value="50hz">50 Hz</option><option value="auto">Auto</option><option value="off">Off</option></select><strong></strong></div>
+                            <div class="settings-row"><label class="muted" for="white-balance-{{d}}">WB</label><select id="white-balance-{{d}}" onchange="saveDeviceSetting('{{d}}', 'white_balance', this.value)"><option value="daylight">Daylight</option><option value="cloudy-daylight">Cloudy</option><option value="fluorescent">Fluorescent</option><option value="incandescent">Incandescent</option><option value="shade">Shade</option><option value="twilight">Twilight</option><option value="warm-fluorescent">Warm Fluor.</option><option value="auto">Auto</option></select><strong></strong></div>
+                            <div class="settings-row"><label class="muted" for="focus-{{d}}">Focus</label><select id="focus-{{d}}" onchange="saveDeviceSetting('{{d}}', 'focus_mode', this.value)"><option value="continuous-picture">Continuous</option><option value="auto">Auto</option><option value="macro">Macro</option><option value="infinity">Infinity</option><option value="fixed">Fixed</option></select><strong></strong></div>
+                            <div class="settings-row"><label class="muted" for="exposure-{{d}}">Exposure</label><input id="exposure-{{d}}" type="range" min="-12" max="12" step="1" value="0" oninput="previewExposure('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'exposure_compensation', this.value)"><strong id="exposure-value-{{d}}">0</strong></div>
+                            <div class="settings-row"><label class="muted" for="iso-{{d}}">ISO</label><select id="iso-{{d}}" onchange="saveDeviceSetting('{{d}}', 'iso', this.value)"><option value="auto">Auto</option><option value="100">100</option><option value="200">200</option><option value="400">400</option><option value="800">800</option><option value="1600">1600</option></select><strong></strong></div>
+                        </div>
                         {% endfor %}
-                    </div>
+                        </div>
+                    </aside>
                 </div>
             </section>
             <section class="panel view-section" id="view-growth">
@@ -2002,6 +2270,24 @@ OBSERVATORY_DASHBOARD_HTML = """
                 </div>
                 <h3 style="margin-top:18px">Timelapses</h3>
                 <div class="timeline" id="timelapse-list"></div>
+                <h3 style="margin-top:18px">Custom Timelapse Export</h3>
+                <div class="timeline">
+                    <div class="event">
+                        <time>Range</time>
+                        <div>
+                            <strong>Render a clip from saved frames</strong><br>
+                            Pick a device and date range, such as last weekend, without changing the live timelapse.
+                            <div class="controls" style="margin-top:8px">
+                                <select id="custom-timelapse-device">{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
+                                <input id="custom-timelapse-start" type="datetime-local">
+                                <input id="custom-timelapse-end" type="datetime-local">
+                                <button onclick="makeCustomTimelapse()">Render Clip</button>
+                            </div>
+                            <div class="muted" id="custom-timelapse-status" style="margin-top:8px">Idle</div>
+                            <div id="custom-timelapse-player"></div>
+                        </div>
+                    </div>
+                </div>
             </section>
         </main>
     </div>
@@ -2031,7 +2317,10 @@ OBSERVATORY_DASHBOARD_HTML = """
         const MAX_CHART_POINTS = 700;
         const connectedDevices = new Set({{ devices|tojson }});
         const deviceAliases = {{ device_aliases|tojson }};
+        const deviceMetadata = {{ device_metadata|tojson }};
+        const settingsCache = {};
         let showSetupGreenMask = true;
+        let activeSetupMode = 'onboarding';
         let pointPopover = null;
         let liveDevice = null;
         let liveTimer = null;
@@ -2293,14 +2582,14 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function saveDeviceSetting(deviceId, key, value) {
             const payload = {};
-            payload[key] = (key === 'zoom_percent' || key === 'delay_ms' || key === 'exposure_compensation' || key === 'display_rotation_deg') ? Number(value) : value;
+            payload[key] = key === 'collect_night_frames' ? Boolean(value) : ((key === 'zoom_percent' || key === 'delay_ms' || key === 'exposure_compensation' || key === 'display_rotation_deg') ? Number(value) : value);
             fetch('/device_settings/' + deviceId, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             }).then(r => r.json()).then(settings => {
                 applyDeviceSettings(deviceId, settings);
-                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, anti-banding ${settings.antibanding}. It applies on the next capture.`);
+                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, night frames ${settings.collect_night_frames ? 'on' : 'off'}. It applies on the next capture.`);
             });
         }
         function saveDeviceSettings(deviceId, payload) {
@@ -2380,6 +2669,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 .catch(e => showOperation('PTZ stop failed', `${cameraId}: ${e.message}`, 'bad'));
         }
         function applyDeviceSettings(deviceId, settings) {
+            settingsCache[deviceId] = settings || {};
             const zoom = document.getElementById('zoom-' + deviceId);
             const zoomValue = document.getElementById('zoom-value-' + deviceId);
             const delay = document.getElementById('delay-' + deviceId);
@@ -2392,6 +2682,8 @@ OBSERVATORY_DASHBOARD_HTML = """
             const antibanding = document.getElementById('antibanding-' + deviceId);
             const rotation = document.getElementById('rotation-' + deviceId);
             const rotationNumber = document.getElementById('rotation-number-' + deviceId);
+            const collectNight = document.getElementById('collect-night-' + deviceId);
+            const collectNightLabel = document.getElementById('collect-night-label-' + deviceId);
             const toggle = document.getElementById('profile-toggle-' + deviceId);
             const auto = document.getElementById('auto-light-' + deviceId);
             if (zoom) zoom.value = settings.zoom_percent || 0;
@@ -2407,6 +2699,8 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (rotation) rotation.value = settings.display_rotation_deg || 0;
             if (rotationNumber) rotationNumber.value = Math.round(settings.display_rotation_deg || 0);
             previewRotation(deviceId, settings.display_rotation_deg || 0);
+            if (collectNight) collectNight.checked = settings.collect_night_frames !== false;
+            if (collectNightLabel) collectNightLabel.textContent = settings.collect_night_frames === false ? 'Skip' : 'Collect';
             if (toggle) {
                 const profileName = settings.profile_name || settings.light_mode || settings.active_light_mode || 'day';
                 toggle.dataset.activeMode = settings.active_light_mode || settings.light_mode || 'day';
@@ -2430,13 +2724,106 @@ OBSERVATORY_DASHBOARD_HTML = """
                 segmentState.segments = segments || {};
                 segmentState.manualMarkers = manualMarkers || {};
                 if (!segmentState.deviceId) {
-                    const first = Object.keys(segmentState.segments || {})[0] || Object.keys(latestStats || {})[0];
+                    const first = Object.keys(segmentState.segments || {})[0] || Object.keys(latestStats || {})[0] || Array.from(connectedDevices)[0];
                     if (first) selectSegmentationDevice(first);
                 }
                 renderAllSegmentOverlays();
                 renderSegmentList();
                 renderGrowthCharts(latestStats);
             });
+        }
+        function showSetupMode(mode) {
+            activeSetupMode = mode;
+            document.querySelectorAll('[data-setup-mode]').forEach(button => button.classList.toggle('active', button.dataset.setupMode === mode));
+            document.querySelectorAll('[data-setup-panel]').forEach(panel => panel.classList.toggle('active', panel.dataset.setupPanel === mode));
+            renderSetupWorkbench();
+        }
+        function selectedSetupCard() {
+            if (!segmentState.deviceId) return null;
+            return document.getElementById('setup-controls-' + segmentState.deviceId);
+        }
+        function renderSetupWorkbench() {
+            const card = selectedSetupCard();
+            const onboarding = document.getElementById('setup-onboarding-controls');
+            const tune = document.getElementById('setup-tune-controls');
+            if (onboarding) onboarding.innerHTML = '';
+            if (tune) tune.innerHTML = '';
+            if (card) {
+                if (activeSetupMode === 'tune') {
+                    tune?.appendChild(card);
+                } else {
+                    onboarding?.appendChild(card);
+                }
+                card.style.display = 'block';
+            }
+            renderSetupSummary();
+            renderSetupChecklist();
+            renderSetupQA();
+            renderSetupTuneSteps();
+        }
+        function renderSetupSummary() {
+            const root = document.getElementById('setup-summary');
+            if (!root || !segmentState.deviceId) return;
+            const id = segmentState.deviceId;
+            const meta = deviceMetadata[id] || {};
+            const info = latestStats[id] || {};
+            const data = info.data || {};
+            root.innerHTML = `
+                <div><span>Device</span><strong>${aliasOf(id)}</strong></div>
+                <div><span>Chamber / role</span><strong>${meta.chamber || '--'} / ${meta.role || '--'}</strong></div>
+                <div><span>Markers</span><strong>${data.markers_found || 0} detected</strong></div>
+                <div><span>Stable scale</span><strong>${info.stable_scale_px_per_mm ? fmt(Number(info.stable_scale_px_per_mm), 3) + ' px/mm' : '--'}</strong></div>
+            `;
+        }
+        function renderSetupChecklist() {
+            const root = document.getElementById('setup-checklist');
+            if (!root || !segmentState.deviceId) return;
+            const id = segmentState.deviceId;
+            const meta = deviceMetadata[id] || {};
+            const info = latestStats[id] || {};
+            const data = info.data || {};
+            const segments = (segmentState.segments || {})[id] || [];
+            const checks = [
+                ['Named', Boolean(deviceAliases[id]), aliasOf(id)],
+                ['Assigned', Boolean(meta.chamber && meta.role), `${meta.chamber || '--'} / ${meta.role || '--'}`],
+                ['Frame', Boolean(info.filename), info.filename || '--'],
+                ['Tags', Number(data.markers_found || 0) > 0, `${data.markers_found || 0} visible`],
+                ['Scale', Boolean(info.stable_scale_px_per_mm || data.scale_px_per_mm), `${fmt(Number(info.stable_scale_px_per_mm || data.scale_px_per_mm), 3)} px/mm`],
+                ['Segments', segments.length > 0, `${segments.length} saved`],
+                ['Locked', Boolean((settingsCache[id] || {}).measurement_locked), (settingsCache[id] || {}).measurement_locked_at || '--'],
+            ];
+            root.innerHTML = `<div class="event"><time>Ready</time><div class="setup-checklist">${checks.map(([name, ok, detail]) => `<div><span>${name}<br><small class="muted">${detail}</small></span><strong class="${ok ? 'ok' : 'warn'}">${ok ? 'OK' : 'Needs work'}</strong></div>`).join('')}</div></div>`;
+        }
+        function renderSetupQA() {
+            const root = document.getElementById('setup-qa-panel');
+            if (!root || !segmentState.deviceId) return;
+            const id = segmentState.deviceId;
+            const info = latestStats[id] || {};
+            const data = info.data || {};
+            const color = data.color_metrics || {};
+            const scaleRejected = data.scale_rejected || ((info.history || []).slice(-1)[0] || {}).scale_rejected;
+            const confidence = Number(data.markers_found || 0) > 0 && !scaleRejected && Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0) > 0;
+            root.innerHTML = `
+                <div class="event"><time>${confidence ? 'Good' : 'Check'}</time><div><strong>Measurement confidence: ${confidence ? 'usable' : 'needs attention'}</strong><br>Markers ${data.markers_found || 0}, scale ${data.scale_px_per_mm ? fmt(Number(data.scale_px_per_mm), 3) + ' px/mm' : '--'}, canopy ${fmt(Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0))} mm2, green index ${color.green_index !== undefined ? fmt(Number(color.green_index), 3) : '--'}${scaleRejected ? '<br><span class="warn">Scale was rejected on this frame.</span>' : ''}</div></div>
+                <div class="event"><time>Actions</time><div class="controls"><button onclick="captureDevice('${id}')">Test Capture</button><button onclick="refreshSegmentationFrame()">Refresh Frame</button><button onclick="calibrateSelectedAruco()">Accept Scale</button><button onclick="showSetupMode('segmentation')">Edit Segments</button></div></div>
+            `;
+        }
+        function renderSetupTuneSteps() {
+            const root = document.getElementById('setup-tune-steps');
+            if (!root || !segmentState.deviceId) return;
+            const id = segmentState.deviceId;
+            const settings = settingsCache[id] || {};
+            const info = latestStats[id] || {};
+            const data = info.data || {};
+            const color = data.color_metrics || {};
+            const locked = settings.measurement_locked;
+            root.innerHTML = `
+                <div class="event"><time>1</time><div><strong>Find the sharp, stable camera setup</strong><br>Use live view/test frame, focus, exposure, WB, ISO, settle, and zoom until tags and leaves look stable.</div></div>
+                <div class="event"><time>2</time><div><strong>Maximize marker detection</strong><br>${data.markers_found || 0} markers visible. Use Auto Sweep Tags if detection is weak.</div></div>
+                <div class="event"><time>3</time><div><strong>Confirm green measurement</strong><br>Green index ${color.green_index !== undefined ? fmt(Number(color.green_index), 3) : '--'}, canopy ${fmt(Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0))} mm2. Use Segment mode to remove false green.</div></div>
+                <div class="event"><time>4</time><div><strong>Accept fixed geometry</strong><br>Scale ${fmt(Number(info.stable_scale_px_per_mm || data.scale_px_per_mm), 3)} px/mm. Phones and boards should now stay fixed except harvests or small tray nudges.</div></div>
+                <div class="event"><time>${locked ? 'Locked' : 'Open'}</time><div><strong>${locked ? 'Setup locked for measurement' : 'Setup not locked yet'}</strong><br>${locked ? (settings.measurement_locked_at || '') : 'Lock after tags, greenmask, and motion view are acceptable.'}<br><button onclick="lockSelectedMeasurementSetup(${locked ? 'false' : 'true'})">${locked ? 'Unlock Setup' : 'Lock Setup'}</button></div></div>
+            `;
         }
         function selectSegmentationDevice(deviceId) {
             segmentState.deviceId = deviceId;
@@ -2446,9 +2833,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             document.querySelectorAll('.device-list button').forEach(button => {
                 if (button.textContent.includes(deviceId)) button.classList.add('active');
             });
-            document.querySelectorAll('.setup-control-card').forEach(card => {
-                card.style.display = card.dataset.setupDevice === deviceId ? 'block' : 'none';
-            });
+            document.querySelectorAll('.setup-control-card').forEach(card => { card.style.display = 'none'; });
             const img = document.getElementById('segment-image');
             img.style.display = 'block';
             img.src = (showSetupGreenMask ? '/analysis_debug/' : '/last_frame/') + deviceId + '?t=' + Date.now();
@@ -2456,6 +2841,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             const crop = document.getElementById('manual-marker-crop');
             if (crop) crop.style.display = 'none';
             renderSegmentList();
+            renderSetupWorkbench();
         }
         function refreshSegmentationFrame() {
             if (segmentState.deviceId) selectSegmentationDevice(segmentState.deviceId);
@@ -2482,6 +2868,19 @@ OBSERVATORY_DASHBOARD_HTML = """
                 showOperation('Device name saved', `${deviceId}: ${aliasOf(deviceId)}`);
             });
         }
+        function saveDeviceMetadata(deviceId, key, value) {
+            const payload = {};
+            payload[key] = value;
+            fetch('/device_metadata/' + encodeURIComponent(deviceId), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(r => r.json()).then(body => {
+                deviceMetadata[deviceId] = body.metadata || {};
+                renderSetupWorkbench();
+                showOperation('Device context saved', `${aliasOf(deviceId)}: ${key} updated.`);
+            });
+        }
         function calibrateSelectedAruco() {
             if (!segmentState.deviceId) return;
             fetch('/calibrate_aruco/' + encodeURIComponent(segmentState.deviceId), { method: 'POST' }).then(async r => {
@@ -2492,6 +2891,21 @@ OBSERVATORY_DASHBOARD_HTML = """
                 showOperation('ArUco scale calibrated', `${aliasOf(segmentState.deviceId)}: stable scale set to ${fmt(Number(body.scale_px_per_mm), 3)} px/mm from ${body.source || 'current marker detection'}.`);
                 updateStats();
             }).catch(e => showOperation('ArUco calibration failed', e.message, 'bad'));
+        }
+        function autoTuneSelectedTags() {
+            if (segmentState.deviceId) autoTuneTags(segmentState.deviceId);
+        }
+        function captureSelectedSetupFrame() {
+            if (!segmentState.deviceId) return;
+            captureDevice(segmentState.deviceId);
+            setTimeout(() => refreshSegmentationFrame(), 1200);
+        }
+        function lockSelectedMeasurementSetup(lock = true) {
+            if (!segmentState.deviceId) return;
+            saveDeviceSettings(segmentState.deviceId, { measurement_locked: lock }).then(settings => {
+                showOperation(lock ? 'Measurement setup locked' : 'Measurement setup unlocked', `${aliasOf(segmentState.deviceId)}: ${lock ? 'camera setup, scale, greenmask, and motion view are marked stable.' : 'setup can be edited again.'}`);
+                renderSetupWorkbench();
+            });
         }
         function enableSegmentMode() {
             if (!segmentState.deviceId) {
@@ -3278,6 +3692,33 @@ OBSERVATORY_DASHBOARD_HTML = """
             const target = document.getElementById('timelapse-player-' + cssEscape(deviceId));
             if (target) target.innerHTML = `<video controls preload="metadata" src="/video/${deviceId}?t=${Date.now()}" style="margin-top:8px"></video>`;
         }
+        function makeCustomTimelapse() {
+            const device = document.getElementById('custom-timelapse-device')?.value;
+            const start = document.getElementById('custom-timelapse-start')?.value;
+            const end = document.getElementById('custom-timelapse-end')?.value;
+            const status = document.getElementById('custom-timelapse-status');
+            const player = document.getElementById('custom-timelapse-player');
+            if (!device || !start || !end) {
+                if (status) status.textContent = 'Choose a device, start, and end.';
+                return;
+            }
+            if (status) status.textContent = 'Rendering custom clip...';
+            if (player) player.innerHTML = '';
+            fetch('/custom_timelapse/' + encodeURIComponent(device), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ start, end })
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Custom render failed');
+                return body;
+            }).then(d => {
+                if (status) status.textContent = `Rendered ${d.frames} frames: ${d.filename}`;
+                if (player) player.innerHTML = `<video controls preload="metadata" src="${d.url}?t=${Date.now()}" style="margin-top:8px"></video>`;
+            }).catch(e => {
+                if (status) status.textContent = e.message;
+            });
+        }
         function showFileLocation(kind, deviceId) {
             fetch(`/show_location/${kind}/${deviceId}`, { method: 'POST' }).then(r => r.json()).then(d => showOperation('File location opened', d.path || deviceId));
         }
@@ -3381,6 +3822,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 renderTimelapses(stats);
                 renderGrowthCharts(stats);
                 renderAllSegmentOverlays();
+                renderSetupWorkbench();
                 const health = document.getElementById('health-list');
                 if (health) health.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div>${id}: ${((info.data || {}).markers_found || 0)} markers, health ${(info.nutrient_deficiency || {}).severity || 'collecting'}</div></div>`).join('');
                 renderDeviceCapabilities();
@@ -3435,6 +3877,7 @@ def run_app():
     load_profiles()
     load_device_settings()
     load_device_aliases()
+    load_device_metadata()
     load_video_manifest()
     # Start the timelapse thread immediately
     t = threading.Thread(target=timelapse_loop, daemon=True)
