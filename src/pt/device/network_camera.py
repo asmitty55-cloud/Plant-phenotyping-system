@@ -1,4 +1,5 @@
 import os
+import socket
 import subprocess
 import time
 import urllib.error
@@ -16,6 +17,7 @@ CONFIG_DIR = os.path.join(get_data_root(), "configs")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.yaml")
 LOCAL_CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.local.yaml")
 DEFAULT_RTSP_PATHS = ("onvif1", "onvif2")
+CAMERA_STATUS = {}
 
 
 def hidden_subprocess_flags():
@@ -78,6 +80,37 @@ def camera_has_live_stream(camera_id):
     return bool(camera and live_stream_urls(camera))
 
 
+def camera_reachable(camera, timeout=1.0):
+    host = camera.get("host")
+    port = int(camera.get("rtsp_port", 554))
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def network_camera_status(camera_id, probe=False):
+    camera = camera_by_id(camera_id)
+    if not camera:
+        return {"configured": False, "reachable": False, "message": "Unknown camera"}
+    cached = dict(CAMERA_STATUS.get(camera_id, {}))
+    if probe or "reachable" not in cached:
+        cached["reachable"] = camera_reachable(camera)
+        cached["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cached.update({
+        "configured": True,
+        "id": camera_id,
+        "name": camera.get("name") or camera_id,
+        "host": camera.get("host"),
+        "rtsp_port": int(camera.get("rtsp_port", 554)),
+    })
+    CAMERA_STATUS[camera_id] = cached
+    return cached
+
+
 def get_ffmpeg():
     candidates = [
         os.path.join(get_data_root(), "bin", "ffmpeg.exe"),
@@ -100,23 +133,28 @@ def get_ffmpeg():
     return None
 
 
-def capture_with_ffmpeg(camera, url, output_path):
+def capture_with_ffmpeg(camera, url, output_path, transport=None):
     ffmpeg = get_ffmpeg()
     if not ffmpeg:
         return False
-    transport = camera.get("rtsp_transport", "udp")
+    transport = transport or camera.get("rtsp_transport", "tcp")
     cmd = [
         ffmpeg,
         "-y",
         "-rtsp_transport",
         transport,
+        "-rw_timeout",
+        "5000000",
         "-i",
         url,
         "-frames:v",
         "1",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=hidden_subprocess_flags())
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=8, creationflags=hidden_subprocess_flags())
+    except subprocess.TimeoutExpired:
+        return False
     if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return False
     if has_smeared_bottom_half(output_path):
@@ -172,29 +210,37 @@ def capture_network_camera(camera_id, filename=None):
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, filename)
 
+    status = network_camera_status(camera_id, probe=True)
+    if not status.get("reachable"):
+        status.update({
+            "last_error": f"{camera.get('host')}:{camera.get('rtsp_port', 554)} is unreachable",
+            "last_attempt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        CAMERA_STATUS[camera_id] = status
+        print(f"[NETWORK_CAMERA] {camera_id} is configured but unreachable at {status['host']}:{status['rtsp_port']}.")
+        return None
+
+    preferred = camera.get("rtsp_transport", "tcp")
+    transports = [preferred] + [value for value in ("tcp", "udp") if value != preferred]
     for url in rtsp_urls(camera):
-        if capture_with_ffmpeg(camera, url, output_path):
-            print(f"[NETWORK_CAMERA] Captured {camera_id}: {output_path}")
-            return output_path
-
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        try:
-            if not cap.isOpened():
-                continue
-
-            frame = None
-            for _ in range(12):
-                ok, candidate = cap.read()
-                if ok and candidate is not None:
-                    frame = candidate
-                    break
-
-            if frame is not None and cv2.imwrite(output_path, frame):
+        for transport in transports:
+            if capture_with_ffmpeg(camera, url, output_path, transport=transport):
+                CAMERA_STATUS[camera_id] = {
+                    **status,
+                    "reachable": True,
+                    "last_capture": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "last_error": "",
+                    "transport": transport,
+                    "url_path": url.rsplit("/", 1)[-1],
+                }
                 print(f"[NETWORK_CAMERA] Captured {camera_id}: {output_path}")
                 return output_path
-        finally:
-            cap.release()
 
+    CAMERA_STATUS[camera_id] = {
+        **status,
+        "last_attempt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_error": "RTSP port is reachable but no configured stream produced a frame.",
+    }
     print(f"[NETWORK_CAMERA] Failed to capture {camera_id}; tried {len(rtsp_urls(camera))} stream URL(s).")
     return None
 

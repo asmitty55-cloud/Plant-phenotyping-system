@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 import json
 from pt.core.utils.path_utils import get_images_dir
+from pt.device import adb_transport
 
 ADB = "adb"
 REMOTE_DIR = "/sdcard/PTCaptures"
@@ -67,8 +68,8 @@ def adb(cmd, device=None):
         return "", f"ADB timeout: {' '.join(base + cmd)}"
 
 def get_devices():
-    out, _ = adb(["devices"])
-    return [line.split()[0] for line in out.splitlines() if "\tdevice" in line]
+    adb_transport.reconnect_configured_async()
+    return adb_transport.adb_devices()
 
 # -------------------------
 # APK management
@@ -106,8 +107,10 @@ def install_apk(device):
 
     print(f"Applying bulletproof automation settings to {device}...")
 
-    # 1. Disable all network connectivity to block Play Protect "calling home" during install
-    adb(["shell", "svc", "wifi", "disable"], device)
+    # A Wi-Fi ADB device must keep Wi-Fi enabled or it will sever its own
+    # install session. USB devices retain the legacy offline-install behavior.
+    if ":" not in device:
+        adb(["shell", "svc", "wifi", "disable"], device)
     adb(["shell", "svc", "data", "disable"], device)
 
     # 2. Disable package verifiers and background scanning

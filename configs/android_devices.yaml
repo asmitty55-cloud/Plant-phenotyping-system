@@ -1,0 +1,13 @@
+# Optional Android ADB transports.
+#
+# Copy this file to configs/android_devices.local.yaml and add phones connected
+# to the PC's Wi-Fi hotspot. The local file is ignored by git.
+#
+# USB ADB always remains available. These entries only add automatic Wi-Fi
+# reconnects, and manual IP endpoints work without mDNS discovery.
+android_devices:
+  - name: tray_1_top
+    enabled: false
+    auto_connect: true
+    host: 192.168.137.42
+    port: 5555

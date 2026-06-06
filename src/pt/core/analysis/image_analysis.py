@@ -223,7 +223,13 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
 
     if canopy_pixels > 0:
         x, y, w, h = cv2.boundingRect(mask)
-        bbox = {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+        bbox = {
+            "x": int(x),
+            "y": int(y),
+            "width": int(w),
+            "height": int(h),
+            "center": [float(x + w / 2.0), float(y + h / 2.0)],
+        }
         selected_hsv = hsv[mask > 0]
         selected_bgr = frame[mask > 0].astype(np.float32)
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
@@ -259,6 +265,286 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
         "color_metrics": color_metrics,
         "mask": mask,
     }
+
+
+def _sample_patch_pixels(image, polygon):
+    height, width = image.shape[:2]
+    pts = np.array(polygon, dtype=np.float32)
+    if len(pts) < 3:
+        return None
+    pts[:, 0] = np.clip(pts[:, 0], 0, width - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, height - 1)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
+    mask = cv2.erode(mask, np.ones((5, 5), np.uint8), iterations=2)
+    pixels = image[mask > 0]
+    if len(pixels) < 25:
+        return None
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)[mask > 0]
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[mask > 0]
+    b, g, r = pixels.astype(np.float32).mean(axis=0)
+    return {
+        "samples": int(len(pixels)),
+        "mean_rgb": [float(r), float(g), float(b)],
+        "mean_hsv": [float(v) for v in hsv.astype(np.float32).mean(axis=0)],
+        "mean_lab": [float(v) for v in lab.astype(np.float32).mean(axis=0)],
+        "polygon": pts.astype(float).tolist(),
+    }
+
+
+def sample_native_charuco_colors(image, charuco_detection):
+    if not charuco_detection:
+        return []
+    target = charuco_detection.get("target") or {}
+    patch_specs = target.get("color_patches") or []
+    corners = charuco_detection.get("charuco_corners")
+    ids = charuco_detection.get("charuco_ids")
+    if not patch_specs or corners is None or ids is None or len(ids) < 4:
+        return []
+
+    board = get_charuco_board(target=target)
+    object_corners = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    source = []
+    destination = []
+    for idx, corner_id in enumerate(ids.reshape(-1)):
+        corner_id = int(corner_id)
+        if 0 <= corner_id < len(object_corners):
+            source.append(object_corners[corner_id][:2])
+            destination.append(corners[idx][0])
+    if len(source) < 4:
+        return []
+    homography, _ = cv2.findHomography(np.asarray(source), np.asarray(destination), cv2.RANSAC, 3.0)
+    if homography is None:
+        return []
+
+    board_width = float(target["squares_x"]) * float(target["square_size_mm"])
+    board_height = float(target["squares_y"]) * float(target["square_size_mm"])
+    patches = []
+    for idx, spec in enumerate(patch_specs, start=1):
+        polygon = spec.get("polygon_mm")
+        if not polygon and spec.get("polygon_normalized"):
+            polygon = [
+                [float(point[0]) * board_width, float(point[1]) * board_height]
+                for point in spec["polygon_normalized"]
+            ]
+        if not polygon or len(polygon) < 3:
+            continue
+        projected = cv2.perspectiveTransform(
+            np.asarray(polygon, dtype=np.float32).reshape(1, -1, 2),
+            homography,
+        )[0]
+        sampled = _sample_patch_pixels(image, projected)
+        if not sampled:
+            continue
+        sampled.update({
+            "uid": spec.get("uid") or f"native_{idx}",
+            "name": spec.get("name") or f"Native patch {idx}",
+            "code": spec.get("code") or "",
+            "role": spec.get("role") or "",
+            "source": "charuco_native",
+            "reference_rgb": spec.get("reference_rgb"),
+        })
+        patches.append(sampled)
+    if not patches:
+        return []
+    return [{"name": target.get("name") or "ChArUco Native Colors", "source": "charuco_native", "patches": patches}]
+
+
+def sample_color_boards(image, device_id, charuco_detection=None):
+    boards = calib_store.get_color_boards(device_id) if device_id else []
+    sampled = []
+    for board in boards:
+        patches = []
+        for patch in board.get("patches", []):
+            polygon = patch.get("polygon") or []
+            sampled_patch = _sample_patch_pixels(image, polygon)
+            if not sampled_patch:
+                continue
+            sampled_patch.update({
+                "uid": patch.get("uid"),
+                "name": patch.get("name"),
+                "code": patch.get("code"),
+                "role": patch.get("role"),
+                "source": "manual",
+            })
+            patches.append(sampled_patch)
+        sampled.append({"name": board.get("name"), "patches": patches})
+    return sample_native_charuco_colors(image, charuco_detection) + sampled
+
+
+def native_reference_baseline(color_boards):
+    baseline = []
+    for board in color_boards or []:
+        patches = []
+        for patch in board.get("patches") or []:
+            rgb = patch.get("reference_rgb")
+            if not rgb or len(rgb) != 3:
+                continue
+            rgb_pixel = np.uint8([[list(rgb)]])
+            lab = cv2.cvtColor(rgb_pixel[:, :, ::-1], cv2.COLOR_BGR2LAB)[0, 0]
+            patches.append({
+                **patch,
+                "mean_rgb": [float(v) for v in rgb],
+                "mean_lab": [float(v) for v in lab],
+            })
+        if patches:
+            baseline.append({"name": board.get("name"), "source": "charuco_native_reference", "patches": patches})
+    return baseline
+
+
+def flatten_color_patches(color_boards):
+    patches = []
+    for board in color_boards or []:
+        for patch in board.get("patches", []) or []:
+            if patch.get("mean_rgb"):
+                patches.append({
+                    **patch,
+                    "key": f"{board.get('name', '')}:{patch.get('uid') or patch.get('name') or patch.get('code')}",
+                })
+    return patches
+
+
+def patch_key_map(color_boards):
+    return {patch["key"]: patch for patch in flatten_color_patches(color_boards)}
+
+
+def compute_color_drift(current_boards, baseline_boards):
+    current = patch_key_map(current_boards)
+    baseline = patch_key_map(baseline_boards)
+    deltas = []
+    for key, cur in current.items():
+        base = baseline.get(key)
+        if not base:
+            continue
+        c = np.array(cur.get("mean_lab") or [0, 0, 0], dtype=np.float32)
+        b = np.array(base.get("mean_lab") or [0, 0, 0], dtype=np.float32)
+        deltas.append(float(np.linalg.norm(c - b)))
+    if not deltas:
+        return {"status": "no_matching_patches", "patches": 0, "mean_delta_lab": None, "max_delta_lab": None, "confidence": 0.0}
+    mean_delta = float(np.mean(deltas))
+    max_delta = float(np.max(deltas))
+    confidence = max(0.0, min(1.0, 1.0 - (mean_delta / 35.0)))
+    status = "stable" if mean_delta < 8 else "drift" if mean_delta < 18 else "large_drift"
+    return {
+        "status": status,
+        "patches": len(deltas),
+        "mean_delta_lab": mean_delta,
+        "max_delta_lab": max_delta,
+        "confidence": confidence,
+    }
+
+
+def corrected_frame_simple(frame, current_boards, baseline_boards):
+    current = flatten_color_patches(current_boards)
+    baseline = patch_key_map(baseline_boards)
+    gain_samples = []
+    for cur in current:
+        role = (cur.get("role") or "").lower()
+        name = (cur.get("name") or "").lower()
+        if not any(token in f"{role} {name}" for token in ("white", "gray", "grey", "neutral")):
+            continue
+        base = baseline.get(cur["key"])
+        if not base:
+            continue
+        c = np.array(cur.get("mean_rgb"), dtype=np.float32)
+        b = np.array(base.get("mean_rgb"), dtype=np.float32)
+        if np.all(c > 3):
+            gain_samples.append(b / np.maximum(c, 1.0))
+    if not gain_samples:
+        return None, {"status": "no_neutral_patches", "gain_rgb": None}
+    gain = np.median(np.vstack(gain_samples), axis=0)
+    gain = np.clip(gain, 0.55, 1.85)
+    rgb = frame[:, :, ::-1].astype(np.float32) * gain.reshape(1, 1, 3)
+    corrected = np.clip(rgb, 0, 255).astype(np.uint8)[:, :, ::-1]
+    return corrected, {"status": "ok", "gain_rgb": [float(v) for v in gain]}
+
+
+def corrected_frame_advanced(frame, current_boards, baseline_boards):
+    current = patch_key_map(current_boards)
+    baseline = patch_key_map(baseline_boards)
+    src = []
+    dst = []
+    for key, cur in current.items():
+        base = baseline.get(key)
+        if not base:
+            continue
+        src.append(np.array(cur.get("mean_rgb"), dtype=np.float32) / 255.0)
+        dst.append(np.array(base.get("mean_rgb"), dtype=np.float32) / 255.0)
+    if len(src) < 4:
+        return None, {"status": "need_4_matching_patches", "patches": len(src), "matrix": None}
+    src = np.vstack(src)
+    dst = np.vstack(dst)
+    matrix, *_ = np.linalg.lstsq(src, dst, rcond=None)
+    matrix = np.clip(matrix, -1.25, 2.25)
+    rgb = frame[:, :, ::-1].astype(np.float32) / 255.0
+    corrected = np.tensordot(rgb, matrix, axes=([2], [0]))
+    corrected = np.clip(corrected * 255.0, 0, 255).astype(np.uint8)[:, :, ::-1]
+    fitted = np.clip(src @ matrix, 0, 1)
+    error = float(np.mean(np.linalg.norm(fitted - dst, axis=1)))
+    return corrected, {"status": "ok", "patches": len(src), "fit_error_rgb": error, "matrix": matrix.astype(float).tolist()}
+
+
+def color_metrics_from_mask(frame, mask):
+    if mask is None or cv2.countNonZero(mask) == 0:
+        return {}
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    selected_hsv = hsv[mask > 0]
+    selected_bgr = frame[mask > 0].astype(np.float32)
+    selected_lab = lab[mask > 0].astype(np.float32)
+    selected_b = selected_bgr[:, 0]
+    selected_g = selected_bgr[:, 1]
+    selected_r = selected_bgr[:, 2]
+    green_index = np.mean((2 * selected_g - selected_r - selected_b) / 255.0)
+    yellow_ratio = np.mean((selected_hsv[:, 0] >= 18) & (selected_hsv[:, 0] <= 42) & (selected_hsv[:, 1] >= 40))
+    dark_ratio = np.mean(selected_hsv[:, 2] < 55)
+    return {
+        "mean_hue": float(np.mean(selected_hsv[:, 0])),
+        "mean_saturation": float(np.mean(selected_hsv[:, 1])),
+        "mean_value": float(np.mean(selected_hsv[:, 2])),
+        "mean_lab_a": float(np.mean(selected_lab[:, 1])),
+        "mean_lab_b": float(np.mean(selected_lab[:, 2])),
+        "green_index": float(green_index),
+        "chlorosis_ratio": float(yellow_ratio),
+        "dark_tissue_ratio": float(dark_ratio),
+    }
+
+
+def calculate_color_correction(frame, mask, device_id, current_boards):
+    reference = calib_store.get_color_reference(device_id) if device_id else {}
+    baseline = (reference or {}).get("baseline") or {}
+    baseline_boards = baseline.get("color_boards") or []
+    native_baseline = native_reference_baseline(current_boards)
+    if native_baseline:
+        baseline_boards = native_baseline
+    enabled = bool(reference.get("enabled", True))
+    mode = reference.get("mode", "off")
+    drift = compute_color_drift(current_boards, baseline_boards) if baseline_boards else {"status": "no_baseline", "confidence": 0.0}
+    result = {
+        "enabled": enabled,
+        "mode": mode,
+        "baseline_timestamp": baseline.get("timestamp"),
+        "drift": drift,
+        "simple": None,
+        "advanced": None,
+        "active_corrected_color_metrics": None,
+    }
+    if not enabled or mode == "off" or not baseline_boards or mask is None:
+        return result
+    simple_frame, simple_info = corrected_frame_simple(frame, current_boards, baseline_boards)
+    if simple_frame is not None:
+        result["simple"] = {**simple_info, "color_metrics": color_metrics_from_mask(simple_frame, mask)}
+    else:
+        result["simple"] = simple_info
+    advanced_frame, advanced_info = corrected_frame_advanced(frame, current_boards, baseline_boards)
+    if advanced_frame is not None:
+        result["advanced"] = {**advanced_info, "color_metrics": color_metrics_from_mask(advanced_frame, mask)}
+    else:
+        result["advanced"] = advanced_info
+    chosen = result.get(mode)
+    if chosen and chosen.get("color_metrics"):
+        result["active_corrected_color_metrics"] = chosen["color_metrics"]
+    return result
 
 
 def calculate_plant_area(frame, px_per_mm):
@@ -538,6 +824,7 @@ def analyze_image(image_path, device_id=None):
             "dictionary": detected_dict,
             "method": used_method,
             "calibration_target": get_charuco_target(device_id),
+            "color_boards": [],
         }
 
         # Setup debug frame
@@ -596,9 +883,11 @@ def analyze_image(image_path, device_id=None):
                 results["charuco_target"] = charuco_detection.get("target")
                 results["charuco_bbox"] = charuco_detection.get("charuco_bbox")
 
+            results["color_boards"] = sample_color_boards(frame, device_id, charuco_detection)
             canopy = calculate_canopy_metrics(frame, results["scale_px_per_mm"], device_id)
             plant_area = canopy["canopy_area_mm2"]
             plant_mask = canopy["mask"]
+            color_correction = calculate_color_correction(frame, plant_mask, device_id, results.get("color_boards", []))
             results.update({
                 "plant_area_mm2": plant_area,
                 "canopy_area_mm2": plant_area,
@@ -606,6 +895,7 @@ def analyze_image(image_path, device_id=None):
                 "canopy_coverage": canopy["canopy_coverage"],
                 "canopy_bounding_box": canopy["bounding_box"],
                 "color_metrics": canopy["color_metrics"],
+                "color_correction": color_correction,
                 "mask": plant_mask,
                 "segments": calculate_segment_metrics(plant_mask, results["scale_px_per_mm"], device_id),
             })
@@ -636,6 +926,13 @@ def analyze_image(image_path, device_id=None):
                 for corner in charuco_detection["charuco_corners"].reshape(-1, 2):
                     center = tuple(np.round(corner).astype(int))
                     cv2.circle(debug_frame, center, 3, (0, 0, 255), -1)
+            for board in calib_store.get_color_boards(device_id):
+                for patch in board.get("patches", []):
+                    pts = np.array(patch.get("polygon", []), dtype=np.int32)
+                    if len(pts) >= 3:
+                        cv2.polylines(debug_frame, [pts], True, (255, 0, 255), 2)
+                        label = str(patch.get("name") or patch.get("code") or "patch")
+                        cv2.putText(debug_frame, label[:14], tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
         else:
             print(f"[ANALYSIS] Failed to find markers in {image_path} after trying Green, Blue, and Gray channels.")
 
@@ -729,6 +1026,11 @@ def process_latest_captures(captures_dir):
 
             # Calculate Growth Rate (mm2 / hour)
             growth_rate = 0.0
+            movement = {
+                "centroid_px": (results.get("canopy_bounding_box") or {}).get("center"),
+                "displacement_mm": 0.0,
+                "speed_mm_hr": 0.0,
+            }
             if len(history) >= 1:
                 last_entry = history[-1]
                 try:
@@ -737,7 +1039,19 @@ def process_latest_captures(captures_dir):
                     hours = (t2 - t1) / 3600.0
                     if hours > 0.01:
                         growth_rate = (current_area - (last_entry.get("area") or 0)) / hours
+                        current_centroid = movement.get("centroid_px")
+                        previous_centroid = (last_entry.get("movement") or {}).get("centroid_px")
+                        active_scale = float(results.get("scale_px_per_mm") or 0)
+                        if current_centroid and previous_centroid and active_scale > 0:
+                            displacement_px = float(np.linalg.norm(
+                                np.asarray(current_centroid, dtype=np.float32)
+                                - np.asarray(previous_centroid, dtype=np.float32)
+                            ))
+                            displacement_mm = displacement_px / active_scale
+                            movement["displacement_mm"] = displacement_mm
+                            movement["speed_mm_hr"] = displacement_mm / hours
                 except: pass
+            results["movement"] = movement
 
             all_stats[device_id].update({
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -767,7 +1081,10 @@ def process_latest_captures(captures_dir):
                     "segments": results.get("segments", []),
                     "canopy_coverage": results.get("canopy_coverage"),
                     "color_metrics": results.get("color_metrics"),
+                    "color_correction": results.get("color_correction"),
+                    "color_boards": results.get("color_boards", []),
                     "nutrient_deficiency": deficiency,
+                    "movement": movement,
                 }
                 history.append(history_entry)
                 upsert_history_point(device_id, history_entry)

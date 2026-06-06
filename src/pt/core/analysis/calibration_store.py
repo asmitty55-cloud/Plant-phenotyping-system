@@ -21,6 +21,8 @@ class CalibrationStore:
             "device_overrides": {},  # device_id -> { "marker_id": size_mm, "ignore_regions": [[x1,y1,x2,y2], ...] }
             "charuco_overrides": {},
             "manual_markers": {},
+            "color_boards": {},
+            "color_reference": {},
             "camera_params": {},     # device_id -> { "K": [[...]], "dist": [...], "R": [...], "T": [...] }
             "world_origin_device": None # The device ID that defines the origin
         }
@@ -30,6 +32,8 @@ class CalibrationStore:
         self.data.setdefault("device_overrides", {})
         self.data.setdefault("charuco_overrides", {})
         self.data.setdefault("manual_markers", {})
+        self.data.setdefault("color_boards", {})
+        self.data.setdefault("color_reference", {})
         self.data.setdefault("camera_params", {})
 
     def save(self):
@@ -170,5 +174,67 @@ class CalibrationStore:
             if marker.get("uid") != uid and str(idx) != str(uid)
         ]
         self.save()
+
+    def add_color_patch(self, device_id, board_name, patch_name, code, role, polygon):
+        self._ensure_defaults()
+        boards = self.data["color_boards"].setdefault(device_id, [])
+        board = next((b for b in boards if b.get("name") == board_name), None)
+        if board is None:
+            board = {"name": str(board_name or "Color Board"), "patches": []}
+            boards.append(board)
+        patch = {
+            "uid": f"patch_{len(board.get('patches', [])) + 1}",
+            "name": str(patch_name or f"Patch {len(board.get('patches', [])) + 1}"),
+            "code": str(code or ""),
+            "role": str(role or ""),
+            "polygon": [[float(p[0]), float(p[1])] for p in polygon],
+        }
+        board.setdefault("patches", []).append(patch)
+        self.save()
+        return patch
+
+    def get_color_boards(self, device_id):
+        self._ensure_defaults()
+        return self.data["color_boards"].get(device_id, [])
+
+    def clear_color_boards(self, device_id):
+        self._ensure_defaults()
+        self.data["color_boards"][device_id] = []
+        self.save()
+
+    def delete_color_patch(self, device_id, board_name, uid):
+        self._ensure_defaults()
+        boards = self.data["color_boards"].get(device_id, [])
+        for board in boards:
+            if board.get("name") == board_name:
+                board["patches"] = [
+                    patch for idx, patch in enumerate(board.get("patches", []))
+                    if patch.get("uid") != uid and str(idx) != str(uid)
+                ]
+        self.save()
+
+    def get_color_reference(self, device_id):
+        self._ensure_defaults()
+        default = {"enabled": True, "mode": "off", "baseline": None}
+        current = self.data["color_reference"].get(device_id, {})
+        merged = dict(default)
+        if isinstance(current, dict):
+            merged.update(current)
+        if merged.get("mode") not in ("off", "simple", "advanced"):
+            merged["mode"] = "off"
+        merged["enabled"] = bool(merged.get("enabled", True))
+        return merged
+
+    def set_color_reference(self, device_id, enabled=None, mode=None, baseline=None):
+        self._ensure_defaults()
+        current = self.data["color_reference"].setdefault(device_id, {})
+        if enabled is not None:
+            current["enabled"] = bool(enabled)
+        if mode is not None and mode in ("off", "simple", "advanced"):
+            current["mode"] = mode
+        if baseline is not None:
+            current["baseline"] = baseline
+        self.save()
+        return self.get_color_reference(device_id)
 
 calib_store = CalibrationStore()

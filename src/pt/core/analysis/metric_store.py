@@ -56,15 +56,24 @@ def ensure_db():
                     canopy_coverage REAL,
                     green_index REAL,
                     color_metrics_json TEXT,
+                    color_correction_json TEXT,
                     segments_json TEXT,
                     ignored_segments_json TEXT,
                     nutrient_json TEXT,
+                    movement_json TEXT,
                     ignored INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(device_id, filename)
                 )
                 """
             )
+            existing_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(metric_history)").fetchall()
+            }
+            if "color_correction_json" not in existing_columns:
+                conn.execute("ALTER TABLE metric_history ADD COLUMN color_correction_json TEXT")
+            if "movement_json" not in existing_columns:
+                conn.execute("ALTER TABLE metric_history ADD COLUMN movement_json TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metric_rollups (
@@ -122,10 +131,10 @@ def upsert_history_point(device_id, entry):
             INSERT INTO metric_history (
                 device_id, timestamp, filename, area, growth_rate_mm2_hr, scale,
                 detected_scale, scale_rejected, canopy_coverage, green_index,
-                color_metrics_json, segments_json, ignored_segments_json,
-                nutrient_json, ignored
+                color_metrics_json, color_correction_json, segments_json, ignored_segments_json,
+                nutrient_json, movement_json, ignored
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, filename) DO UPDATE SET
                 timestamp=excluded.timestamp,
                 area=excluded.area,
@@ -136,9 +145,11 @@ def upsert_history_point(device_id, entry):
                 canopy_coverage=excluded.canopy_coverage,
                 green_index=excluded.green_index,
                 color_metrics_json=excluded.color_metrics_json,
+                color_correction_json=excluded.color_correction_json,
                 segments_json=excluded.segments_json,
                 ignored_segments_json=excluded.ignored_segments_json,
-                nutrient_json=excluded.nutrient_json
+                nutrient_json=excluded.nutrient_json,
+                movement_json=excluded.movement_json
             """,
             (
                 device_id,
@@ -152,9 +163,11 @@ def upsert_history_point(device_id, entry):
                 entry.get("canopy_coverage"),
                 color.get("green_index"),
                 _json(entry.get("color_metrics")),
+                _json(entry.get("color_correction")),
                 _json(entry.get("segments") or []),
                 _json(entry.get("ignored_segments") or []),
                 _json(entry.get("nutrient_deficiency")),
+                _json(entry.get("movement") or {}),
                 1 if entry.get("ignored") else 0,
             ),
         )
@@ -182,7 +195,9 @@ def row_to_history(row):
         "ignored_segments": load_json("ignored_segments_json", []),
         "canopy_coverage": row["canopy_coverage"],
         "color_metrics": load_json("color_metrics_json", {}),
+        "color_correction": load_json("color_correction_json", {}),
         "nutrient_deficiency": load_json("nutrient_json", {}),
+        "movement": load_json("movement_json", {}),
         "ignored": bool(row["ignored"]),
     }
 

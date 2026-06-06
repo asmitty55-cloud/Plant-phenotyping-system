@@ -26,3 +26,8 @@ runtime output at durable storage outside the repo.
 
 Current analysis expects the back-wall ChArUco target documented in
 `docs/calibration.md`.
+
+## Android Transport
+
+Android capture accepts both USB ADB serials and optional Wi-Fi ADB endpoints.
+The shared transport and hotspot setup are documented in `docs/wifi_adb.md`.

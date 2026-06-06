@@ -6,7 +6,8 @@ import subprocess
 import json
 import shutil
 import cv2
-from datetime import datetime, timezone
+import numpy as np
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template_string, jsonify, send_from_directory, request, Response, stream_with_context
 
 from pt.core.analysis import process_latest_captures
@@ -14,15 +15,18 @@ from pt.core.analysis.calibration_store import calib_store
 import pt.core.analysis.metric_store as metric_store
 from pt.core.analysis.segmentation_store import segmentation_store
 from pt.core.analysis.volumetric import calibrate_extrinsics, reconstruct_visual_hull
+from pt.core.experiments import add_event, load_events, load_experiments, load_plant_records, upsert_experiment, upsert_plant_record
 from pt.core.utils.path_utils import get_captures_dir, get_data_root
 from pt.device.calibration.phone_interrogate import interrogate_phone
 from pt.device.calibration.phone_logger import PhoneLogger
+from pt.device import adb_transport
 from pt.device.capture_service import capture
 from pt.device.network_camera import (
     camera_has_live_stream,
     capture_network_camera,
     configured_camera_ids,
     mjpeg_live_frames,
+    network_camera_status,
     ptz_move,
     ptz_stop,
 )
@@ -32,12 +36,14 @@ from pt.device.network_camera import (
 DATA_ROOT = get_data_root()
 CAPTURES_DIR = get_captures_dir()
 VIDEOS_DIR = os.path.join(DATA_ROOT, "videos")
+WORKING_VIDEOS_DIR = os.path.join(VIDEOS_DIR, "_program_working_do_not_open_while_running")
 DEBUG_DIR = os.path.join(DATA_ROOT, "debug")
 profiles_file = os.path.join(DEBUG_DIR, "profiles.json")
 device_settings_file = os.path.join(DEBUG_DIR, "device_settings.json")
 device_aliases_file = os.path.join(DEBUG_DIR, "device_aliases.json")
 device_metadata_file = os.path.join(DEBUG_DIR, "device_metadata.json")
 video_manifest_file = os.path.join(DEBUG_DIR, "video_manifest.json")
+night_skip_state_file = os.path.join(DEBUG_DIR, "night_skip_state.json")
 legacy_profiles_file = os.path.join(os.getcwd(), "debug", "profiles.json")
 MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".mp4", ".mov")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -47,6 +53,7 @@ DEFAULT_REMOTE_DIR = "/sdcard/PTCaptures"
 VIDEO_ASSEMBLY_FRAME_STEP = 5
 
 os.makedirs(VIDEOS_DIR, exist_ok=True)
+os.makedirs(WORKING_VIDEOS_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 app = Flask(__name__)
@@ -66,6 +73,10 @@ active_live_stream_device = None
 video_manifest = {}
 video_locks = {}
 night_skip_started = {}
+operation_jobs = {}
+operation_jobs_lock = threading.Lock()
+activity_lines = []
+activity_lock = threading.Lock()
 
 DEFAULT_DEVICE_SETTINGS = {
     "light_mode": "auto",
@@ -81,7 +92,57 @@ DEFAULT_DEVICE_SETTINGS = {
     "collect_night_frames": True,
     "measurement_locked": False,
     "measurement_locked_at": "",
+    "expected_marker_count": 4,
+    "measurement_profile_score": 0.0,
+    "measurement_profile_summary": "",
 }
+
+
+def update_operation(operation_id, message, progress=None, status=None, result=None):
+    if not operation_id:
+        return
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    with operation_jobs_lock:
+        job = operation_jobs.setdefault(operation_id, {
+            "id": operation_id,
+            "status": "running",
+            "progress": 0,
+            "lines": [],
+            "result": None,
+        })
+        if message:
+            job["lines"].append(f"[{timestamp}] {message}")
+            job["lines"] = job["lines"][-120:]
+        if progress is not None:
+            job["progress"] = int(max(0, min(100, progress)))
+        if status:
+            job["status"] = status
+        if result is not None:
+            job["result"] = result
+        job["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def operation_snapshot(operation_id):
+    with operation_jobs_lock:
+        job = operation_jobs.get(operation_id)
+        return dict(job) if job else None
+
+
+def log_activity(message, device_id=None):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    prefix = f"{device_id}: " if device_id else ""
+    line = f"[{timestamp}] {prefix}{message}"
+    with activity_lock:
+        activity_lines.append(line)
+        del activity_lines[:-160]
+    print(f"[ACTIVITY] {prefix}{message}")
+
+
+def activity_snapshot():
+    with activity_lock:
+        return list(activity_lines)
+
+
 DAY_CAPTURE_PROFILE = {
     "delay_ms": 5000,
     "exposure_compensation": 0,
@@ -162,8 +223,16 @@ def _video_current_name(device_id):
     return f"{_safe_video_id(device_id)}.mp4"
 
 
+def _video_current_path(device_id):
+    return os.path.join(WORKING_VIDEOS_DIR, _video_current_name(device_id))
+
+
 def _video_playback_name(device_id):
     return f"{_safe_video_id(device_id)}_playback.mp4"
+
+
+def _video_playback_path(device_id):
+    return os.path.join(VIDEOS_DIR, _video_playback_name(device_id))
 
 
 def _custom_video_name(device_id, start_label, end_label):
@@ -314,6 +383,9 @@ def settings_for_device(device_id):
     settings["collect_night_frames"] = bool(settings.get("collect_night_frames", True))
     settings["measurement_locked"] = bool(settings.get("measurement_locked", False))
     settings["measurement_locked_at"] = str(settings.get("measurement_locked_at") or "")
+    settings["expected_marker_count"] = int(max(1, min(50, settings.get("expected_marker_count", 4))))
+    settings["measurement_profile_score"] = float(settings.get("measurement_profile_score") or 0.0)
+    settings["measurement_profile_summary"] = str(settings.get("measurement_profile_summary") or "")
     if str(settings.get("iso", "auto")) not in ("auto", "100", "200", "400", "800", "1600"):
         settings["iso"] = "auto"
     if settings.get("white_balance") not in ("auto", "daylight", "cloudy-daylight", "fluorescent", "incandescent", "shade", "twilight", "warm-fluorescent"):
@@ -375,6 +447,48 @@ def _format_duration(seconds):
     return f"{secs}s"
 
 
+def load_night_skip_state():
+    night_skip_started.clear()
+    if not os.path.exists(night_skip_state_file):
+        return
+    try:
+        with open(night_skip_state_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(loaded, dict):
+        night_skip_started.update(loaded)
+
+
+def save_night_skip_state():
+    os.makedirs(os.path.dirname(night_skip_state_file), exist_ok=True)
+    with open(night_skip_state_file, "w", encoding="utf-8") as f:
+        json.dump(night_skip_started, f, indent=2)
+
+
+def start_night_skip(device_id, timestamp):
+    if device_id not in night_skip_started:
+        night_skip_started[device_id] = {
+            "started_at": time.time(),
+            "timestamp": timestamp,
+        }
+        save_night_skip_state()
+
+
+def finish_night_skip(device_id, logger=None):
+    state = night_skip_started.pop(device_id, None)
+    if not state:
+        return None
+    save_night_skip_state()
+    started_at = float(state.get("started_at") or time.time())
+    timestamp = state.get("timestamp") or time.strftime("%Y%m%d_%H%M%S", time.localtime(started_at))
+    duration = max(0.0, time.time() - started_at)
+    placeholder = create_night_placeholder(device_id, timestamp, duration)
+    if logger:
+        logger.log(f"Night interval summarized in {placeholder}: {_format_duration(duration)}.", major=True)
+    return placeholder
+
+
 def create_night_placeholder(device_id, timestamp, duration_seconds):
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     os.makedirs(device_dir, exist_ok=True)
@@ -423,15 +537,8 @@ def run_adb(cmd):
         return "", "adb-not-found"
 
 def detect_connected_devices():
-    out, err = run_adb(["adb", "devices"])
-    if err == "adb-not-found":
-        return []
-    lines = out.split("\n")[1:]
-    devices = []
-    for line in lines:
-        if "\tdevice" in line:
-            devices.append(line.split("\t")[0])
-    return devices
+    adb_transport.reconnect_configured_async()
+    return adb_transport.adb_devices()
 
 
 def ensure_device_profile(device_id):
@@ -533,6 +640,7 @@ def sync_device(device_id, logger):
     remote_files = _remote_media_files(device_id, remote_dir)
     if not remote_files:
         logger.log("No files found on device to sync.", major=False)
+        log_activity("No remote files found during sync.", device_id)
         state["initial_backup_complete"] = True
         _save_sync_state(local_device_dir, state)
         return
@@ -541,6 +649,7 @@ def sync_device(device_id, logger):
 
     if is_first_sync:
         logger.log(f"New device {device_id} detected. Starting full backup of {len(remote_files)} files.", major=True)
+        log_activity(f"Starting first sync backup of {len(remote_files)} files.", device_id)
         backup_dir = os.path.join(local_device_dir, "backup")
         os.makedirs(backup_dir, exist_ok=True)
 
@@ -552,6 +661,7 @@ def sync_device(device_id, logger):
             if os.path.exists(backup_latest):
                 shutil.copy2(backup_latest, os.path.join(local_device_dir, latest_file))
         logger.log(f"Initial sync complete. Backup in {backup_dir}.", major=True)
+        log_activity("Initial sync complete.", device_id)
     else:
         local_files = sorted([f for f in os.listdir(local_device_dir) if _is_capture_image(f)])
         last_local = local_files[-1] if local_files else ""
@@ -562,10 +672,13 @@ def sync_device(device_id, logger):
         ]
         if to_pull:
             logger.log(f"Differential sync: {len(to_pull)} new files found for {device_id}.", major=True)
+            log_activity(f"Differential sync found {len(to_pull)} new file(s).", device_id)
             for f in to_pull:
+                log_activity(f"Pulling {f} from device.", device_id)
                 _pull_remote_file(device_id, remote_dir, f, local_device_dir)
         else:
             logger.log(f"No new files for {device_id}.", major=False)
+            log_activity("No new files found during sync.", device_id)
 
     for f in remote_files:
         if f != latest_file:
@@ -579,15 +692,18 @@ def sync_device(device_id, logger):
     _save_sync_state(local_device_dir, state)
     
     logger.log(f"Sync finished for {device_id}. Reference file {latest_file} remains on device.", major=False)
+    log_activity(f"Sync finished. Reference file {latest_file} remains on device.", device_id)
 
 
 def capture_and_sync(device_id):
     lock = _device_lock(device_id)
     if not lock.acquire(blocking=False):
         print(f"[CAPTURE] {device_id} already has a capture in progress.")
+        log_activity("Capture skipped because another capture is already running.", device_id)
         return False
 
     try:
+        log_activity("Preparing Android capture profile.", device_id)
         ensure_device_profile(device_id)
         logger = PhoneLogger(device_id)
         local_device_dir = os.path.join(CAPTURES_DIR, device_id)
@@ -602,16 +718,19 @@ def capture_and_sync(device_id):
             f"Triggering capture: {filename} light={settings['active_light_mode']} mode={settings['light_mode']} luma={settings['latest_luminance']} collect_night={settings['collect_night_frames']} zoom={settings['zoom_percent']}% focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}",
             major=True,
         )
+        log_activity(
+            f"Launching camera capture {filename}; focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}.",
+            device_id,
+        )
         if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
-            now = time.time()
-            started = night_skip_started.setdefault(device_id, now)
-            placeholder = create_night_placeholder(device_id, timestamp, now - started)
+            start_night_skip(device_id, timestamp)
             last_capture[device_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            logger.log(f"Night capture skipped; wrote timelapse placeholder {placeholder}.", major=True)
-            assemble_video(device_id)
+            logger.log("Night capture skipped; waiting for daylight to write one summarized timelapse frame.", major=True)
+            log_activity("Night capture skipped; waiting to summarize this night interval.", device_id)
             return True
 
-        night_skip_started.pop(device_id, None)
+        finish_night_skip(device_id, logger)
+        log_activity("Sending capture command to phone.", device_id)
         if capture.capture_on_device(
             device_id,
             filename,
@@ -623,16 +742,22 @@ def capture_and_sync(device_id):
             antibanding=settings["antibanding"],
             white_balance=settings["white_balance"],
         ):
+            log_activity("Capture complete; starting device sync.", device_id)
             sync_device(device_id, logger)
             last_capture[device_id] = time.strftime("%Y-%m-%d %H:%M:%S")
 
             try:
+                log_activity("Analyzing greenspace, ChArUco scale, color reference, and movement.", device_id)
                 process_latest_captures(CAPTURES_DIR)
+                log_activity("Analysis complete.", device_id)
             except Exception as e:
                 print(f"[ANALYSIS] Error: {e}")
+                log_activity(f"Analysis failed: {e}", device_id)
 
+            log_activity("Updating timelapse video if enough new frames are available.", device_id)
             assemble_video(device_id)
             return True
+        log_activity("Capture command failed or timed out.", device_id)
         return False
     finally:
         lock.release()
@@ -642,27 +767,32 @@ def capture_network_and_analyze(camera_id):
     lock = _device_lock(camera_id)
     if not lock.acquire(blocking=False):
         print(f"[NETWORK_CAMERA] {camera_id} already has a capture in progress.")
+        log_activity("Network camera capture skipped because a capture is already running.", camera_id)
         return False
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
         settings = effective_capture_settings(camera_id)
         if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
-            now = time.time()
-            started = night_skip_started.setdefault(camera_id, now)
-            create_night_placeholder(camera_id, timestamp, now - started)
+            start_night_skip(camera_id, timestamp)
             last_capture[camera_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            assemble_video(camera_id)
+            log_activity("Night network capture skipped; waiting to summarize this interval.", camera_id)
             return True
-        night_skip_started.pop(camera_id, None)
+        finish_night_skip(camera_id)
+        log_activity(f"Requesting network camera frame {filename}.", camera_id)
         if capture_network_camera(camera_id, filename):
             last_capture[camera_id] = time.strftime("%Y-%m-%d %H:%M:%S")
             try:
+                log_activity("Analyzing network frame greenspace, markers, color, and movement.", camera_id)
                 process_latest_captures(CAPTURES_DIR)
+                log_activity("Network frame analysis complete.", camera_id)
             except Exception as e:
                 print(f"[ANALYSIS] Error: {e}")
+                log_activity(f"Network frame analysis failed: {e}", camera_id)
+            log_activity("Updating network camera timelapse if needed.", camera_id)
             assemble_video(camera_id)
             return True
+        log_activity("Network camera did not provide a fresh frame.", camera_id)
         return False
     finally:
         lock.release()
@@ -767,8 +897,8 @@ def _render_video_from_frames(device_id, images, output_file):
 
 
 def _refresh_playback_mirror(device_id):
-    current_file = os.path.join(VIDEOS_DIR, _video_current_name(device_id))
-    playback_file = os.path.join(VIDEOS_DIR, _video_playback_name(device_id))
+    current_file = _video_current_path(device_id)
+    playback_file = _video_playback_path(device_id)
     if not os.path.exists(current_file):
         return False
 
@@ -804,8 +934,8 @@ def assemble_video(device_id):
             print(f"[VIDEO] Need at least 2 frames for {device_id}; found {len(images)} in {device_dir}.")
             return
 
-        output_file = os.path.join(VIDEOS_DIR, _video_current_name(device_id))
-        playback_file = os.path.join(VIDEOS_DIR, _video_playback_name(device_id))
+        output_file = _video_current_path(device_id)
+        playback_file = _video_playback_path(device_id)
         if os.path.exists(output_file) and len(images) % VIDEO_ASSEMBLY_FRAME_STEP != 0:
             if not os.path.exists(playback_file):
                 _refresh_playback_mirror(device_id)
@@ -858,6 +988,8 @@ def run_multicam_calibration():
 
 @app.route("/ignore_region/<device_id>", methods=["POST"])
 def add_ignore(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     data = request.get_json(silent=True)
     if isinstance(data, dict) and data.get("polygon"):
         calib_store.add_ignore_polygon(device_id, data["polygon"])
@@ -870,6 +1002,8 @@ def add_ignore(device_id):
 
 @app.route("/clear_ignore/<device_id>")
 def clear_ignore(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     calib_store.clear_ignore_regions(device_id)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
@@ -882,6 +1016,8 @@ def list_segments():
 
 @app.route("/segments/<device_id>", methods=["POST"])
 def add_segment(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     data = request.get_json(silent=True) or {}
     region = data.get("region")
     polygon = data.get("polygon")
@@ -898,6 +1034,8 @@ def add_segment(device_id):
 
 @app.route("/segments/<device_id>", methods=["DELETE"])
 def clear_segments(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     deleted = segmentation_store.clear(device_id) if hasattr(segmentation_store, "clear") else 0
     if not deleted:
         for segment in list(segmentation_store.list().get(device_id, [])):
@@ -907,12 +1045,16 @@ def clear_segments(device_id):
 
 @app.route("/segments/<device_id>/<segment_id>", methods=["DELETE"])
 def delete_segment(device_id, segment_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     deleted = segmentation_store.delete(device_id, segment_id)
     return jsonify({"status": "ok", "device": device_id, "segment_id": segment_id, "deleted": deleted})
 
 
 @app.route("/manual_marker/<device_id>", methods=["POST"])
 def add_manual_marker(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     data = request.get_json(silent=True) or {}
     corners = data.get("corners")
     if not isinstance(corners, list) or len(corners) != 4:
@@ -929,6 +1071,8 @@ def add_manual_marker(device_id):
 
 @app.route("/manual_marker/<device_id>/clear", methods=["POST"])
 def clear_manual_markers(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     calib_store.clear_manual_markers(device_id)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
@@ -941,7 +1085,82 @@ def list_manual_markers():
 
 @app.route("/manual_marker/<device_id>/<uid>", methods=["DELETE"])
 def delete_manual_marker(device_id, uid):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     calib_store.delete_manual_marker(device_id, uid)
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
+
+
+@app.route("/color_boards")
+def list_color_boards():
+    return jsonify(calib_store.data.get("color_boards", {}))
+
+
+@app.route("/color_reference/<device_id>", methods=["GET", "POST"])
+def color_reference(device_id):
+    if request.method == "GET":
+        return jsonify(calib_store.get_color_reference(device_id))
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+
+    data = request.get_json(silent=True) or {}
+    baseline = None
+    if data.get("set_baseline"):
+        stats = load_dashboard_stats()
+        device_data = (stats.get(device_id) or {}).get("data") or {}
+        color_boards = device_data.get("color_boards") or []
+        if not any((board.get("patches") or []) for board in color_boards):
+            return jsonify({"status": "error", "message": "No sampled color patches are available on the current frame."}), 400
+        baseline = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "filename": (stats.get(device_id) or {}).get("filename"),
+            "color_boards": color_boards,
+        }
+    reference = calib_store.set_color_reference(
+        device_id,
+        enabled=data.get("enabled") if "enabled" in data else None,
+        mode=data.get("mode") if "mode" in data else None,
+        baseline=baseline,
+    )
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "reference": reference, "stats": stats.get(device_id, {})})
+
+
+@app.route("/color_board/<device_id>", methods=["POST"])
+def add_color_patch(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+    data = request.get_json(silent=True) or {}
+    polygon = data.get("polygon") or []
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return jsonify({"status": "error", "message": "Color patches need at least three polygon points."}), 400
+    patch = calib_store.add_color_patch(
+        device_id,
+        data.get("board_name") or "Color Board",
+        data.get("patch_name") or "Patch",
+        data.get("code") or "",
+        data.get("role") or "",
+        polygon,
+    )
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "patch": patch, "device": device_id, "stats": stats.get(device_id, {})})
+
+
+@app.route("/color_board/<device_id>/clear", methods=["POST"])
+def clear_color_board(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+    calib_store.clear_color_boards(device_id)
+    stats = process_latest_captures(CAPTURES_DIR)
+    return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
+
+
+@app.route("/color_board/<device_id>/<board_name>/<uid>", methods=["DELETE"])
+def delete_color_patch(device_id, board_name, uid):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+    calib_store.delete_color_patch(device_id, board_name, uid)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "device": device_id, "stats": stats.get(device_id, {})})
 
@@ -949,6 +1168,8 @@ def delete_manual_marker(device_id, uid):
 def set_marker_size():
     import flask
     data = flask.request.json
+    if data.get("device_id") and measurement_setup_locked(data.get("device_id")):
+        return locked_setup_response(data.get("device_id"))
     # data: { marker_id, size_mm, device_id (optional) }
     calib_store.set_marker_size(data["marker_id"], data["size_mm"], data.get("device_id"))
     stats = process_latest_captures(CAPTURES_DIR)
@@ -958,6 +1179,8 @@ def set_marker_size():
 def set_charuco_target():
     data = request.get_json(silent=True) or {}
     device_id = data.get("device_id")
+    if device_id and measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
     calib_store.set_charuco_target(data, device_id)
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "stats": stats.get(device_id, {}) if device_id else {}})
@@ -965,13 +1188,20 @@ def set_charuco_target():
 
 @app.route("/calibrate_aruco/<device_id>", methods=["POST"])
 def calibrate_aruco(device_id):
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+    payload = request.get_json(silent=True) or {}
+    operation_id = payload.get("operation_id")
+    update_operation(operation_id, f"{device_id}: analyzing the latest frame for scale.", 10)
     stats = process_latest_captures(CAPTURES_DIR)
     info = stats.get(device_id) or {}
     data = info.get("data") or {}
     scale = data.get("scale_px_per_mm")
     if not scale:
+        update_operation(operation_id, f"{device_id}: no valid marker scale was found.", 100, "error")
         return jsonify({"status": "error", "message": "No valid ArUco/ChArUco scale found for the selected device."}), 400
 
+    update_operation(operation_id, f"{device_id}: detected {float(scale):.4f} px/mm from {data.get('scale_source') or 'marker geometry'}.", 65)
     stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
     if os.path.exists(stats_file):
         with open(stats_file, "r", encoding="utf-8") as f:
@@ -985,7 +1215,118 @@ def calibrate_aruco(device_id):
     })
     with open(stats_file, "w", encoding="utf-8") as f:
         json.dump(saved, f, indent=4)
+    update_operation(operation_id, f"{device_id}: stable scale saved.", 100, "complete")
     return jsonify({"status": "ok", "device": device_id, "scale_px_per_mm": float(scale), "source": data.get("scale_source")})
+
+
+@app.route("/operations/<operation_id>")
+def get_operation(operation_id):
+    snapshot = operation_snapshot(operation_id)
+    if snapshot is None:
+        return jsonify({"status": "missing", "progress": 0, "lines": []}), 404
+    return jsonify(snapshot)
+
+
+@app.route("/activity")
+def get_activity():
+    return jsonify({"lines": activity_snapshot()})
+
+
+@app.route("/device_log/<device_id>")
+def get_device_log(device_id):
+    log_path = os.path.join(DEBUG_DIR, f"{device_id}.txt")
+    if not os.path.exists(log_path):
+        return jsonify({"device_id": device_id, "log": "No log yet."})
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+        return jsonify({"device_id": device_id, "log": "".join(f.readlines()[-80:])})
+
+
+def measurement_setup_locked(device_id):
+    return bool(settings_for_device(device_id).get("measurement_locked"))
+
+
+def locked_setup_response(device_id):
+    return jsonify({
+        "status": "locked",
+        "message": "Measurement setup is locked. Unlock Setup before changing camera, calibration, segmentation, or color settings. Rotation stays editable because it is display-only.",
+        "device": device_id,
+    }), 423
+
+
+@app.route("/lock_setup/<device_id>", methods=["POST"])
+def lock_setup(device_id):
+    payload = request.get_json(silent=True) or {}
+    operation_id = payload.get("operation_id")
+    lock = bool(payload.get("lock", True))
+    if not lock:
+        current = settings_for_device(device_id)
+        current["measurement_locked"] = False
+        current["measurement_locked_at"] = ""
+        device_settings[device_id] = current
+        save_device_settings()
+        update_operation(operation_id, f"{device_id}: setup unlocked.", 100, "complete")
+        return jsonify({"status": "ok", "settings": settings_response(device_id), "scale": None})
+
+    update_operation(operation_id, f"{device_id}: checking marker geometry.", 10)
+    stats = process_latest_captures(CAPTURES_DIR)
+    info = stats.get(device_id) or {}
+    data = info.get("data") or {}
+    scale = data.get("scale_px_per_mm")
+    if not scale:
+        update_operation(operation_id, f"{device_id}: lock stopped because no valid scale is visible.", 100, "error")
+        return jsonify({"status": "error", "message": "Cannot lock setup until a valid ArUco/ChArUco scale is visible."}), 400
+
+    update_operation(operation_id, f"{device_id}: accepting scale {float(scale):.4f} px/mm.", 45)
+    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+    saved = stats
+    if os.path.exists(stats_file):
+        try:
+            with open(stats_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            saved = stats
+    saved.setdefault(device_id, {}).update({
+        "stable_scale_px_per_mm": float(scale),
+        "stable_scale_source": data.get("scale_source") or "current_marker_detection",
+        "stable_scale_calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    with open(stats_file, "w", encoding="utf-8") as f:
+        json.dump(saved, f, indent=4)
+
+    update_operation(operation_id, f"{device_id}: checking color-reference patches.", 65)
+    sampled_boards = data.get("color_boards") or []
+    native_patches = [
+        patch
+        for board in sampled_boards
+        for patch in (board.get("patches") or [])
+        if patch.get("source") == "charuco_native" and patch.get("mean_rgb")
+    ]
+    color_note = "manual color calibration remains available"
+    if native_patches:
+        baseline = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "filename": info.get("filename"),
+            "color_boards": sampled_boards,
+            "source": "charuco_native",
+        }
+        calib_store.set_color_reference(device_id, enabled=True, mode="advanced", baseline=baseline)
+        color_note = f"native ChArUco color baseline accepted from {len(native_patches)} patches"
+
+    update_operation(operation_id, f"{device_id}: {color_note}.", 80)
+    current = settings_for_device(device_id)
+    current["measurement_locked"] = True
+    current["measurement_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    device_settings[device_id] = current
+    save_device_settings()
+    result = {
+        "status": "ok",
+        "settings": settings_response(device_id),
+        "scale": float(scale),
+        "scale_source": data.get("scale_source"),
+        "native_color_patches": len(native_patches),
+    }
+    update_operation(operation_id, f"{device_id}: setup lock complete.", 100, "complete", result)
+    return jsonify(result)
 
 @app.route("/reconstruct")
 def run_reconstruction():
@@ -1063,7 +1404,10 @@ def dashboard():
 def serve_video(device_id):
     filename = video_manifest.get(device_id, _video_playback_name(device_id))
     if not os.path.exists(os.path.join(VIDEOS_DIR, filename)):
-        filename = _video_current_name(device_id)
+        current_path = _video_current_path(device_id)
+        if os.path.exists(current_path):
+            _refresh_playback_mirror(device_id)
+        filename = _video_playback_name(device_id)
     response = send_from_directory(VIDEOS_DIR, filename, conditional=True)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
@@ -1081,13 +1425,16 @@ def serve_custom_video(filename):
 @app.route("/show_location/<kind>/<device_id>", methods=["POST"])
 def show_location(kind, device_id):
     if kind == "video":
-        path = os.path.join(VIDEOS_DIR, f"{device_id}.mp4")
+        path = _video_playback_path(device_id)
     else:
         path = os.path.join(CAPTURES_DIR, device_id)
     target = path if os.path.isdir(path) else os.path.dirname(path)
     if os.name == "nt" and os.path.exists(target):
-        subprocess.Popen(["explorer.exe", target], creationflags=subprocess.CREATE_NO_WINDOW)
-    return jsonify({"status": "ok", "path": target})
+        if kind == "video" and os.path.exists(path):
+            subprocess.Popen(["explorer.exe", "/select,", path], creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            subprocess.Popen(["explorer.exe", target], creationflags=subprocess.CREATE_NO_WINDOW)
+    return jsonify({"status": "ok", "path": path if kind == "video" else target})
 
 
 def load_dashboard_stats():
@@ -1118,6 +1465,8 @@ def load_dashboard_stats():
                     "scale_rejected": latest.get("scale_rejected"),
                     "canopy_coverage": latest.get("canopy_coverage"),
                     "color_metrics": latest.get("color_metrics") or {},
+                    "color_correction": latest.get("color_correction") or {},
+                    "movement": latest.get("movement") or {},
                 })
     return stats
 
@@ -1179,11 +1528,10 @@ def reset_timelapse(device_id):
         os.makedirs(device_capture_dir, exist_ok=True)
 
     archived_video_dir = os.path.join(archive_root, "videos")
-    for video_name in (_video_current_name(device_id), _video_playback_name(device_id)):
-        video_path = os.path.join(VIDEOS_DIR, video_name)
+    for video_path in (_video_current_path(device_id), _video_playback_path(device_id)):
         if os.path.exists(video_path):
             os.makedirs(archived_video_dir, exist_ok=True)
-            base, ext = os.path.splitext(video_name)
+            base, ext = os.path.splitext(os.path.basename(video_path))
             shutil.move(video_path, os.path.join(archived_video_dir, f"{base}_{stamp}{ext}"))
     if device_id in video_manifest:
         video_manifest[device_id] = _video_playback_name(device_id)
@@ -1210,6 +1558,207 @@ def _capture_timestamp(filename):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     raw = match.group(1) + match.group(2)
     return datetime.strptime(raw, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _video_device_id(filename):
+    stem = os.path.splitext(filename)[0]
+    for suffix in ("_playback", "_current"):
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
+    return stem
+
+
+def _available_video_imports():
+    if not os.path.exists(VIDEOS_DIR):
+        return []
+    videos = []
+    for name in sorted(os.listdir(VIDEOS_DIR)):
+        path = os.path.join(VIDEOS_DIR, name)
+        if not os.path.isfile(path) or os.path.splitext(name)[1].lower() not in (".mp4", ".mov", ".avi", ".mkv"):
+            continue
+        videos.append({
+            "name": name,
+            "device_id": _video_device_id(name),
+            "size_mb": round(os.path.getsize(path) / (1024 * 1024), 1),
+            "modified": datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return videos
+
+
+def _import_video_frames(video_name, device_id=None, sample_seconds=60, max_frames=240):
+    safe_name = os.path.basename(video_name)
+    video_path = os.path.join(VIDEOS_DIR, safe_name)
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video not found: {safe_name}")
+    device_id = device_id or _video_device_id(safe_name)
+    out_dir = os.path.join(CAPTURES_DIR, device_id)
+    os.makedirs(out_dir, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {safe_name}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration_seconds = frame_count / fps if fps else 0
+    if duration_seconds <= 0:
+        duration_seconds = max_frames * sample_seconds
+    step = max(1, int(sample_seconds * fps))
+    base_time = datetime.fromtimestamp(os.path.getmtime(video_path)) - timedelta(seconds=duration_seconds)
+    written = 0
+    frame_idx = 0
+    while written < max_frames and frame_idx < max(1, frame_count):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        timestamp = base_time + timedelta(seconds=frame_idx / fps)
+        filename = f"capture_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(os.path.join(out_dir, filename), frame)
+        written += 1
+        frame_idx += step
+    cap.release()
+    return {"device_id": device_id, "video": safe_name, "frames": written, "sample_seconds": sample_seconds}
+
+
+def _import_video_job(video_name, device_id=None, sample_seconds=60, max_frames=240):
+    try:
+        metric_store.set_backfill_status(
+            running=1,
+            started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            finished_at=None,
+            current_device=device_id or _video_device_id(video_name),
+            processed=0,
+            total=0,
+            message=f"extracting frames from {video_name}",
+        )
+        result = _import_video_frames(video_name, device_id=device_id, sample_seconds=sample_seconds, max_frames=max_frames)
+        log_activity(f"Imported {result['frames']} retroactive frames from {result['video']} for {result['device_id']}.")
+        _backfill_metric_history()
+    except Exception as exc:
+        metric_store.set_backfill_status(
+            running=0,
+            finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            message=f"video import failed: {exc}",
+        )
+
+
+def _dominant_frequency_hz(history):
+    samples = []
+    for entry in history or []:
+        movement = entry.get("movement") or {}
+        centroid = movement.get("centroid_px")
+        value = None
+        if isinstance(centroid, list) and len(centroid) == 2:
+            value = float(centroid[1])
+        elif movement.get("displacement_mm") is not None:
+            value = float(movement.get("displacement_mm") or 0)
+        timestamp = None
+        try:
+            timestamp = datetime.strptime(entry.get("timestamp") or "", "%Y-%m-%d %H:%M:%S").timestamp()
+        except (TypeError, ValueError):
+            pass
+        if timestamp and value is not None and np.isfinite(value):
+            samples.append((timestamp, value))
+    if len(samples) < 8:
+        return None
+    samples.sort()
+    times = np.asarray([item[0] for item in samples], dtype=np.float64)
+    values = np.asarray([item[1] for item in samples], dtype=np.float64)
+    span = float(times[-1] - times[0])
+    if span < 2 * 3600:
+        return None
+    deltas = np.diff(times)
+    step = float(np.median(deltas[deltas > 0])) if np.any(deltas > 0) else 0
+    if step <= 0:
+        return None
+    step = max(60.0, min(step, 3600.0))
+    uniform_times = np.arange(times[0], times[-1] + step, step)
+    if len(uniform_times) < 8:
+        return None
+    uniform_values = np.interp(uniform_times, times, values)
+    uniform_values = uniform_values - np.mean(uniform_values)
+    amplitude = float(np.std(uniform_values))
+    if amplitude <= 0:
+        return None
+    spectrum = np.abs(np.fft.rfft(uniform_values))
+    freqs = np.fft.rfftfreq(len(uniform_values), d=step)
+    min_freq = 1.0 / (48 * 3600)
+    max_freq = 1.0 / (2 * 3600)
+    mask = (freqs >= min_freq) & (freqs <= max_freq)
+    if not np.any(mask):
+        return None
+    masked_spectrum = spectrum[mask]
+    masked_freqs = freqs[mask]
+    index = int(np.argmax(masked_spectrum))
+    freq = float(masked_freqs[index])
+    strength = float(masked_spectrum[index] / max(1e-9, np.sum(masked_spectrum)))
+    return {
+        "frequency_hz": freq,
+        "period_hours": (1.0 / freq) / 3600.0 if freq > 0 else None,
+        "amplitude_px": amplitude,
+        "strength": strength,
+        "samples": len(samples),
+        "span_hours": span / 3600.0,
+        "fingerprint": f"{freq:.9g}Hz:{amplitude:.2f}px:{strength:.2f}",
+    }
+
+
+def _biology_state():
+    stats = load_dashboard_stats()
+    rhythms = {}
+    alerts = []
+    for device_id, info in stats.items():
+        history = info.get("history") or []
+        rhythm = _dominant_frequency_hz(history)
+        if rhythm:
+            rhythms[device_id] = rhythm
+            midpoint = len(history) // 2
+            if midpoint >= 8:
+                old = _dominant_frequency_hz(history[:midpoint])
+                new = _dominant_frequency_hz(history[midpoint:])
+                if old and new and old.get("frequency_hz"):
+                    shift = abs(new["frequency_hz"] - old["frequency_hz"]) / old["frequency_hz"]
+                    if shift >= 0.25:
+                        alerts.append({
+                            "severity": "warn",
+                            "type": "rhythm_shift",
+                            "device_id": device_id,
+                            "message": f"Circadian rhythm shifted {shift * 100:.0f}% ({old['frequency_hz']:.3g} Hz to {new['frequency_hz']:.3g} Hz).",
+                        })
+        recent = [entry for entry in history[-12:] if not entry.get("ignored")]
+        baseline = [entry for entry in history[-60:-12] if not entry.get("ignored")]
+        recent_green = [value for value in [
+            ((entry.get("color_metrics") or {}).get("green_index"))
+            for entry in recent
+        ] if isinstance(value, (int, float))]
+        baseline_green = [value for value in [
+            ((entry.get("color_metrics") or {}).get("green_index"))
+            for entry in baseline
+        ] if isinstance(value, (int, float))]
+        if recent_green and baseline_green:
+            recent_avg = float(np.mean(recent_green))
+            baseline_avg = float(np.mean(baseline_green))
+            if baseline_avg and recent_avg < baseline_avg * 0.85:
+                alerts.append({
+                    "severity": "warn",
+                    "type": "green_index_drop",
+                    "device_id": device_id,
+                    "message": f"Green index dropped {((baseline_avg - recent_avg) / abs(baseline_avg)) * 100:.0f}% from recent baseline.",
+                })
+        latest = (history[-1] if history else {}).get("movement") or {}
+        previous = (history[-6] if len(history) >= 6 else {}).get("movement") or {}
+        latest_centroid = latest.get("centroid_px")
+        previous_centroid = previous.get("centroid_px")
+        if isinstance(latest_centroid, list) and isinstance(previous_centroid, list) and len(latest_centroid) == 2 and len(previous_centroid) == 2:
+            y_shift = float(latest_centroid[1]) - float(previous_centroid[1])
+            speed = float(latest.get("speed_mm_hr") or 0)
+            if y_shift > 10 and speed > 0.5:
+                alerts.append({
+                    "severity": "warn",
+                    "type": "droop",
+                    "device_id": device_id,
+                    "message": f"Canopy centroid moved downward {y_shift:.0f}px with {speed:.2f} mm/hr movement speed.",
+                })
+    return {"rhythms": rhythms, "alerts": alerts[-100:]}
 
 
 def _backfill_metric_history():
@@ -1247,6 +1796,11 @@ def _backfill_metric_history():
             if result:
                 area = float(result.get("plant_area_mm2") or 0)
                 growth = 0.0
+                movement = {
+                    "centroid_px": (result.get("canopy_bounding_box") or {}).get("center"),
+                    "displacement_mm": 0.0,
+                    "speed_mm_hr": 0.0,
+                }
                 prev = previous.get(device_id)
                 if prev:
                     dt = (
@@ -1255,6 +1809,16 @@ def _backfill_metric_history():
                     ).total_seconds() / 3600.0
                     if dt > 0.01:
                         growth = (area - prev["area"]) / dt
+                        active_scale = float(result.get("scale_px_per_mm") or 0)
+                        current_centroid = movement.get("centroid_px")
+                        previous_centroid = prev.get("centroid_px")
+                        if current_centroid and previous_centroid and active_scale > 0:
+                            displacement_px = float(np.linalg.norm(
+                                np.asarray(current_centroid, dtype=np.float32)
+                                - np.asarray(previous_centroid, dtype=np.float32)
+                            ))
+                            movement["displacement_mm"] = displacement_px / active_scale
+                            movement["speed_mm_hr"] = movement["displacement_mm"] / dt
                 entry = {
                     "timestamp": timestamp,
                     "filename": filename,
@@ -1266,10 +1830,11 @@ def _backfill_metric_history():
                     "segments": result.get("segments", []),
                     "canopy_coverage": result.get("canopy_coverage"),
                     "color_metrics": result.get("color_metrics"),
+                    "movement": movement,
                     "nutrient_deficiency": {},
                 }
                 metric_store.upsert_history_point(device_id, entry)
-                previous[device_id] = {"timestamp": timestamp, "area": area}
+                previous[device_id] = {"timestamp": timestamp, "area": area, "centroid_px": movement.get("centroid_px")}
             processed += 1
         for device_id in {job[0] for job in jobs}:
             metric_store.refresh_rollups(device_id)
@@ -1312,6 +1877,31 @@ def start_metric_backfill():
 @app.route("/metrics/backfill")
 def metric_backfill_status():
     return jsonify(metric_store.get_backfill_status())
+
+
+@app.route("/video_imports")
+def list_video_imports():
+    return jsonify({"videos": _available_video_imports()})
+
+
+@app.route("/video_imports/import", methods=["POST"])
+def import_video_for_analysis():
+    data = request.get_json(silent=True) or {}
+    video_name = os.path.basename(str(data.get("video") or ""))
+    if not video_name:
+        return jsonify({"status": "error", "message": "Choose a video to import."}), 400
+    status = metric_store.get_backfill_status()
+    if status.get("running"):
+        return jsonify(status), 409
+    try:
+        sample_seconds = int(max(1, min(3600, int(data.get("sample_seconds") or 60))))
+        max_frames = int(max(1, min(2000, int(data.get("max_frames") or 240))))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Sample seconds and max frames must be numbers."}), 400
+    device_id = str(data.get("device_id") or _video_device_id(video_name)).strip()
+    threading.Thread(target=_import_video_job, args=(video_name, device_id, sample_seconds, max_frames), daemon=True).start()
+    return jsonify({"status": "ok", "message": f"Import started for {video_name}", "device_id": device_id})
+
 
 @app.route("/stats")
 def get_stats():
@@ -1436,6 +2026,64 @@ def get_device_settings():
     return jsonify({device_id: settings_response(device_id) for device_id in known})
 
 
+@app.route("/adb_transport")
+def get_adb_transport():
+    return jsonify(adb_transport.transport_status())
+
+
+@app.route("/adb_transport/connect", methods=["POST"])
+def connect_adb_transport():
+    data = request.get_json(silent=True) or {}
+    try:
+        endpoint = adb_transport.normalize_endpoint(data.get("endpoint"), data.get("port", 5555))
+        result = adb_transport.connect(endpoint)
+        if result["ok"] and data.get("remember", True):
+            adb_transport.remember_endpoint(endpoint, data.get("name", ""))
+        return jsonify(result), (200 if result["ok"] else 502)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.route("/adb_transport/disconnect", methods=["POST"])
+def disconnect_adb_transport():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = adb_transport.disconnect(data.get("endpoint"))
+        if data.get("forget"):
+            adb_transport.forget_endpoint(data.get("endpoint"))
+        return jsonify(result), (200 if result["ok"] else 502)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.route("/adb_transport/pair", methods=["POST"])
+def pair_adb_transport():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = adb_transport.pair(data.get("endpoint"), data.get("pairing_code"))
+        return jsonify(result), (200 if result["ok"] else 502)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.route("/adb_transport/prepare_legacy", methods=["POST"])
+def prepare_legacy_adb_transport():
+    data = request.get_json(silent=True) or {}
+    try:
+        result = adb_transport.prepare_legacy_wifi(data.get("serial"), data.get("port", 5555))
+        if result["ok"] and data.get("remember", True):
+            adb_transport.remember_endpoint(result["endpoint"], data.get("name", ""))
+        return jsonify(result), (200 if result["ok"] else 502)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.route("/adb_transport/reconnect", methods=["POST"])
+def reconnect_adb_transports():
+    results = adb_transport.reconnect_configured(force=True)
+    return jsonify({"ok": all(result.get("ok") for result in results), "results": results})
+
+
 @app.route("/device_capabilities")
 def get_device_capabilities():
     return jsonify({
@@ -1444,10 +2092,67 @@ def get_device_capabilities():
     })
 
 
+@app.route("/network_camera_status")
+def get_network_camera_status():
+    probe = request.args.get("probe", "0") == "1"
+    return jsonify({
+        camera_id: network_camera_status(camera_id, probe=probe)
+        for camera_id in configured_camera_ids()
+    })
+
+
+@app.route("/experiments", methods=["GET", "POST"])
+def experiments_api():
+    if request.method == "GET":
+        return jsonify({
+            "experiments": load_experiments(),
+            "events": load_events(),
+            "plants": load_plant_records(),
+            "biology": _biology_state(),
+        })
+    try:
+        return jsonify({"status": "ok", "experiment": upsert_experiment(request.get_json(silent=True) or {})})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/experiment_events", methods=["POST"])
+def experiment_events_api():
+    try:
+        return jsonify({"status": "ok", "event": add_event(request.get_json(silent=True) or {})})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/plant_records", methods=["GET", "POST"])
+def plant_records_api():
+    if request.method == "GET":
+        return jsonify({"plants": load_plant_records()})
+    try:
+        return jsonify({"status": "ok", "plant": upsert_plant_record(request.get_json(silent=True) or {})})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/biology_state")
+def biology_state_api():
+    return jsonify(_biology_state())
+
+
 @app.route("/device_settings/<device_id>", methods=["POST"])
 def update_device_settings(device_id):
     data = request.get_json(silent=True) or {}
     current = settings_for_device(device_id)
+    if current.get("measurement_locked"):
+        allowed_locked_keys = {"display_rotation_deg"}
+        unlocking = set(data.keys()) == {"measurement_locked"} and data.get("measurement_locked") is False
+        visual_only = set(data.keys()).issubset(allowed_locked_keys)
+        if not unlocking and not visual_only:
+            return jsonify({
+                "status": "locked",
+                "message": "Measurement setup is locked. Unlock Setup before changing camera, calibration, segmentation, or color settings. Rotation stays editable because it is display-only.",
+                "settings": settings_response(device_id),
+            }), 423
     if data.get("light_mode") in ("auto", "day", "night_ir"):
         current["light_mode"] = data["light_mode"]
     if data.get("profile_name") in ("auto", "day", "wide_day", "night_ir"):
@@ -1465,6 +2170,11 @@ def update_device_settings(device_id):
     if "measurement_locked" in data:
         current["measurement_locked"] = bool(data["measurement_locked"])
         current["measurement_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if current["measurement_locked"] else ""
+    if "expected_marker_count" in data:
+        try:
+            current["expected_marker_count"] = int(max(1, min(50, int(data["expected_marker_count"]))))
+        except (TypeError, ValueError):
+            pass
     if str(data.get("iso")) in ("auto", "100", "200", "400", "800", "1600"):
         current["iso"] = str(data["iso"])
     if data.get("focus_mode") in ("continuous-picture", "auto", "infinity", "macro", "fixed"):
@@ -1490,44 +2200,199 @@ def latest_marker_count(device_id):
         return 0
 
 
+def latest_analysis_record(device_id):
+    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+    if not os.path.exists(stats_file):
+        return {}
+    try:
+        with open(stats_file, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+        return stats.get(device_id) or {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def latest_capture_path(device_id):
+    device_dir = os.path.join(CAPTURES_DIR, device_id)
+    if not os.path.exists(device_dir):
+        return None
+    latest = _latest_capture_file(os.listdir(device_dir))
+    return os.path.join(device_dir, latest) if latest else None
+
+
+def image_quality_metrics(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR) if image_path else None
+    if img is None:
+        return {"sharpness": 0.0, "brightness": 0.0, "clipped_fraction": 1.0}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(gray.mean())
+    clipped = float(((gray <= 4) | (gray >= 251)).mean())
+    return {"sharpness": sharpness, "brightness": brightness, "clipped_fraction": clipped}
+
+
+def score_measurement_trial(analysis, quality, expected_markers, previous_trial=None):
+    data = analysis.get("data") or {}
+    markers = int(data.get("markers_found") or 0)
+    marker_score = min(markers / max(1, expected_markers), 1.0)
+
+    sharpness = float(quality.get("sharpness") or 0.0)
+    sharpness_score = min(sharpness / 260.0, 1.0)
+
+    scale = data.get("scale_px_per_mm")
+    scale_score = 0.0
+    if scale not in (None, 0):
+        scale_score = 0.55
+        if not data.get("scale_rejected"):
+            scale_score += 0.25
+        if previous_trial and previous_trial.get("scale"):
+            ratio = min(float(scale), float(previous_trial["scale"])) / max(float(scale), float(previous_trial["scale"]))
+            scale_score += max(0.0, min(0.2, (ratio - 0.75) / 0.25 * 0.2))
+
+    color = data.get("color_metrics") or {}
+    green_index = color.get("green_index")
+    canopy = float(data.get("canopy_area_mm2") or data.get("plant_area_mm2") or 0.0)
+    green_score = 0.0
+    if green_index is not None and canopy > 0:
+        green_score = min(max(float(green_index), 0.0) / 0.18, 1.0)
+
+    brightness = float(quality.get("brightness") or 0.0)
+    clipped = float(quality.get("clipped_fraction") or 0.0)
+    exposure_score = 1.0 - min(abs(brightness - 128.0) / 128.0, 1.0)
+    exposure_score *= max(0.0, 1.0 - clipped * 8.0)
+
+    score = (
+        marker_score * 0.40
+        + sharpness_score * 0.20
+        + scale_score * 0.20
+        + green_score * 0.10
+        + exposure_score * 0.10
+    )
+    return {
+        "score": round(float(score), 4),
+        "markers": markers,
+        "expected_markers": expected_markers,
+        "marker_score": round(float(marker_score), 4),
+        "sharpness": round(sharpness, 2),
+        "sharpness_score": round(float(sharpness_score), 4),
+        "scale": float(scale) if scale not in (None, 0) else None,
+        "scale_score": round(float(scale_score), 4),
+        "scale_rejected": bool(data.get("scale_rejected")),
+        "green_index": float(green_index) if green_index is not None else None,
+        "green_score": round(float(green_score), 4),
+        "canopy_area_mm2": canopy,
+        "brightness": round(brightness, 2),
+        "clipped_fraction": round(clipped, 5),
+        "exposure_score": round(float(exposure_score), 4),
+    }
+
+
 @app.route("/auto_tune_tags/<device_id>", methods=["POST"])
 def auto_tune_tags(device_id):
     if device_id in configured_camera_ids():
         return jsonify({"status": "error", "message": "Automatic camera-setting sweep is for Android ADB cameras."}), 400
 
+    payload = request.get_json(silent=True) or {}
+    operation_id = payload.get("operation_id")
     original = dict(settings_for_device(device_id))
+    try:
+        expected_markers = int(payload.get("expected_markers") or original.get("expected_marker_count") or 4)
+    except (TypeError, ValueError):
+        expected_markers = 4
+    expected_markers = int(max(1, min(50, expected_markers)))
+    update_operation(operation_id, f"{device_id}: starting measurement-profile calibration for {expected_markers} expected tags.", 2)
     profiles = [
-        {"delay_ms": 5000, "antibanding": "60hz", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "auto", "white_balance": "daylight"},
-        {"delay_ms": 7000, "antibanding": "60hz", "focus_mode": "auto", "exposure_compensation": 2, "iso": "400", "white_balance": "daylight"},
-        {"delay_ms": 9000, "antibanding": "60hz", "focus_mode": "macro", "exposure_compensation": 2, "iso": "400", "white_balance": "daylight"},
-        {"delay_ms": 9000, "antibanding": "50hz", "focus_mode": "auto", "exposure_compensation": 2, "iso": "400", "white_balance": "daylight"},
-        {"delay_ms": 9000, "antibanding": "auto", "focus_mode": "continuous-picture", "exposure_compensation": 4, "iso": "800", "white_balance": "daylight"},
-        {"delay_ms": 11000, "antibanding": "60hz", "focus_mode": "infinity", "exposure_compensation": 4, "iso": "800", "white_balance": "daylight"},
-        {"delay_ms": 11000, "antibanding": "50hz", "focus_mode": "macro", "exposure_compensation": 4, "iso": "800", "white_balance": "cloudy-daylight"},
-        {"delay_ms": 12000, "antibanding": "60hz", "focus_mode": "auto", "exposure_compensation": -2, "iso": "auto", "white_balance": "daylight"},
-        {"delay_ms": 12000, "antibanding": "off", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "1600", "white_balance": "daylight"},
+        {"delay_ms": 5000, "antibanding": "60hz", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "auto", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 7000, "antibanding": "60hz", "focus_mode": "auto", "exposure_compensation": 0, "iso": "200", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 8000, "antibanding": "60hz", "focus_mode": "macro", "exposure_compensation": 0, "iso": "200", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 9000, "antibanding": "50hz", "focus_mode": "auto", "exposure_compensation": 1, "iso": "400", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 9000, "antibanding": "50hz", "focus_mode": "auto", "exposure_compensation": 1, "iso": "400", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 10000, "antibanding": "60hz", "focus_mode": "continuous-picture", "exposure_compensation": -1, "iso": "auto", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 10000, "antibanding": "auto", "focus_mode": "auto", "exposure_compensation": 0, "iso": "400", "white_balance": "cloudy-daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 11000, "antibanding": "60hz", "focus_mode": "infinity", "exposure_compensation": 0, "iso": "400", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
+        {"delay_ms": 12000, "antibanding": "off", "focus_mode": "continuous-picture", "exposure_compensation": 0, "iso": "800", "white_balance": "daylight", "zoom_percent": original.get("zoom_percent", 0)},
     ]
     results = []
-    best = {"markers": -1, "profile": original}
+    best = {"score": -1.0, "profile": original, "score_detail": {}}
+    previous_score = None
 
     for idx, profile in enumerate(profiles, start=1):
+        update_operation(
+            operation_id,
+            f"{device_id}: trial {idx}/{len(profiles)} - focus {profile['focus_mode']}, exposure {profile['exposure_compensation']}, ISO {profile['iso']}, {profile['antibanding']}.",
+            5 + int((idx - 1) / len(profiles) * 85),
+        )
         current = dict(original)
         current.update(profile)
         current["light_mode"] = "day"
+        current["profile_name"] = "day"
+        current["expected_marker_count"] = expected_markers
+        current["measurement_locked"] = False
+        current["measurement_locked_at"] = ""
         device_settings[device_id] = current
         save_device_settings()
         ok = capture_and_sync(device_id)
-        markers = latest_marker_count(device_id) if ok else 0
-        trial = {"trial": idx, "ok": bool(ok), "markers": markers, "profile": profile}
+        analysis = latest_analysis_record(device_id) if ok else {}
+        quality = image_quality_metrics(latest_capture_path(device_id)) if ok else {}
+        score_detail = score_measurement_trial(analysis, quality, expected_markers, previous_score)
+        trial = {"trial": idx, "ok": bool(ok), "profile": profile, **score_detail}
         results.append(trial)
-        if markers > best["markers"]:
-            best = {"markers": markers, "profile": current}
-        if markers >= 4:
-            break
+        update_operation(
+            operation_id,
+            f"{device_id}: trial {idx} {'captured' if ok else 'failed'} - {score_detail['markers']}/{expected_markers} tags, score {round(score_detail['score'] * 100)}%, sharpness {score_detail['sharpness']}.",
+            5 + int(idx / len(profiles) * 85),
+        )
+        previous_score = score_detail
+        if score_detail["score"] > best["score"]:
+            best = {"score": score_detail["score"], "profile": current, "score_detail": score_detail}
 
-    device_settings[device_id] = best["profile"] if best["markers"] > 0 else original
+    winning = best["profile"] if best["score"] > 0 else original
+    winning["expected_marker_count"] = expected_markers
+    winning["measurement_profile_score"] = best["score"]
+    winning["measurement_profile_summary"] = (
+        f"{best['score_detail'].get('markers', 0)}/{expected_markers} tags, "
+        f"sharpness {best['score_detail'].get('sharpness', 0)}, "
+        f"scale {best['score_detail'].get('scale') or '--'}, "
+        f"green {best['score_detail'].get('green_index') if best['score_detail'].get('green_index') is not None else '--'}"
+    )
+    winning["measurement_locked"] = bool(payload.get("lock", True)) and best["score"] > 0
+    winning["measurement_locked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if winning["measurement_locked"] else ""
+    device_settings[device_id] = winning
     save_device_settings()
-    return jsonify({"status": "ok", "device": device_id, "best_markers": best["markers"], "best_profile": settings_response(device_id), "trials": results})
+    accepted_scale = best["score_detail"].get("scale")
+    if winning["measurement_locked"] and accepted_scale:
+        stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
+        try:
+            with open(stats_file, "r", encoding="utf-8") as f:
+                saved_stats = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            saved_stats = {}
+        saved_stats.setdefault(device_id, {}).update({
+            "stable_scale_px_per_mm": float(accepted_scale),
+            "stable_scale_source": "measurement_profile_sweep",
+            "stable_scale_calibrated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(saved_stats, f, indent=4)
+        update_operation(operation_id, f"{device_id}: accepted stable scale {float(accepted_scale):.4f} px/mm from the winning trial.", 96)
+    response = {
+        "status": "ok",
+        "device": device_id,
+        "expected_markers": expected_markers,
+        "best_score": best["score"],
+        "best_markers": best["score_detail"].get("markers", 0),
+        "best_profile": settings_response(device_id),
+        "best_detail": best["score_detail"],
+        "trials": results,
+    }
+    update_operation(
+        operation_id,
+        f"{device_id}: calibration complete. Best score {round(best['score'] * 100)}% with {best['score_detail'].get('markers', 0)}/{expected_markers} tags.",
+        100,
+        "complete",
+        response,
+    )
+    return jsonify(response)
 
 @app.route("/analysis_debug/<device_id>")
 def serve_analysis_debug(device_id):
@@ -1672,9 +2537,7 @@ DASHBOARD_HTML = """
             <p>Last Sync: <span class="timestamp">{{ last.get(d, 'Initializing...') }}</span></p>
 
             <div class="label">Timelapse Loop</div>
-            <video id="vid-{{d}}" controls loop muted preload="metadata">
-                <source src="/video/{{d}}" type="video/mp4">
-            </video>
+            <video id="vid-{{d}}" controls loop muted preload="none" data-src="/video/{{d}}"></video>
 
             <div class="controls">
                 <button onclick="fetch('/capture/{{d}}').then(()=>location.reload())">Force Capture</button>
@@ -1987,6 +2850,10 @@ OBSERVATORY_DASHBOARD_HTML = """
         .setup-summary div { border: 1px solid #26302c; border-radius: 6px; padding: 9px; background: #0d1311; }
         .setup-summary span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; }
         .setup-summary strong { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+        .lock-notice { display: none; border: 1px solid var(--amber); background: rgba(255, 191, 87, .12); border-radius: 8px; padding: 10px; margin: 10px 0; color: var(--text); }
+        .lock-notice.active { display: block; }
+        .locked-control { opacity: .58; }
+        .setup-control-card.locked input:disabled, .setup-control-card.locked select:disabled, .locked-control:disabled { cursor: not-allowed; }
         .setup-checklist { display: grid; gap: 8px; }
         .setup-checklist div { display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid #26302c; padding-top: 8px; }
         .setup-checklist .ok { color: var(--green); font-weight: 800; }
@@ -1994,6 +2861,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         select, input[type="range"] { width: 100%; accent-color: var(--green); }
         select { min-height: 34px; border-radius: 6px; border: 1px solid #3a4541; background: #101514; color: var(--text); padding: 0 8px; }
         .telemetry { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+        .telemetry.mission-canopy-only { grid-template-columns: 1fr; }
         .telemetry div { background: var(--panel-2); border: 1px solid #222c28; border-radius: 6px; padding: 10px; min-height: 58px; }
         .telemetry span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; }
         .telemetry strong { display: block; margin-top: 5px; overflow-wrap: anywhere; }
@@ -2005,6 +2873,8 @@ OBSERVATORY_DASHBOARD_HTML = """
         .chart-field input[type="number"] { min-width: 0; }
         .chart-field .range-value { text-align: right; color: var(--text); font-weight: 800; overflow-wrap: anywhere; }
         .custom-window { display: grid; grid-template-columns: minmax(70px, 1fr) minmax(86px, 1fr); gap: 6px; }
+        .chart-slider-row, .chart-input-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; grid-column: 1 / -1; }
+        .chart-input-row { border-top: 1px solid #26302c; padding-top: 8px; margin-top: 2px; }
         .point-popover { position: fixed; z-index: 30; min-width: 210px; background: #121816; border: 1px solid #495650; border-radius: 8px; padding: 12px; box-shadow: 0 18px 50px rgba(0,0,0,.45); }
         .point-popover .value { font-weight: 800; margin: 6px 0 10px; }
         canvas { width: 100% !important; height: 100% !important; }
@@ -2040,6 +2910,8 @@ OBSERVATORY_DASHBOARD_HTML = """
         .event { display: grid; grid-template-columns: 82px 1fr; gap: 10px; border-top: 1px solid #26302c; padding-top: 10px; color: #c9d3ce; }
         .event time { color: var(--muted); font-size: .78rem; }
         .log { font-family: Consolas, monospace; font-size: .76rem; white-space: pre-wrap; background: #070908; border: 1px solid #202824; border-radius: 6px; padding: 10px; max-height: 130px; overflow: auto; color: #aab7b0; }
+        .operation-console { font-family: Consolas, monospace; white-space: pre-wrap; min-height: 118px; max-height: 240px; overflow: auto; background: #050807; color: #9dd7ac; border: 1px solid #26342d; border-radius: 6px; padding: 10px; line-height: 1.45; }
+        .operation-progress { width: 100%; height: 8px; margin: 8px 0; accent-color: var(--green); }
         .empty { border: 1px dashed #3a4541; border-radius: 8px; padding: 28px; color: var(--muted); text-align: center; }
         @media (max-width: 980px) {
             .shell { grid-template-columns: 1fr; }
@@ -2059,10 +2931,10 @@ OBSERVATORY_DASHBOARD_HTML = """
             <div class="nav-item active" data-view="mission" onclick="showSection('mission', this)">Mission Control <span class="pill">{{ devices|length }}</span></div>
             <div class="nav-item" data-view="segmentation" onclick="showSection('segmentation', this)">Setup</div>
             <div class="nav-item" data-view="growth" onclick="showSection('growth', this)">Growth Analytics</div>
+            <div class="nav-item" data-view="movement" onclick="showSection('movement', this)">Movement</div>
             <div class="nav-item" data-view="experiments" onclick="showSection('experiments', this)">Active Experiments</div>
             <div class="nav-section">Operations</div>
             <div class="nav-item" data-view="volume" onclick="showSection('volume', this)">Canopy Volume</div>
-            <div class="nav-item" data-view="health" onclick="showSection('health', this)">Device Health</div>
             <div class="nav-item" data-view="settings" onclick="showSection('settings', this)">Settings</div>
         </aside>
         <main class="main">
@@ -2103,7 +2975,8 @@ OBSERVATORY_DASHBOARD_HTML = """
                             </div>
                             <div class="controls">
                                 <button onclick="captureDevice('{{d}}')">Capture</button>
-                                <button onclick="refreshFrame('{{d}}')">Refresh</button>
+                                <button onclick="toggleMissionGreenMask('{{d}}')" id="mission-greenmask-toggle-{{d}}">Greenmask On</button>
+                                <button onclick="refreshDevice('{{d}}')">Refresh</button>
                             </div>
                             <div class="rotation-row">
                                 <label class="muted" for="rotation-{{d}}">Rotate</label>
@@ -2123,10 +2996,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                                 <button onclick="ptzMove('{{d}}','down_right')">↘</button>
                             </div>
                             {% endif %}
-                            <video id="vid-{{d}}" controls loop muted preload="metadata"><source src="/video/{{d}}" type="video/mp4"></video>
-                            <div class="telemetry" id="stats-{{d}}">
-                                <div><span>Markers</span><strong>--</strong></div><div><span>Canopy</span><strong>--</strong></div>
-                                <div><span>Growth</span><strong>--</strong></div><div><span>Health</span><strong>Collecting</strong></div>
+                            <div class="controls"><button onclick="loadMissionTimelapse('{{d}}')">Load Timelapse</button></div>
+                            <video id="vid-{{d}}" controls loop muted preload="none" data-src="/video/{{d}}"></video>
+                            <div class="telemetry mission-canopy-only" id="stats-{{d}}">
+                                <div><span>Canopy Area</span><strong>--</strong></div>
                             </div>
                         </article>
                         {% endfor %}
@@ -2150,6 +3023,11 @@ OBSERVATORY_DASHBOARD_HTML = """
                     <div class="chart-wrap"><canvas id="fleet-chart"></canvas></div>
                     <div class="timeline" id="event-timeline"><div class="event"><time>Now</time><div>Waiting for capture telemetry.</div></div></div>
                 </aside>
+                <section class="panel" style="grid-column:1 / -1">
+                    <h2>Running Activity</h2>
+                    <div class="muted" style="margin-top:6px">Live play-by-play of captures, syncs, analysis, color checks, movement calculations, and recovery actions.</div>
+                    <div class="operation-console" id="activity-console" style="margin-top:12px">Waiting for live activity.</div>
+                </section>
             </div>
             <section class="panel view-section" id="view-segmentation">
                 <h2>Connected Devices</h2>
@@ -2164,52 +3042,70 @@ OBSERVATORY_DASHBOARD_HTML = """
                     </aside>
                     <div class="setup-stage">
                         <div class="setup-summary" id="setup-summary"></div>
+                        <div class="controls" style="margin-top:10px">
+                            <button id="setup-greenmask-toggle" onclick="toggleGreenMask()" title="Switch between green overlay and raw frame.">Greenmask On</button>
+                        </div>
                         <div class="image-wrap">
-                            <img id="segment-image" src="" onpointerdown="startSegmentDrag(event)" onpointermove="moveSegmentDrag(event)" onpointerup="finishSegmentDrag(event)" ondblclick="finishPointMode()" onerror="this.style.display='none'">
+                            <img id="segment-image" src="" onpointerdown="startSegmentDrag(event)" onpointermove="moveSegmentDrag(event)" onpointerup="finishSegmentDrag(event)" ondblclick="finishPointMode()" onerror="handleSetupImageError(this)">
                             <div id="segment-overlays"></div>
                             <div id="segment-selection" style="position:absolute; border:2px dashed var(--cyan); pointer-events:none; display:none;"></div>
                         </div>
+                        <h3 style="margin-top:14px">Device Log</h3>
+                        <div class="log" id="selected-device-log">Select a device to see its capture and sync log.</div>
                         <div class="timeline" id="segment-list"></div>
                     </div>
                     <aside>
                         <div class="setup-mode-tabs">
-                            <button class="active" data-setup-mode="onboarding" onclick="showSetupMode('onboarding')">Onboard</button>
-                            <button data-setup-mode="tune" onclick="showSetupMode('tune')">Tune</button>
+                            <button class="active" data-setup-mode="setup" onclick="showSetupMode('setup')">Setup</button>
                             <button data-setup-mode="segmentation" onclick="showSetupMode('segmentation')">Segment</button>
+                            <button data-setup-mode="color" onclick="showSetupMode('color')">Color</button>
                             <button data-setup-mode="qa" onclick="showSetupMode('qa')">QA</button>
                         </div>
-                        <div class="setup-panel active" data-setup-panel="onboarding">
-                            <h3>Onboarding</h3>
-                            <div class="muted">Name the device, assign a chamber and role, then confirm a capture works.</div>
-                            <div id="setup-onboarding-controls"></div>
-                        </div>
-                        <div class="setup-panel" data-setup-panel="tune">
-                            <h3>Tune & Calibrate</h3>
-                            <div class="muted">Optimize camera settings for tag detection, green measurement, and movement tracking, then lock the fixed rig setup.</div>
-                            <div id="setup-tune-controls"></div>
-                            <div class="timeline" id="setup-tune-steps"></div>
+                        <div class="setup-panel active" data-setup-panel="setup">
+                            <h3>Device Setup</h3>
+                            <div class="muted">Name the device, assign its chamber, optimize capture settings, confirm tag/scale detection, then lock the fixed measurement profile. Rotation is display-only and remains editable after lock.</div>
+                            <div class="lock-notice" id="setup-lock-notice"><strong>Measurement setup is locked.</strong><br>Unlock Setup before changing camera, calibration, segmentation, or color settings. Rotation stays editable because it only changes display orientation.</div>
+                            <label class="settings-row" title="How many ArUco/ChArUco markers should be visible in this fixed view. The sweep scores profiles against this target."><span class="muted">Expected tags</span><input id="expected-tags-input" type="number" min="1" max="50" value="4" onchange="saveExpectedTags()"></label>
+                            <div id="setup-controls-panel"></div>
+                            <div class="timeline" id="setup-steps"></div>
                             <div class="controls">
                                 <button onclick="captureSelectedSetupFrame()" title="Capture one fresh frame using the current settings.">Test Frame</button>
-                                <button onclick="autoTuneSelectedTags()" title="Sweep capture settings to maximize tag detection.">Auto Sweep Tags</button>
-                                <button onclick="calibrateSelectedAruco()" title="Use the selected device's current marker scale as stable reference.">Accept Scale</button>
-                                <button onclick="enableManualMarkerMode()" title="Crop and click a visible marker by hand.">Manual Tag</button>
-                                <button onclick="clearManualTagsForSelected()" title="Remove all manual tags for this device.">Clear Tags</button>
-                                <button class="primary" onclick="lockSelectedMeasurementSetup()" title="Mark the current camera, calibration, greenmask, and motion setup as fixed.">Lock Setup</button>
+                                <button class="primary" data-locked-edit onclick="autoTuneSelectedTags()" title="Ask for expected visible tags, then sweep camera settings and lock the best measurement profile.">Calibrate Measurement Profile</button>
+                                <button data-locked-edit onclick="enableManualMarkerMode()" title="Crop and click a visible marker by hand.">Manual Tag</button>
+                                <button data-locked-edit onclick="clearManualTagsForSelected()" title="Remove all manual tags for this device.">Clear Tags</button>
+                                <button class="primary" data-locked-edit onclick="lockSelectedMeasurementSetup()" title="Mark the current camera, calibration, greenmask, and motion setup as fixed.">Lock Setup</button>
                             </div>
+                            <progress class="operation-progress" id="setup-operation-progress" max="100" value="0"></progress>
+                            <div class="operation-console" id="setup-operation-console">Ready. Long-running setup actions will report their work here.</div>
                         </div>
                         <div class="setup-panel" data-setup-panel="segmentation">
                             <h3>Segmentation</h3>
                             <div class="muted">Define trays/plants and exclude false green areas.</div>
                             <div class="controls">
-                                <button onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region.">Segment Box</button>
-                                <button onclick="enablePolygonSegmentMode()" title="Click around a skewed tray, then double-click.">Segment Polygon</button>
-                                <button onclick="enableIgnoreEditorMode('ignore-box')" title="Drag over false green/artifact space.">Ignore Box</button>
-                                <button onclick="enableIgnoreEditorMode('ignore-polygon')" title="Click around false green/artifact space, then double-click.">Ignore Polygon</button>
-                                <button id="greenmask-toggle" onclick="toggleGreenMask()" title="Switch between green overlay and raw frame.">Greenmask On</button>
-                                <button onclick="clearSegmentsForSelected()" title="Remove every saved segment.">Clear Segments</button>
-                                <button onclick="clearEditorIgnores()" title="Remove ignored regions.">Clear Ignores</button>
+                                <button data-locked-edit onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region.">Segment Box</button>
+                                <button data-locked-edit onclick="enablePolygonSegmentMode()" title="Click around a skewed tray, then double-click.">Segment Polygon</button>
+                                <button data-locked-edit onclick="enableIgnoreEditorMode('ignore-box')" title="Drag over false green/artifact space.">Ignore Box</button>
+                                <button data-locked-edit onclick="enableIgnoreEditorMode('ignore-polygon')" title="Click around false green/artifact space, then double-click.">Ignore Polygon</button>
+                                <button data-locked-edit onclick="clearSegmentsForSelected()" title="Remove every saved segment.">Clear Segments</button>
+                                <button data-locked-edit onclick="clearEditorIgnores()" title="Remove ignored regions.">Clear Ignores</button>
                                 <button onclick="refreshSegmentationFrame()" title="Reload the selected frame.">Refresh Frame</button>
                             </div>
+                        </div>
+                        <div class="setup-panel" data-setup-panel="color">
+                            <h3>Color Reference</h3>
+                            <div class="muted">Colored ChArUco cells are detected and sampled automatically from their known board positions. Manual polygons remain available for handmade or partially hidden references.</div>
+                            <label class="settings-row" title="Enable drift scoring and optional analysis-only green-index correction. Raw photos are never changed."><span class="muted">Color QA</span><input id="color-reference-enabled" type="checkbox" checked onchange="saveColorReferenceSettings()"><strong id="color-reference-enabled-label">On</strong></label>
+                            <label class="settings-row" title="Off records patch values only. Simple uses neutral patches. Advanced uses all matching patches to solve a color matrix for analysis metrics."><span class="muted">Correction</span><select id="color-reference-mode" onchange="saveColorReferenceSettings()"><option value="off">Off</option><option value="simple">Simple</option><option value="advanced">Advanced</option></select><strong></strong></label>
+                            <div class="controls">
+                                <button data-locked-edit onclick="enableColorPatchMode()" title="Fallback: click around a color swatch, then double-click to save it.">Add Manual Patch</button>
+                                <button class="primary" data-locked-edit onclick="finishColorPatchMode()" title="Finish the current color patch polygon and enter its name/code.">Finish Color Patch</button>
+                                <button data-locked-edit onclick="setColorReferenceBaseline()" title="Use the current sampled patch colors as the baseline for future drift/correction.">Set Baseline</button>
+                                <button data-locked-edit onclick="clearColorPatchesForSelected()" title="Remove every saved color patch for this camera.">Clear Color Board</button>
+                                <button onclick="refreshSegmentationFrame()" title="Reload the selected frame.">Refresh Frame</button>
+                            </div>
+                            <div class="muted" id="color-patch-status">No active color patch.</div>
+                            <div class="timeline" id="color-reference-status"></div>
+                            <div class="timeline" id="color-patch-list"></div>
                         </div>
                         <div class="setup-panel" data-setup-panel="qa">
                             <h3>Measurement QA</h3>
@@ -2222,8 +3118,8 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="settings-row"><label class="muted" for="alias-{{d}}">Name</label><input id="alias-{{d}}" type="text" value="{{ device_aliases.get(d, '') }}" placeholder="{{ d }}" title="Local display name only. This does not rename capture folders or device IDs." onchange="saveDeviceAlias('{{d}}', this.value)"><strong></strong></div>
                             <div class="settings-row"><label class="muted" for="chamber-{{d}}">Chamber</label><input id="chamber-{{d}}" type="text" value="{{ (device_metadata.get(d, {}) or {}).get('chamber', '') }}" placeholder="Chamber A" onchange="saveDeviceMetadata('{{d}}', 'chamber', this.value)"><strong></strong></div>
                             <div class="settings-row"><label class="muted" for="role-{{d}}">Role</label><select id="role-{{d}}" onchange="saveDeviceMetadata('{{d}}', 'role', this.value)">{% set role = (device_metadata.get(d, {}) or {}).get('role', 'tray') %}<option value="tray" {{ 'selected' if role == 'tray' else '' }}>Tray</option><option value="wall" {{ 'selected' if role == 'wall' else '' }}>Wall</option><option value="overview" {{ 'selected' if role == 'overview' else '' }}>Overview</option><option value="night_vision" {{ 'selected' if role == 'night_vision' else '' }}>Night vision</option><option value="calibration" {{ 'selected' if role == 'calibration' else '' }}>Calibration</option><option value="other" {{ 'selected' if role == 'other' else '' }}>Other</option></select><strong></strong></div>
-                            <div class="controls" style="margin-top:12px"><select id="profile-toggle-{{d}}" onchange="applyNamedProfile('{{d}}', this.value)"><option value="day">Day Profile</option><option value="wide_day">Wide Day</option><option value="night_ir">Night IR</option></select><button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button><button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button><button onclick="saveCurrentProfile('{{d}}')">Save Profile</button></div>
-                            <label class="settings-row" title="When off, this device skips real night captures and contributes a one-second labeled night placeholder to its timelapse instead."><span class="muted">Night frames</span><input id="collect-night-{{d}}" type="checkbox" onchange="saveDeviceSetting('{{d}}', 'collect_night_frames', this.checked)"><strong id="collect-night-label-{{d}}">Collect</strong></label>
+                            <div class="controls" style="margin-top:12px"><button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button><button onclick="autoTuneTags('{{d}}')">Calibrate Measurement Profile</button><button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button></div>
+                            <label class="settings-row" title="When off, this device contributes a one-second labeled night placeholder instead of black frames. Measurements ignore placeholders, but timelapse timing stays aligned."><span class="muted">Night frames</span><input id="collect-night-{{d}}" type="checkbox" onchange="saveDeviceSetting('{{d}}', 'collect_night_frames', this.checked)"><strong id="collect-night-label-{{d}}">Collect</strong></label>
                             <div class="settings-row"><label class="muted" for="zoom-{{d}}">Zoom</label><input id="zoom-{{d}}" type="range" min="0" max="100" value="0" oninput="previewZoom('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'zoom_percent', this.value)"><strong id="zoom-value-{{d}}">0%</strong></div>
                             <div class="settings-row"><label class="muted" for="delay-{{d}}">Settle</label><input id="delay-{{d}}" type="range" min="500" max="15000" step="500" value="5000" oninput="previewDelay('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'delay_ms', this.value)"><strong id="delay-value-{{d}}">5.0s</strong></div>
                             <div class="settings-row"><label class="muted" for="antibanding-{{d}}">Banding</label><select id="antibanding-{{d}}" onchange="saveDeviceSetting('{{d}}', 'antibanding', this.value)"><option value="60hz">60 Hz</option><option value="50hz">50 Hz</option><option value="auto">Auto</option><option value="off">Off</option></select><strong></strong></div>
@@ -2231,6 +3127,11 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="settings-row"><label class="muted" for="focus-{{d}}">Focus</label><select id="focus-{{d}}" onchange="saveDeviceSetting('{{d}}', 'focus_mode', this.value)"><option value="continuous-picture">Continuous</option><option value="auto">Auto</option><option value="macro">Macro</option><option value="infinity">Infinity</option><option value="fixed">Fixed</option></select><strong></strong></div>
                             <div class="settings-row"><label class="muted" for="exposure-{{d}}">Exposure</label><input id="exposure-{{d}}" type="range" min="-12" max="12" step="1" value="0" oninput="previewExposure('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'exposure_compensation', this.value)"><strong id="exposure-value-{{d}}">0</strong></div>
                             <div class="settings-row"><label class="muted" for="iso-{{d}}">ISO</label><select id="iso-{{d}}" onchange="saveDeviceSetting('{{d}}', 'iso', this.value)"><option value="auto">Auto</option><option value="100">100</option><option value="200">200</option><option value="400">400</option><option value="800">800</option><option value="1600">1600</option></select><strong></strong></div>
+                            <div class="rotation-row">
+                                <label class="muted" for="setup-rotation-{{d}}">Rotate</label>
+                                <input id="setup-rotation-{{d}}" type="range" min="0" max="360" step="1" value="0" oninput="previewRotation('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'display_rotation_deg', this.value)">
+                                <input id="setup-rotation-number-{{d}}" type="number" min="0" max="360" step="1" value="0" oninput="previewRotation('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'display_rotation_deg', this.value)">
+                            </div>
                         </div>
                         {% endfor %}
                         </div>
@@ -2242,7 +3143,76 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <div class="muted" style="margin-top:6px">Each camera gets its own chart. Named segmentation regions become individual lines.</div>
                 <div id="growth-charts" class="timeline"></div>
             </section>
-            <section class="panel view-section" id="view-experiments"><h2>Active Experiments</h2><div class="timeline" id="experiments-list"><div class="event"><time>Live</time><div>Ranked by grow speed, current movement proxies, recovery after harvest once harvest events are recorded, and health stability.</div></div></div><div class="timeline" id="trait-ranking"></div></section>
+            <section class="panel view-section" id="view-movement">
+                <h2>Movement</h2>
+                <div class="muted" style="margin-top:6px">Movement uses canopy centroid drift between calibrated captures. Circadian rhythm, droop warning, brightness flattening/stretching, and plant identity by movement axis are staged here as the next analysis layer.</div>
+                <div class="timeline">
+                    <div class="event">
+                        <time>Video</time>
+                        <div>
+                            <strong>Retroactive movement analysis</strong><br>
+                            Import frames from an existing MP4 in <code>C:\\dev\\pt\\videos</code>, then analyze them like normal captures.
+                            <div class="controls" style="margin-top:10px">
+                                <select id="video-import-select"></select>
+                                <input id="video-import-device" type="text" placeholder="device_id from filename">
+                                <input id="video-import-sample" type="number" min="1" max="3600" value="60" title="Seconds between sampled frames">
+                                <input id="video-import-max" type="number" min="1" max="2000" value="240" title="Maximum frames to extract">
+                                <button class="primary" onclick="importSelectedVideo()">Import + Analyze</button>
+                                <button onclick="loadVideoImports()">Refresh Videos</button>
+                            </div>
+                            <div class="muted" id="video-import-status" style="margin-top:8px">Video importer ready.</div>
+                        </div>
+                    </div>
+                </div>
+                <h3 style="margin-top:18px">Circadian Fingerprints</h3>
+                <div class="timeline" id="movement-rhythm-list"></div>
+                <div class="timeline" id="movement-list"></div>
+            </section>
+            <section class="panel view-section" id="view-experiments">
+                <h2>Active Experiments</h2>
+                <div class="muted" style="margin-top:6px">Assign cameras/plants, record interventions, and compare growth, color, and canopy movement against those events.</div>
+                <div class="controls" style="margin-top:12px">
+                    <input id="experiment-id" type="text" placeholder="experiment_id">
+                    <input id="experiment-name" type="text" placeholder="Experiment name">
+                    <input id="experiment-hypothesis" type="text" placeholder="Hypothesis">
+                    <button class="primary" onclick="saveExperiment()">Save Experiment</button>
+                </div>
+                <div class="controls" style="margin-top:8px">
+                    <select id="experiment-event-id"></select>
+                    <select id="experiment-event-type"><option value="observation">Observation</option><option value="planted">Planted</option><option value="germination">Germination / first plant</option><option value="irrigation">Irrigation</option><option value="fertilizer">Fertilizer</option><option value="light_change">Light change</option><option value="harvest">Harvest</option><option value="stress">Stress</option><option value="treatment">Treatment</option><option value="breeding">Breeding / parentage</option></select>
+                    <select id="experiment-event-device"><option value="">All devices</option>{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
+                    <input id="experiment-event-plant" type="text" placeholder="plant/tray id">
+                    <input id="experiment-event-notes" type="text" placeholder="Event notes">
+                    <button onclick="logExperimentEvent()">Log Event</button>
+                    <button onclick="enablePlantNotifications()">Enable Notifications</button>
+                </div>
+                <h3 style="margin-top:18px">Tray / Plant Records</h3>
+                <div class="controls" style="margin-top:8px">
+                    <input id="plant-record-id" type="text" placeholder="plant_or_tray_id">
+                    <input id="plant-record-name" type="text" placeholder="plant / tray name">
+                    <input id="plant-record-variety" type="text" placeholder="variety">
+                    <input id="plant-record-planted" type="date" title="planted date">
+                    <input id="plant-record-germination" type="datetime-local" title="first germination / first plant">
+                    <input id="plant-record-device" type="text" placeholder="phone/device id">
+                    <input id="plant-record-segment" type="text" placeholder="segment id">
+                    <input id="plant-record-irrigation" type="text" placeholder="irrigation">
+                    <input id="plant-record-fertilizer" type="text" placeholder="fertilizer">
+                    <input id="plant-record-harvest" type="text" placeholder="harvest">
+                    <input id="plant-record-mother" type="text" placeholder="mother parent">
+                    <input id="plant-record-father" type="text" placeholder="father parent">
+                    <input id="plant-record-notes" type="text" placeholder="other notes">
+                    <button class="primary" onclick="savePlantRecord()">Save Plant/Tray</button>
+                </div>
+                <div class="timeline" id="biology-alerts"></div>
+                <div class="timeline" id="plant-records-list"></div>
+                <h3 style="margin-top:18px">Calendar</h3>
+                <div class="timeline" id="experiment-calendar"></div>
+                <h3 style="margin-top:18px">Circadian Fingerprints</h3>
+                <div class="timeline" id="rhythm-list"></div>
+                <div class="timeline" id="experiments-list"></div>
+                <h3 style="margin-top:18px">Trait And Movement Ranking</h3>
+                <div class="timeline" id="trait-ranking"></div>
+            </section>
             <section class="panel view-section" id="view-volume">
                 <h2>Canopy Volume</h2>
                 <div class="muted" style="margin-top:6px">Select cameras seeing the same plants and calibration target, confirm target dimensions, then calibrate and reconstruct.</div>
@@ -2254,10 +3224,36 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <canvas id="volume-preview" style="margin-top:12px; height:320px !important; background:#070908; border:1px solid #26302c; border-radius:6px"></canvas>
                 <div class="timeline" id="calibration-list"><div class="event"><time>Ready</time><div>Use the red marker editors on Mission Control to confirm ArUco/ChArUco dimensions first.</div></div></div>
             </section>
-            <section class="panel view-section" id="view-health"><h2>Device Health</h2><div class="timeline" id="health-list"></div>{% for d in devices %}<div style="margin-top:10px"><div class="muted">{{ d }}</div><div class="log" id="log-{{d}}">{{ logs[d] }}</div></div>{% endfor %}</section>
             <section class="panel view-section" id="view-settings">
                 <h2>Settings</h2>
                 <div class="timeline"><div class="event"><time>Camera</time><div>Use Setup for capture tuning, tag detection, segmentation, and ignore regions. Mission Control is for observing, capture, refresh, and ESCAM movement.</div></div></div>
+                <h3 style="margin-top:18px">Wi-Fi ADB</h3>
+                <div class="timeline">
+                    <div class="event">
+                        <time>Optional</time>
+                        <div>
+                            <strong>Connect Android phones through the PC hotspot</strong><br>
+                            USB remains the setup and recovery path. Enter the phone's hotspot address for direct connection without relying on network discovery.
+                            <div class="controls" style="margin-top:8px">
+                                <input id="adb-wifi-name" type="text" placeholder="Camera name">
+                                <input id="adb-wifi-endpoint" type="text" placeholder="192.168.137.42:5555">
+                                <button class="primary" onclick="connectWifiAdb()">Connect and Save</button>
+                                <button class="warn" onclick="disconnectWifiAdb()">Disconnect and Forget</button>
+                                <button onclick="reconnectWifiAdb()">Reconnect Saved</button>
+                            </div>
+                            <div class="controls" style="margin-top:8px">
+                                <select id="adb-usb-serial"><option value="">Select USB phone</option></select>
+                                <button onclick="prepareLegacyWifiAdb()">Prepare USB Phone for Wi-Fi</button>
+                            </div>
+                            <div class="controls" style="margin-top:8px">
+                                <input id="adb-pair-endpoint" type="text" placeholder="Android 11+ pairing IP:port">
+                                <input id="adb-pair-code" type="text" inputmode="numeric" placeholder="Pairing code">
+                                <button onclick="pairWifiAdb()">Pair Android 11+</button>
+                            </div>
+                            <div class="muted" id="adb-transport-status" style="margin-top:8px">Loading ADB transports...</div>
+                        </div>
+                    </div>
+                </div>
                 <h3 style="margin-top:18px">Long-Term Metrics</h3>
                 <div class="timeline">
                     <div class="event"><time>SQLite</time><div><strong>Durable metric history</strong><br>New captures are stored in an append-only SQLite database with hourly/daily rollups for long-term charts.<br><div class="controls" style="margin-top:8px"><button onclick="startMetricBackfill()">Rebuild From Captures</button><button class="warn" onclick="clearMetricHistory()">Clear Derived Metrics</button></div><div class="muted" id="metric-store-status" style="margin-top:8px">Idle</div></div></div>
@@ -2265,7 +3261,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <h3 style="margin-top:18px">Tag Detection Sweep</h3>
                 <div class="timeline">
                     {% for d in devices %}
-                    <div class="event"><time>ADB</time><div><strong>{{ d }}</strong><br>Automatically try settle, banding, focus, exposure, and ISO combinations to maximize detected ArUco/ChArUco markers.<br><button onclick="autoTuneTags('{{d}}')">Auto Sweep Tags</button></div></div>
+                    <div class="event"><time>ADB</time><div><strong>{{ d }}</strong><br>Ask how many tags should be visible, then sweep settle, banding, focus, exposure, ISO, and WB to lock the best measurement profile.<br><button onclick="autoTuneTags('{{d}}')">Calibrate Measurement Profile</button></div></div>
                     {% endfor %}
                 </div>
                 <h3 style="margin-top:18px">Timelapses</h3>
@@ -2311,22 +3307,29 @@ OBSERVATORY_DASHBOARD_HTML = """
     <script>
         const charts = {};
         const ignoreState = {};
-        const segmentState = { deviceId: null, enabled: false, dragging: false, mode: 'box', points: [], roi: null, manualMarkers: {}, segments: {} };
+        const segmentState = { deviceId: null, enabled: false, dragging: false, mode: 'box', points: [], roi: null, manualMarkers: {}, colorBoards: {}, segments: {} };
         const growthControls = {};
-        const fleetControls = { metric: 'area', windowMode: 'all', customValue: 1, customUnit: 'days', windowHours: 0, maxY: '', trim: true };
+        const fleetControls = { metric: 'area', windowMode: 'all', customValue: 1, customUnit: 'days', windowHours: 0, minX: '', maxX: '', minY: '', maxY: '', trim: true, outlierSensitivity: 2.5 };
         const MAX_CHART_POINTS = 700;
         const connectedDevices = new Set({{ devices|tojson }});
         const deviceAliases = {{ device_aliases|tojson }};
         const deviceMetadata = {{ device_metadata|tojson }};
+        const deviceLogs = {{ logs|tojson }};
         const settingsCache = {};
+        const colorReferenceCache = {};
+        const networkCameraStatus = {};
         let showSetupGreenMask = true;
-        let activeSetupMode = 'onboarding';
+        let showMissionGreenMask = true;
+        const missionGreenMaskState = {};
+        let activeSetupMode = 'setup';
         let pointPopover = null;
+        let setupOperationTimer = null;
         let liveDevice = null;
         let liveTimer = null;
         let liveBusy = false;
         let latestStats = {};
         let activeView = 'mission';
+        const seenAlertKeys = new Set();
         function fmt(value, digits = 1) { return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
         function aliasOf(deviceId) { return deviceAliases[deviceId] || deviceId; }
         function showOperation(title, detail, tone = 'normal') {
@@ -2334,6 +3337,105 @@ OBSERVATORY_DASHBOARD_HTML = """
             el.style.display = 'block';
             el.style.borderColor = tone === 'bad' ? 'var(--red)' : tone === 'warn' ? 'var(--amber)' : 'var(--line)';
             el.innerHTML = `<h2>${title}</h2><div class="muted" style="margin-top:6px">${detail}</div>`;
+        }
+        function newOperationId(prefix) {
+            return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        }
+        function renderSetupOperation(job) {
+            const consoleEl = document.getElementById('setup-operation-console');
+            const progressEl = document.getElementById('setup-operation-progress');
+            if (consoleEl) {
+                consoleEl.textContent = (job.lines || []).join('\\\\n') || 'Waiting for operation output...';
+                consoleEl.scrollTop = consoleEl.scrollHeight;
+            }
+            if (progressEl) progressEl.value = Number(job.progress || 0);
+        }
+        function watchSetupOperation(operationId) {
+            clearInterval(setupOperationTimer);
+            const poll = () => fetch('/operations/' + encodeURIComponent(operationId))
+                .then(r => r.ok ? r.json() : null)
+                .then(job => {
+                    if (!job) return;
+                    renderSetupOperation(job);
+                    if (job.status === 'complete' || job.status === 'error') {
+                        clearInterval(setupOperationTimer);
+                        setupOperationTimer = null;
+                    }
+                }).catch(() => {});
+            poll();
+            setupOperationTimer = setInterval(poll, 700);
+        }
+        function adbRequest(path, payload) {
+            return fetch(path, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload || {})
+            }).then(async response => {
+                const body = await response.json();
+                if (!response.ok) throw new Error(body.message || 'ADB command failed');
+                return body;
+            });
+        }
+        function loadAdbTransportStatus() {
+            fetch('/adb_transport').then(r => r.json()).then(status => {
+                const el = document.getElementById('adb-transport-status');
+                const configured = (status.configured || []).map(device => {
+                    const label = device.name || device.endpoint || 'Invalid endpoint';
+                    return `${label}: ${device.online ? 'online' : 'offline'}`;
+                });
+                if (el) el.textContent = status.adb_available
+                    ? `USB: ${(status.usb || []).join(', ') || 'none'} | Wi-Fi: ${(status.wifi || []).join(', ') || 'none'} | Saved: ${configured.join(', ') || 'none'}`
+                    : 'ADB was not found. Install Android platform-tools or set PT_ADB.';
+                const select = document.getElementById('adb-usb-serial');
+                if (select) {
+                    const selected = select.value;
+                    select.innerHTML = '<option value="">Select USB phone</option>' + (status.usb || []).map(serial => `<option value="${serial}">${serial}</option>`).join('');
+                    if ((status.usb || []).includes(selected)) select.value = selected;
+                }
+            }).catch(error => {
+                const el = document.getElementById('adb-transport-status');
+                if (el) el.textContent = `Could not read ADB status: ${error.message}`;
+            });
+        }
+        function connectWifiAdb() {
+            const endpoint = document.getElementById('adb-wifi-endpoint').value.trim();
+            const name = document.getElementById('adb-wifi-name').value.trim();
+            adbRequest('/adb_transport/connect', {endpoint, name, remember: true})
+                .then(body => {
+                    showOperation('Wi-Fi ADB connected', body.message || body.endpoint);
+                    loadAdbTransportStatus();
+                })
+                .catch(error => showOperation('Wi-Fi ADB connection failed', error.message, 'bad'));
+        }
+        function reconnectWifiAdb() {
+            adbRequest('/adb_transport/reconnect', {}).then(body => {
+                const messages = (body.results || []).map(result => `${result.endpoint}: ${result.message}`).join(' | ');
+                showOperation('Saved Wi-Fi ADB reconnect complete', messages || 'No saved endpoints are enabled.', body.ok ? 'normal' : 'warn');
+                loadAdbTransportStatus();
+            }).catch(error => showOperation('Wi-Fi ADB reconnect failed', error.message, 'bad'));
+        }
+        function disconnectWifiAdb() {
+            const endpoint = document.getElementById('adb-wifi-endpoint').value.trim();
+            adbRequest('/adb_transport/disconnect', {endpoint, forget: true}).then(body => {
+                showOperation('Wi-Fi ADB disconnected', body.message || body.endpoint);
+                loadAdbTransportStatus();
+            }).catch(error => showOperation('Wi-Fi ADB disconnect failed', error.message, 'bad'));
+        }
+        function prepareLegacyWifiAdb() {
+            const serial = document.getElementById('adb-usb-serial').value;
+            const name = document.getElementById('adb-wifi-name').value.trim();
+            adbRequest('/adb_transport/prepare_legacy', {serial, name, remember: true}).then(body => {
+                document.getElementById('adb-wifi-endpoint').value = body.endpoint || '';
+                showOperation('Phone prepared for Wi-Fi ADB', `${serial} is available at ${body.endpoint}.`);
+                loadAdbTransportStatus();
+            }).catch(error => showOperation('Legacy Wi-Fi setup failed', error.message, 'bad'));
+        }
+        function pairWifiAdb() {
+            const endpoint = document.getElementById('adb-pair-endpoint').value.trim();
+            const pairingCode = document.getElementById('adb-pair-code').value.trim();
+            adbRequest('/adb_transport/pair', {endpoint, pairing_code: pairingCode}).then(body => {
+                showOperation('Wireless debugging paired', `${body.endpoint}: ${body.message}. Enter Android's connection address above, then Connect and Save.`);
+            }).catch(error => showOperation('Wireless debugging pairing failed', error.message, 'bad'));
         }
         function showSection(name, item) {
             activeView = name;
@@ -2344,7 +3446,14 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (item) item.classList.add('active');
             pauseHiddenVideos();
             if (name === 'settings') renderTimelapses(latestStats);
-            if (name === 'growth') renderGrowthCharts(latestStats);
+            if (name === 'growth') {
+                renderGrowthCharts(latestStats);
+                loadActivity();
+            }
+            if (name === 'movement') {
+                renderMovementWorkspace(latestStats);
+                loadVideoImports();
+            }
             if (name === 'segmentation') loadSegments();
             if (name === 'segmentation' && !segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
@@ -2403,10 +3512,60 @@ OBSERVATORY_DASHBOARD_HTML = """
             const devices = Array.from(document.querySelectorAll('.volume-camera-check:checked')).map(el => el.value);
             return devices.length ? '?devices=' + encodeURIComponent(devices.join(',')) : '';
         }
-        function refreshFrame(deviceId) { document.getElementById('analysis-' + deviceId).src = '/analysis_debug/' + deviceId + '?t=' + Date.now(); }
+        function frameUrl(deviceId, greenmask) {
+            return (greenmask ? '/analysis_debug/' : '/last_frame/') + deviceId + '?t=' + Date.now();
+        }
+        function refreshFrame(deviceId) {
+            const img = document.getElementById('analysis-' + deviceId);
+            const greenmask = missionGreenMaskState[deviceId] !== false;
+            if (img) {
+                img.style.display = 'block';
+                img.src = frameUrl(deviceId, greenmask);
+            }
+        }
+        function toggleMissionGreenMask(deviceId = null) {
+            if (deviceId) {
+                const next = missionGreenMaskState[deviceId] === false;
+                missionGreenMaskState[deviceId] = next;
+                const button = document.getElementById('mission-greenmask-toggle-' + deviceId);
+                if (button) button.textContent = next ? 'Greenmask On' : 'Greenmask Off';
+                refreshFrame(deviceId);
+                return;
+            }
+            showMissionGreenMask = !showMissionGreenMask;
+            document.querySelectorAll('article[data-device]').forEach(card => {
+                missionGreenMaskState[card.dataset.device] = showMissionGreenMask;
+                const button = document.getElementById('mission-greenmask-toggle-' + card.dataset.device);
+                if (button) button.textContent = showMissionGreenMask ? 'Greenmask On' : 'Greenmask Off';
+                refreshFrame(card.dataset.device);
+            });
+        }
         function captureDevice(deviceId) {
             if (liveDevice === deviceId) toggleLiveView(deviceId);
-            fetch('/capture/' + deviceId).then(() => location.reload());
+            showOperation('Capture running', `${deviceId}: requesting a fresh frame...`);
+            return fetch('/capture/' + deviceId).then(async response => {
+                const detail = await response.text();
+                if (!response.ok) throw new Error(detail || `Capture failed (${response.status})`);
+                refreshFrame(deviceId);
+                refreshSegmentationFrame();
+                updateStats();
+                loadNetworkCameraStatus(false);
+                refreshSelectedDeviceLog(deviceId);
+                showOperation('Capture complete', `${deviceId}: fresh frame captured and analyzed.`);
+                return detail;
+            }).catch(error => {
+                showOperation('Capture failed', `${deviceId}: ${error.message}`, 'bad');
+                loadNetworkCameraStatus(true);
+                throw error;
+            });
+        }
+        function refreshDevice(deviceId) {
+            if (deviceUsesNetworkStream(deviceId)) {
+                captureDevice(deviceId).catch(() => {});
+            } else {
+                refreshFrame(deviceId);
+                updateStats();
+            }
         }
         function deviceUsesNetworkStream(deviceId) {
             return document.querySelector(`[data-device="${deviceId}"]`)?.dataset.liveStream === '1';
@@ -2480,13 +3639,24 @@ OBSERVATORY_DASHBOARD_HTML = """
             });
         }
         function clearIgnore(deviceId) {
-            fetch('/clear_ignore/' + deviceId).then(() => {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
+            fetch('/clear_ignore/' + deviceId).then(async r => {
+                if (!r.ok) throw new Error((await r.json()).message || 'Clear ignore failed');
+                return r;
+            }).then(() => {
                 showOperation('Ignore regions cleared', `${deviceId} will use the full frame on the next analysis pass.`);
                 refreshFrame(deviceId);
                 updateStats();
-            });
+            }).catch(e => showOperation('Ignore clear blocked', e.message, 'bad'));
         }
         function enableIgnoreMode(deviceId) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
             ignoreState[deviceId] = { enabled: true, dragging: false };
             document.getElementById('analysis-' + deviceId).classList.add('mask-active');
             showOperation('Ignore-region mode', `Drag across the ${deviceId} image to mark erroneous green/artifact space. The region is saved when you release.`);
@@ -2501,6 +3671,10 @@ OBSERVATORY_DASHBOARD_HTML = """
             };
         }
         function startIgnoreDrag(event, deviceId) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
             const state = ignoreState[deviceId];
             if (!state || !state.enabled) return;
             event.preventDefault();
@@ -2530,6 +3704,11 @@ OBSERVATORY_DASHBOARD_HTML = """
             sel.style.height = Math.abs(point.sy - state.start.sy) + 'px';
         }
         function finishIgnoreDrag(event, deviceId) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                cancelIgnoreDrag(deviceId);
+                return;
+            }
             const state = ignoreState[deviceId];
             if (!state || !state.dragging) return;
             event.preventDefault();
@@ -2546,11 +3725,15 @@ OBSERVATORY_DASHBOARD_HTML = """
                 return;
             }
             fetch('/ignore_region/' + deviceId, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(region) })
+                .then(async r => {
+                    if (!r.ok) throw new Error((await r.json()).message || 'Ignore region failed');
+                    return r;
+                })
                 .then(() => {
                     showOperation('Ignore region saved', `${deviceId}: [${region.join(', ')}]. The overlay has been regenerated without that region.`);
                     refreshFrame(deviceId);
                     updateStats();
-                });
+                }).catch(e => showOperation('Ignore region blocked', e.message, 'bad'));
         }
         function cancelIgnoreDrag(deviceId) {
             const state = ignoreState[deviceId] || {};
@@ -2577,78 +3760,111 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (wrap) wrap.style.setProperty('--rotation', `${rotation}deg`);
             const slider = document.getElementById('rotation-' + deviceId);
             const number = document.getElementById('rotation-number-' + deviceId);
+            const setupSlider = document.getElementById('setup-rotation-' + deviceId);
+            const setupNumber = document.getElementById('setup-rotation-number-' + deviceId);
             if (slider && document.activeElement !== slider) slider.value = rotation;
             if (number && document.activeElement !== number) number.value = Math.round(rotation);
+            if (setupSlider && document.activeElement !== setupSlider) setupSlider.value = rotation;
+            if (setupNumber && document.activeElement !== setupNumber) setupNumber.value = Math.round(rotation);
+        }
+        function isSetupLocked(deviceId) {
+            return Boolean((settingsCache[deviceId] || {}).measurement_locked);
+        }
+        function showLockedSetupMessage(deviceId) {
+            showOperation('Setup is locked', `${aliasOf(deviceId)} is measurement-locked. Hit Unlock Setup before changing camera, calibration, segmentation, or color settings. Rotation is display-only and remains editable.`, 'bad');
+        }
+        function selectedSetupIsLocked() {
+            if (!segmentState.deviceId) return false;
+            if (!isSetupLocked(segmentState.deviceId)) return false;
+            showLockedSetupMessage(segmentState.deviceId);
+            stopPointMode();
+            return true;
+        }
+        function setControlLocked(control, locked) {
+            if (!control) return;
+            control.disabled = locked;
+            control.classList.toggle('locked-control', locked);
+            control.title = locked ? 'Unlock Setup before changing measurement settings.' : '';
+        }
+        function applySetupLockState(deviceId) {
+            const locked = isSetupLocked(deviceId);
+            const notice = document.getElementById('setup-lock-notice');
+            if (notice) notice.classList.toggle('active', locked && segmentState.deviceId === deviceId);
+            const card = document.getElementById('setup-controls-' + deviceId);
+            if (card) {
+                card.classList.toggle('locked', locked);
+                ['zoom', 'delay', 'antibanding', 'white-balance', 'focus', 'exposure', 'iso', 'collect-night'].forEach(prefix => setControlLocked(document.getElementById(prefix + '-' + deviceId), locked));
+                const auto = document.getElementById('auto-light-' + deviceId);
+                setControlLocked(auto, locked);
+            }
+            if (segmentState.deviceId === deviceId) {
+                setControlLocked(document.getElementById('expected-tags-input'), locked);
+                setControlLocked(document.getElementById('color-reference-enabled'), locked);
+                setControlLocked(document.getElementById('color-reference-mode'), locked);
+                document.querySelectorAll('[data-locked-edit]').forEach(button => setControlLocked(button, locked));
+            }
         }
         function saveDeviceSetting(deviceId, key, value) {
+            if (isSetupLocked(deviceId) && key !== 'measurement_locked' && key !== 'display_rotation_deg') {
+                showLockedSetupMessage(deviceId);
+                applyDeviceSettings(deviceId, settingsCache[deviceId] || {});
+                return Promise.resolve(settingsCache[deviceId] || {});
+            }
             const payload = {};
-            payload[key] = key === 'collect_night_frames' ? Boolean(value) : ((key === 'zoom_percent' || key === 'delay_ms' || key === 'exposure_compensation' || key === 'display_rotation_deg') ? Number(value) : value);
-            fetch('/device_settings/' + deviceId, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            }).then(r => r.json()).then(settings => {
-                applyDeviceSettings(deviceId, settings);
-                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, night frames ${settings.collect_night_frames ? 'on' : 'off'}. It applies on the next capture.`);
-            });
-        }
-        function saveDeviceSettings(deviceId, payload) {
+            payload[key] = key === 'collect_night_frames' ? Boolean(value) : ((key === 'zoom_percent' || key === 'delay_ms' || key === 'exposure_compensation' || key === 'display_rotation_deg' || key === 'expected_marker_count') ? Number(value) : value);
             return fetch('/device_settings/' + deviceId, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
-            }).then(r => r.json()).then(settings => {
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Setting save failed');
+                return body;
+            }).then(settings => {
                 applyDeviceSettings(deviceId, settings);
+                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, night frames ${settings.collect_night_frames ? 'on' : 'off'}. It applies on the next capture.`);
                 return settings;
+            }).catch(error => {
+                showOperation('Camera setting blocked', error.message, 'bad');
+                applyDeviceSettings(deviceId, settingsCache[deviceId] || {});
+                return settingsCache[deviceId] || {};
             });
         }
-        function toggleLightProfile(deviceId) {
-            const current = document.getElementById('profile-toggle-' + deviceId)?.dataset.activeMode || 'day';
-            const nextMode = current === 'night_ir' ? 'day' : 'night_ir';
-            const profile = nextMode === 'night_ir' ? {
-                light_mode: 'night_ir',
-                profile_name: 'night_ir',
-                zoom_percent: 0,
-                delay_ms: 8000,
-                exposure_compensation: 4,
-                iso: '1600',
-                focus_mode: 'continuous-picture',
-                white_balance: 'daylight',
-                antibanding: '60hz'
-            } : {
-                light_mode: 'day',
-                profile_name: 'day',
-                delay_ms: 5000,
-                exposure_compensation: 0,
-                iso: 'auto',
-                focus_mode: 'continuous-picture',
-                white_balance: 'daylight',
-                antibanding: '60hz'
-            };
-            saveDeviceSettings(deviceId, profile).then(settings => {
-                const label = nextMode === 'night' ? 'Night profile saved' : 'Day profile saved';
-                showOperation(label, `${deviceId}: now in ${nextMode} mode. You can still fine-tune exposure, ISO, settle, focus, and zoom individually.`);
+        function saveExpectedTags() {
+            if (!segmentState.deviceId) return;
+            const input = document.getElementById('expected-tags-input');
+            saveDeviceSetting(segmentState.deviceId, 'expected_marker_count', input ? input.value : 4);
+        }
+        function saveDeviceSettings(deviceId, payload) {
+            if (isSetupLocked(deviceId) && !((Object.keys(payload).length === 1) && payload.measurement_locked === false)) {
+                showLockedSetupMessage(deviceId);
+                return Promise.resolve(settingsCache[deviceId] || {});
+            }
+            return fetch('/device_settings/' + deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Setting save failed');
+                return body;
+            }).then(settings => {
+                applyDeviceSettings(deviceId, settings);
+                return settings;
+            }).catch(error => {
+                showOperation('Camera setting blocked', error.message, 'bad');
+                applyDeviceSettings(deviceId, settingsCache[deviceId] || {});
+                return settingsCache[deviceId] || {};
             });
         }
         function setAutoLight(deviceId) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
             saveDeviceSettings(deviceId, { light_mode: 'auto', profile_name: 'auto' }).then(settings => {
                 showOperation('Auto light sensing enabled', `${deviceId}: latest brightness ${settings.latest_luminance === null ? 'unknown' : settings.latest_luminance.toFixed(1)}; active profile is ${settings.active_light_mode}.`);
             });
-        }
-        function applyNamedProfile(deviceId, name) {
-            const profiles = {
-                day: { light_mode: 'day', profile_name: 'day', delay_ms: 5000, exposure_compensation: 0, iso: 'auto', focus_mode: 'continuous-picture', white_balance: 'daylight', antibanding: '60hz' },
-                wide_day: { light_mode: 'day', profile_name: 'wide_day', zoom_percent: 0, delay_ms: 5000, exposure_compensation: 0, iso: 'auto', focus_mode: 'continuous-picture', white_balance: 'daylight', antibanding: '60hz' },
-                night_ir: { light_mode: 'night_ir', profile_name: 'night_ir', zoom_percent: 0, delay_ms: 9000, exposure_compensation: 4, iso: '1600', focus_mode: 'continuous-picture', white_balance: 'daylight', antibanding: '60hz' }
-            };
-            saveDeviceSettings(deviceId, profiles[name] || profiles.day).then(() => {
-                showOperation('Profile applied', `${deviceId}: ${name.replace('_', ' ')} settings saved. Use Live View to fine tune before moving to the next camera.`);
-            });
-        }
-        function saveCurrentProfile(deviceId) {
-            const name = prompt('Profile name');
-            if (!name) return;
-            showOperation('Profile noted', `${deviceId}: "${name}" is ready to become a persistent preset. The current controls are already saved as device settings.`);
         }
         function ptzMove(cameraId, direction) {
             fetch(`/ptz/${cameraId}/${direction}`, {
@@ -2682,9 +3898,11 @@ OBSERVATORY_DASHBOARD_HTML = """
             const antibanding = document.getElementById('antibanding-' + deviceId);
             const rotation = document.getElementById('rotation-' + deviceId);
             const rotationNumber = document.getElementById('rotation-number-' + deviceId);
+            const setupRotation = document.getElementById('setup-rotation-' + deviceId);
+            const setupRotationNumber = document.getElementById('setup-rotation-number-' + deviceId);
             const collectNight = document.getElementById('collect-night-' + deviceId);
             const collectNightLabel = document.getElementById('collect-night-label-' + deviceId);
-            const toggle = document.getElementById('profile-toggle-' + deviceId);
+            const expectedTags = document.getElementById('expected-tags-input');
             const auto = document.getElementById('auto-light-' + deviceId);
             if (zoom) zoom.value = settings.zoom_percent || 0;
             if (zoomValue) zoomValue.textContent = `${settings.zoom_percent || 0}%`;
@@ -2698,18 +3916,17 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (antibanding) antibanding.value = settings.antibanding || '60hz';
             if (rotation) rotation.value = settings.display_rotation_deg || 0;
             if (rotationNumber) rotationNumber.value = Math.round(settings.display_rotation_deg || 0);
+            if (setupRotation) setupRotation.value = settings.display_rotation_deg || 0;
+            if (setupRotationNumber) setupRotationNumber.value = Math.round(settings.display_rotation_deg || 0);
             previewRotation(deviceId, settings.display_rotation_deg || 0);
             if (collectNight) collectNight.checked = settings.collect_night_frames !== false;
             if (collectNightLabel) collectNightLabel.textContent = settings.collect_night_frames === false ? 'Skip' : 'Collect';
-            if (toggle) {
-                const profileName = settings.profile_name || settings.light_mode || settings.active_light_mode || 'day';
-                toggle.dataset.activeMode = settings.active_light_mode || settings.light_mode || 'day';
-                toggle.value = ['day', 'wide_day', 'night_ir'].includes(profileName) ? profileName : ((settings.active_light_mode || settings.light_mode) === 'night_ir' ? 'night_ir' : 'day');
-            }
+            if (expectedTags && segmentState.deviceId === deviceId) expectedTags.value = settings.expected_marker_count || 4;
             if (auto) {
                 const luma = settings.latest_luminance === null || settings.latest_luminance === undefined ? '--' : Number(settings.latest_luminance).toFixed(0);
-                auto.textContent = settings.light_mode === 'auto' ? `Auto: ${(settings.active_light_mode || 'day').toUpperCase()} (${luma})` : 'Auto Light';
+                auto.textContent = settings.light_mode === 'auto' ? `Auto light: ${(settings.active_light_mode || 'day').toUpperCase()} (${luma})` : 'Auto Light';
             }
+            applySetupLockState(deviceId);
         }
         function loadDeviceSettings() {
             fetch('/device_settings').then(r => r.json()).then(all => {
@@ -2719,16 +3936,19 @@ OBSERVATORY_DASHBOARD_HTML = """
         function loadSegments() {
             Promise.all([
                 fetch('/segments').then(r => r.json()),
-                fetch('/manual_markers').then(r => r.json())
-            ]).then(([segments, manualMarkers]) => {
+                fetch('/manual_markers').then(r => r.json()),
+                fetch('/color_boards').then(r => r.json())
+            ]).then(([segments, manualMarkers, colorBoards]) => {
                 segmentState.segments = segments || {};
                 segmentState.manualMarkers = manualMarkers || {};
+                segmentState.colorBoards = colorBoards || {};
                 if (!segmentState.deviceId) {
                     const first = Object.keys(segmentState.segments || {})[0] || Object.keys(latestStats || {})[0] || Array.from(connectedDevices)[0];
                     if (first) selectSegmentationDevice(first);
                 }
                 renderAllSegmentOverlays();
                 renderSegmentList();
+                renderColorPatchList();
                 renderGrowthCharts(latestStats);
             });
         }
@@ -2744,22 +3964,17 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function renderSetupWorkbench() {
             const card = selectedSetupCard();
-            const onboarding = document.getElementById('setup-onboarding-controls');
-            const tune = document.getElementById('setup-tune-controls');
-            if (onboarding) onboarding.innerHTML = '';
-            if (tune) tune.innerHTML = '';
+            const setup = document.getElementById('setup-controls-panel');
+            if (setup) setup.innerHTML = '';
             if (card) {
-                if (activeSetupMode === 'tune') {
-                    tune?.appendChild(card);
-                } else {
-                    onboarding?.appendChild(card);
-                }
+                setup?.appendChild(card);
                 card.style.display = 'block';
             }
             renderSetupSummary();
             renderSetupChecklist();
             renderSetupQA();
             renderSetupTuneSteps();
+            if (segmentState.deviceId) applySetupLockState(segmentState.deviceId);
         }
         function renderSetupSummary() {
             const root = document.getElementById('setup-summary');
@@ -2774,6 +3989,24 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <div><span>Markers</span><strong>${data.markers_found || 0} detected</strong></div>
                 <div><span>Stable scale</span><strong>${info.stable_scale_px_per_mm ? fmt(Number(info.stable_scale_px_per_mm), 3) + ' px/mm' : '--'}</strong></div>
             `;
+            const log = document.getElementById('selected-device-log');
+            if (log) {
+                log.textContent = `Device ID ${id}:\\\\n` + (deviceLogs[id] || 'No log yet.');
+                log.scrollTop = log.scrollHeight;
+            }
+            refreshSelectedDeviceLog(id);
+        }
+        function refreshSelectedDeviceLog(deviceId = segmentState.deviceId) {
+            if (!deviceId) return;
+            const log = document.getElementById('selected-device-log');
+            if (!log) return;
+            fetch('/device_log/' + encodeURIComponent(deviceId)).then(r => r.json()).then(body => {
+                deviceLogs[deviceId] = body.log || 'No log yet.';
+                if (segmentState.deviceId === deviceId) {
+                    log.textContent = `Device ID ${deviceId}:\\\\n${deviceLogs[deviceId]}`;
+                    log.scrollTop = log.scrollHeight;
+                }
+            }).catch(() => {});
         }
         function renderSetupChecklist() {
             const root = document.getElementById('setup-checklist');
@@ -2805,11 +4038,11 @@ OBSERVATORY_DASHBOARD_HTML = """
             const confidence = Number(data.markers_found || 0) > 0 && !scaleRejected && Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0) > 0;
             root.innerHTML = `
                 <div class="event"><time>${confidence ? 'Good' : 'Check'}</time><div><strong>Measurement confidence: ${confidence ? 'usable' : 'needs attention'}</strong><br>Markers ${data.markers_found || 0}, scale ${data.scale_px_per_mm ? fmt(Number(data.scale_px_per_mm), 3) + ' px/mm' : '--'}, canopy ${fmt(Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0))} mm2, green index ${color.green_index !== undefined ? fmt(Number(color.green_index), 3) : '--'}${scaleRejected ? '<br><span class="warn">Scale was rejected on this frame.</span>' : ''}</div></div>
-                <div class="event"><time>Actions</time><div class="controls"><button onclick="captureDevice('${id}')">Test Capture</button><button onclick="refreshSegmentationFrame()">Refresh Frame</button><button onclick="calibrateSelectedAruco()">Accept Scale</button><button onclick="showSetupMode('segmentation')">Edit Segments</button></div></div>
+                <div class="event"><time>Actions</time><div class="controls"><button onclick="captureDevice('${id}')">Test Capture</button><button onclick="refreshSegmentationFrame()">Refresh Frame</button><button onclick="showSetupMode('segmentation')">Edit Segments</button></div></div>
             `;
         }
         function renderSetupTuneSteps() {
-            const root = document.getElementById('setup-tune-steps');
+            const root = document.getElementById('setup-steps');
             if (!root || !segmentState.deviceId) return;
             const id = segmentState.deviceId;
             const settings = settingsCache[id] || {};
@@ -2817,11 +4050,13 @@ OBSERVATORY_DASHBOARD_HTML = """
             const data = info.data || {};
             const color = data.color_metrics || {};
             const locked = settings.measurement_locked;
+            const expected = settings.expected_marker_count || 4;
+            const score = settings.measurement_profile_score ? `${Math.round(Number(settings.measurement_profile_score) * 100)}%` : '--';
             root.innerHTML = `
-                <div class="event"><time>1</time><div><strong>Find the sharp, stable camera setup</strong><br>Use live view/test frame, focus, exposure, WB, ISO, settle, and zoom until tags and leaves look stable.</div></div>
-                <div class="event"><time>2</time><div><strong>Maximize marker detection</strong><br>${data.markers_found || 0} markers visible. Use Auto Sweep Tags if detection is weak.</div></div>
+                <div class="event"><time>1</time><div><strong>Set expected visible tags</strong><br>${expected} expected in this fixed view. The sweep keeps the profile with the best combined marker, sharpness, scale, green, and exposure score.</div></div>
+                <div class="event"><time>2</time><div><strong>Run measurement-profile sweep</strong><br>${data.markers_found || 0}/${expected} markers visible. Last locked score ${score}. ${settings.measurement_profile_summary || ''}</div></div>
                 <div class="event"><time>3</time><div><strong>Confirm green measurement</strong><br>Green index ${color.green_index !== undefined ? fmt(Number(color.green_index), 3) : '--'}, canopy ${fmt(Number(data.canopy_area_mm2 || data.plant_area_mm2 || 0))} mm2. Use Segment mode to remove false green.</div></div>
-                <div class="event"><time>4</time><div><strong>Accept fixed geometry</strong><br>Scale ${fmt(Number(info.stable_scale_px_per_mm || data.scale_px_per_mm), 3)} px/mm. Phones and boards should now stay fixed except harvests or small tray nudges.</div></div>
+                <div class="event"><time>4</time><div><strong>Lock fixed geometry</strong><br>Lock Setup automatically accepts the visible scale (${fmt(Number(info.stable_scale_px_per_mm || data.scale_px_per_mm), 3)} px/mm) and native color reference. Phones and boards should then stay fixed except harvests or small tray nudges.</div></div>
                 <div class="event"><time>${locked ? 'Locked' : 'Open'}</time><div><strong>${locked ? 'Setup locked for measurement' : 'Setup not locked yet'}</strong><br>${locked ? (settings.measurement_locked_at || '') : 'Lock after tags, greenmask, and motion view are acceptable.'}<br><button onclick="lockSelectedMeasurementSetup(${locked ? 'false' : 'true'})">${locked ? 'Unlock Setup' : 'Lock Setup'}</button></div></div>
             `;
         }
@@ -2836,19 +4071,36 @@ OBSERVATORY_DASHBOARD_HTML = """
             document.querySelectorAll('.setup-control-card').forEach(card => { card.style.display = 'none'; });
             const img = document.getElementById('segment-image');
             img.style.display = 'block';
+            delete img.dataset.fallback;
             img.src = (showSetupGreenMask ? '/analysis_debug/' : '/last_frame/') + deviceId + '?t=' + Date.now();
             img.onload = () => renderSegmentationEditorOverlays();
             const crop = document.getElementById('manual-marker-crop');
             if (crop) crop.style.display = 'none';
             renderSegmentList();
+            renderColorPatchList();
             renderSetupWorkbench();
+            applyDeviceSettings(deviceId, settingsCache[deviceId] || {});
+            loadColorReferenceSettings(deviceId);
         }
         function refreshSegmentationFrame() {
             if (segmentState.deviceId) selectSegmentationDevice(segmentState.deviceId);
         }
+        function handleSetupImageError(img) {
+            if (!segmentState.deviceId) {
+                img.style.display = 'none';
+                return;
+            }
+            if (img.dataset.fallback === '1') {
+                img.style.display = 'none';
+                return;
+            }
+            img.dataset.fallback = '1';
+            img.style.display = 'block';
+            img.src = '/last_frame/' + segmentState.deviceId + '?t=' + Date.now();
+        }
         function toggleGreenMask() {
             showSetupGreenMask = !showSetupGreenMask;
-            const button = document.getElementById('greenmask-toggle');
+            const button = document.getElementById('setup-greenmask-toggle');
             if (button) button.textContent = showSetupGreenMask ? 'Greenmask On' : 'Greenmask Off';
             refreshSegmentationFrame();
         }
@@ -2883,7 +4135,13 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function calibrateSelectedAruco() {
             if (!segmentState.deviceId) return;
-            fetch('/calibrate_aruco/' + encodeURIComponent(segmentState.deviceId), { method: 'POST' }).then(async r => {
+            const operationId = newOperationId('scale');
+            watchSetupOperation(operationId);
+            fetch('/calibrate_aruco/' + encodeURIComponent(segmentState.deviceId), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({operation_id: operationId})
+            }).then(async r => {
                 const body = r.headers.get('content-type')?.includes('application/json') ? await r.json() : { message: await r.text() };
                 if (!r.ok) throw new Error(body.message || 'Calibration failed');
                 return body;
@@ -2893,6 +4151,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             }).catch(e => showOperation('ArUco calibration failed', e.message, 'bad'));
         }
         function autoTuneSelectedTags() {
+            if (selectedSetupIsLocked()) return;
             if (segmentState.deviceId) autoTuneTags(segmentState.deviceId);
         }
         function captureSelectedSetupFrame() {
@@ -2902,16 +4161,30 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function lockSelectedMeasurementSetup(lock = true) {
             if (!segmentState.deviceId) return;
-            saveDeviceSettings(segmentState.deviceId, { measurement_locked: lock }).then(settings => {
-                showOperation(lock ? 'Measurement setup locked' : 'Measurement setup unlocked', `${aliasOf(segmentState.deviceId)}: ${lock ? 'camera setup, scale, greenmask, and motion view are marked stable.' : 'setup can be edited again.'}`);
+            const deviceId = segmentState.deviceId;
+            const operationId = newOperationId(lock ? 'lock' : 'unlock');
+            watchSetupOperation(operationId);
+            fetch('/lock_setup/' + encodeURIComponent(deviceId), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({lock, operation_id: operationId})
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Setup lock failed');
+                return body;
+            }).then(body => {
+                applyDeviceSettings(deviceId, body.settings || {});
+                showOperation(lock ? 'Measurement setup locked' : 'Measurement setup unlocked', `${aliasOf(deviceId)}: ${lock ? `scale ${fmt(Number(body.scale), 3)} px/mm accepted and setup marked stable.` : 'setup can be edited again.'}`);
                 renderSetupWorkbench();
-            });
+                updateStats();
+            }).catch(e => showOperation(lock ? 'Setup lock failed' : 'Setup unlock failed', e.message, 'bad'));
         }
         function enableSegmentMode() {
             if (!segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
                 if (first) selectSegmentationDevice(first);
             }
+            if (selectedSetupIsLocked()) return;
             segmentState.enabled = true;
             segmentState.mode = 'box';
             segmentState.points = [];
@@ -2923,6 +4196,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const first = Object.keys(latestStats || {})[0];
                 if (first) selectSegmentationDevice(first);
             }
+            if (selectedSetupIsLocked()) return;
             segmentState.enabled = true;
             segmentState.mode = 'polygon';
             segmentState.points = [];
@@ -2934,6 +4208,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const first = Object.keys(latestStats || {})[0];
                 if (first) selectSegmentationDevice(first);
             }
+            if (selectedSetupIsLocked()) return;
             segmentState.enabled = true;
             segmentState.mode = 'manual-roi';
             segmentState.points = [];
@@ -2946,11 +4221,42 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const first = Object.keys(latestStats || {})[0];
                 if (first) selectSegmentationDevice(first);
             }
+            if (selectedSetupIsLocked()) return;
             segmentState.enabled = true;
             segmentState.mode = mode;
             segmentState.points = [];
             document.getElementById('segment-image')?.classList.add('mask-active');
             showOperation(mode === 'ignore-polygon' ? 'Ignore polygon mode' : 'Ignore box mode', mode === 'ignore-polygon' ? 'Click around false green/artifact space, then double-click the image to finish.' : 'Drag over false green/artifact space.');
+        }
+        function enableColorPatchMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            if (selectedSetupIsLocked()) return;
+            segmentState.enabled = true;
+            segmentState.mode = 'color-patch';
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            updateColorPatchStatus();
+            showOperation('Color patch mode', 'Click around one paint swatch color area, avoiding text/tape/edges, then press Finish Color Patch.');
+        }
+        function updateColorPatchStatus() {
+            const el = document.getElementById('color-patch-status');
+            if (!el) return;
+            if (segmentState.mode === 'color-patch' && segmentState.enabled) {
+                el.textContent = `${segmentState.points.length} point(s) plotted. Use at least 3, then press Finish Color Patch.`;
+            } else {
+                el.textContent = 'No active color patch.';
+            }
+        }
+        function finishColorPatchMode() {
+            if (selectedSetupIsLocked()) return;
+            if (segmentState.mode !== 'color-patch') {
+                showOperation('Color patch inactive', 'Press Add Color Patch first, then click around the swatch area.', 'warn');
+                return;
+            }
+            finishPointMode();
         }
         function segmentImagePoint(event, img) {
             const rect = img.getBoundingClientRect();
@@ -2963,11 +4269,13 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function startSegmentDrag(event) {
             if (!segmentState.enabled || !segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
             event.preventDefault();
             const point = segmentImagePoint(event, event.target);
-            if (segmentState.mode === 'polygon' || segmentState.mode === 'ignore-polygon') {
+            if (segmentState.mode === 'polygon' || segmentState.mode === 'ignore-polygon' || segmentState.mode === 'color-patch') {
                 segmentState.points.push(point);
                 renderPointModeOverlay();
+                updateColorPatchStatus();
                 return;
             }
             segmentState.dragging = true;
@@ -3031,6 +4339,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function finishPointMode() {
             if (!segmentState.enabled || !segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
             if (segmentState.mode === 'polygon') {
                 if (segmentState.points.length < 3) {
                     showOperation('Polygon skipped', 'A polygon needs at least 3 points.', 'warn');
@@ -3058,6 +4367,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                 }
                 const polygon = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
                 saveIgnoreFromEditor({ polygon });
+                return;
+            }
+            if (segmentState.mode === 'color-patch') {
+                saveColorPatchFromPoints();
                 return;
             }
             if (segmentState.mode === 'manual-corners') {
@@ -3090,8 +4403,36 @@ OBSERVATORY_DASHBOARD_HTML = """
             document.getElementById('segment-image')?.classList.remove('mask-active');
             closeManualTagModal();
             renderSegmentationEditorOverlays();
+            updateColorPatchStatus();
+        }
+        function saveColorPatchFromPoints() {
+            if (selectedSetupIsLocked()) return;
+            if (segmentState.points.length < 3) {
+                showOperation('Color patch skipped', 'A color patch needs at least 3 points.', 'warn');
+                return;
+            }
+            const boardName = prompt('Board name', 'Wall Color Board') || 'Wall Color Board';
+            const patchName = prompt('Patch name', `Patch ${(((segmentState.colorBoards[segmentState.deviceId] || [])[0] || {}).patches || []).length + 1}`) || 'Patch';
+            const code = prompt('Paint code / catalog ID', '') || '';
+            const role = prompt('Role', 'green_reference') || '';
+            const polygon = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
+            fetch('/color_board/' + segmentState.deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ board_name: boardName, patch_name: patchName, code, role, polygon })
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Color patch save failed');
+                return body;
+            }).then(() => {
+                stopPointMode();
+                showOperation('Color patch saved', `${segmentState.deviceId}: ${patchName} ${code}`);
+                loadSegments();
+                updateStats();
+            }).catch(e => showOperation('Color patch save failed', e.message, 'bad'));
         }
         function saveIgnoreFromEditor(payload) {
+            if (selectedSetupIsLocked()) return;
             fetch('/ignore_region/' + segmentState.deviceId, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -3106,6 +4447,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function clearEditorIgnores() {
             if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
             clearIgnore(segmentState.deviceId);
             selectSegmentationDevice(segmentState.deviceId);
         }
@@ -3131,6 +4473,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function manualCropClick(event) {
             if (segmentState.mode !== 'manual-corners' || !segmentState.roi) return;
+            if (selectedSetupIsLocked()) return;
             const canvas = event.target;
             const rect = canvas.getBoundingClientRect();
             const [x1, y1, x2, y2] = segmentState.roi;
@@ -3149,6 +4492,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (count) count.textContent = `${segmentState.points.length} / 4 corners`;
         }
         function resetManualTagCorners() {
+            if (selectedSetupIsLocked()) return;
             segmentState.points = [];
             drawManualCrop();
         }
@@ -3160,6 +4504,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function clearManualTagsForSelected() {
             if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
             if (!confirm(`Remove all manual tags for ${segmentState.deviceId}?`)) return;
             fetch(`/manual_marker/${segmentState.deviceId}/clear`, { method: 'POST' }).then(() => {
                 showOperation('Manual tags removed', `${segmentState.deviceId}: all manual tags removed.`);
@@ -3170,6 +4515,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function clearSegmentsForSelected() {
             if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
             if (!confirm(`Remove all saved segments for ${aliasOf(segmentState.deviceId)}?`)) return;
             fetch(`/segments/${encodeURIComponent(segmentState.deviceId)}`, { method: 'DELETE' }).then(() => {
                 showOperation('Segments cleared', `${aliasOf(segmentState.deviceId)}: all segments removed.`);
@@ -3187,15 +4533,16 @@ OBSERVATORY_DASHBOARD_HTML = """
             const sx = rect.width / Math.max(1, img.naturalWidth);
             const sy = rect.height / Math.max(1, img.naturalHeight);
             const points = segmentState.points.map(p => [p.x * sx, p.y * sy]);
-            const poly = points.length > 1 ? `<svg class="segment-box" style="left:0;top:0;width:${rect.width}px;height:${rect.height}px;padding:0;border:0;background:transparent" viewBox="0 0 ${rect.width} ${rect.height}" preserveAspectRatio="none"><polyline points="${points.map(p => p.join(',')).join(' ')}" fill="none" stroke="#77b7c5" stroke-width="2"></polyline></svg>` : '';
-            overlay.innerHTML += poly + segmentState.points.map((p, idx) => `<div class="segment-box" style="left:${p.x * sx - 5}px;top:${p.y * sy - 5}px;width:10px;height:10px">${idx + 1}</div>`).join('');
+            const stroke = segmentState.mode === 'color-patch' ? '#d8ad5f' : '#77b7c5';
+            const poly = points.length > 1 ? `<svg class="segment-box" style="left:0;top:0;width:${rect.width}px;height:${rect.height}px;padding:0;border:0;background:transparent" viewBox="0 0 ${rect.width} ${rect.height}" preserveAspectRatio="none"><polyline points="${points.map(p => p.join(',')).join(' ')}" fill="none" stroke="${stroke}" stroke-width="2"></polyline></svg>` : '';
+            overlay.innerHTML += poly + segmentState.points.map((p, idx) => `<div class="segment-box" style="left:${p.x * sx - 5}px;top:${p.y * sy - 5}px;width:10px;height:10px;border-color:${stroke}">${idx + 1}</div>`).join('');
         }
-        function renderSegmentBoxes(container, img, segments) {
+        function renderSegmentBoxes(container, img, segments, colorBoards = []) {
             if (!container || !img || !img.naturalWidth) return;
             const rect = img.getBoundingClientRect();
             const sx = rect.width / Math.max(1, img.naturalWidth);
             const sy = rect.height / Math.max(1, img.naturalHeight);
-            container.innerHTML = (segments || []).map(seg => {
+            const segmentHtml = (segments || []).map(seg => {
                 const [x1, y1, x2, y2] = seg.region || [0, 0, 0, 0];
                 if (seg.polygon && seg.polygon.length >= 3) {
                     const xs = seg.polygon.map(p => p[0]);
@@ -3206,9 +4553,19 @@ OBSERVATORY_DASHBOARD_HTML = """
                 }
                 return `<div class="segment-box" title="${seg.name || seg.id}" style="left:${x1 * sx}px;top:${y1 * sy}px;width:${(x2 - x1) * sx}px;height:${(y2 - y1) * sy}px"></div>`;
             }).join('');
+            const colorHtml = (colorBoards || []).flatMap(board => (board.patches || []).map(patch => {
+                const pts = patch.polygon || [];
+                if (pts.length < 3) return '';
+                const xs = pts.map(p => p[0]);
+                const ys = pts.map(p => p[1]);
+                const minX = Math.min(...xs), minY = Math.min(...ys);
+                const points = pts.map(p => `${(p[0] - minX) * sx},${(p[1] - minY) * sy}`).join(' ');
+                return `<svg class="segment-box" style="left:${minX * sx}px;top:${minY * sy}px;width:${(Math.max(...xs) - minX) * sx}px;height:${(Math.max(...ys) - minY) * sy}px;padding:0;border-color:#d8ad5f" viewBox="0 0 ${(Math.max(...xs) - minX) * sx} ${(Math.max(...ys) - minY) * sy}" preserveAspectRatio="none"><polygon points="${points}" fill="rgba(216,173,95,.12)" stroke="#d8ad5f" stroke-width="2"></polygon><text x="4" y="14" fill="#fff">${patch.name || patch.code || 'color'}</text></svg>`;
+            })).join('');
+            container.innerHTML = segmentHtml + colorHtml;
         }
         function renderSegmentationEditorOverlays() {
-            renderSegmentBoxes(document.getElementById('segment-overlays'), document.getElementById('segment-image'), segmentState.segments[segmentState.deviceId] || []);
+            renderSegmentBoxes(document.getElementById('segment-overlays'), document.getElementById('segment-image'), segmentState.segments[segmentState.deviceId] || [], segmentState.colorBoards[segmentState.deviceId] || []);
         }
         function renderAllSegmentOverlays() {
             Object.entries(segmentState.segments || {}).forEach(([deviceId, segments]) => {
@@ -3228,7 +4585,117 @@ OBSERVATORY_DASHBOARD_HTML = """
             const markerHtml = markers.length ? markers.map((marker, idx) => `<div class="event"><time>Tag</time><div><strong>${marker.id || 'manual'}</strong><br>${marker.size_mm} mm manual marker<br><button onclick="deleteManualMarker('${deviceId}','${marker.uid || idx}')">Remove Tag</button></div></div>`).join('') : '';
             list.innerHTML = segmentHtml + markerHtml;
         }
+        function renderColorPatchList() {
+            const list = document.getElementById('color-patch-list');
+            if (!list) return;
+            const deviceId = segmentState.deviceId || Object.keys(segmentState.colorBoards || {})[0];
+            const boards = (segmentState.colorBoards || {})[deviceId] || [];
+            const sampled = (((latestStats[deviceId] || {}).data || {}).color_boards || []);
+            const rows = boards.flatMap(board => (board.patches || []).map((patch, idx) => {
+                const sampledPatch = ((sampled.find(b => b.name === board.name) || {}).patches || []).find(p => p.uid === patch.uid) || {};
+                const rgb = sampledPatch.mean_rgb ? sampledPatch.mean_rgb.map(v => Math.round(v)).join(', ') : '--';
+                return `<div class="event"><time>${board.name || 'Board'}</time><div><strong>${patch.name || 'Patch'}</strong><br>${patch.code || '--'} ${patch.role ? '(' + patch.role + ')' : ''}<br>RGB ${rgb}, samples ${sampledPatch.samples || '--'}<br><button onclick="deleteColorPatch(${JSON.stringify(deviceId)},${JSON.stringify(board.name || 'Color Board')},${JSON.stringify(patch.uid || idx)})">Remove Patch</button></div></div>`;
+            }));
+            list.innerHTML = rows.length ? rows.join('') : '<div class="event"><time>None</time><div>No color patches saved for this camera.</div></div>';
+            renderColorReferenceStatus();
+        }
+        function applyColorReferenceSettings(deviceId, reference) {
+            colorReferenceCache[deviceId] = reference || {};
+            if (segmentState.deviceId !== deviceId) return;
+            const enabled = document.getElementById('color-reference-enabled');
+            const enabledLabel = document.getElementById('color-reference-enabled-label');
+            const mode = document.getElementById('color-reference-mode');
+            if (enabled) enabled.checked = reference.enabled !== false;
+            if (enabledLabel) enabledLabel.textContent = reference.enabled === false ? 'Off' : 'On';
+            if (mode) mode.value = reference.mode || 'off';
+            renderColorReferenceStatus();
+            applySetupLockState(deviceId);
+        }
+        function loadColorReferenceSettings(deviceId) {
+            if (!deviceId) return;
+            fetch('/color_reference/' + encodeURIComponent(deviceId))
+                .then(r => r.json())
+                .then(ref => applyColorReferenceSettings(deviceId, ref))
+                .catch(() => {});
+        }
+        function saveColorReferenceSettings() {
+            if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) {
+                applyColorReferenceSettings(segmentState.deviceId, colorReferenceCache[segmentState.deviceId] || {});
+                return;
+            }
+            const enabled = document.getElementById('color-reference-enabled')?.checked;
+            const mode = document.getElementById('color-reference-mode')?.value || 'off';
+            fetch('/color_reference/' + encodeURIComponent(segmentState.deviceId), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ enabled, mode })
+            }).then(r => r.json()).then(body => {
+                applyColorReferenceSettings(segmentState.deviceId, body.reference || {});
+                updateStats();
+                showOperation('Color reference saved', `${segmentState.deviceId}: ${enabled ? 'QA on' : 'QA off'}, correction ${mode}. Raw captures are unchanged.`);
+            });
+        }
+        function setColorReferenceBaseline() {
+            if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
+            if (!confirm(`Use the current sampled color patches as the baseline for ${segmentState.deviceId}?`)) return;
+            const enabled = document.getElementById('color-reference-enabled')?.checked;
+            const mode = document.getElementById('color-reference-mode')?.value || 'off';
+            fetch('/color_reference/' + encodeURIComponent(segmentState.deviceId), {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ enabled, mode, set_baseline: true })
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Baseline failed');
+                return body;
+            }).then(body => {
+                applyColorReferenceSettings(segmentState.deviceId, body.reference || {});
+                updateStats();
+                showOperation('Color baseline set', `${segmentState.deviceId}: current patch colors are now the drift/correction baseline.`);
+            }).catch(e => showOperation('Color baseline failed', e.message, 'bad'));
+        }
+        function renderColorReferenceStatus() {
+            const root = document.getElementById('color-reference-status');
+            if (!root || !segmentState.deviceId) return;
+            const ref = colorReferenceCache[segmentState.deviceId] || {};
+            const correction = (((latestStats[segmentState.deviceId] || {}).data || {}).color_correction || {});
+            const drift = correction.drift || {};
+            const baseline = ref.baseline || {};
+            const corrected = correction.active_corrected_color_metrics || {};
+            const raw = (((latestStats[segmentState.deviceId] || {}).data || {}).color_metrics || {});
+            const confidence = Number.isFinite(Number(drift.confidence)) ? `${Math.round(Number(drift.confidence) * 100)}%` : '--';
+            root.innerHTML = `
+                <div class="event"><time>${ref.mode || 'off'}</time><div><strong>Color correction</strong><br>Baseline: ${baseline.timestamp || 'not set'}<br>Drift: ${drift.status || 'no baseline'} (${confidence}), patches ${drift.patches || 0}<br>Green index raw ${raw.green_index !== undefined ? fmt(Number(raw.green_index), 3) : '--'} / corrected ${corrected.green_index !== undefined ? fmt(Number(corrected.green_index), 3) : '--'}</div></div>
+            `;
+        }
+        function clearColorPatchesForSelected() {
+            if (!segmentState.deviceId) return;
+            if (selectedSetupIsLocked()) return;
+            if (!confirm(`Clear all color patches for ${segmentState.deviceId}?`)) return;
+            fetch(`/color_board/${segmentState.deviceId}/clear`, { method: 'POST' }).then(() => {
+                showOperation('Color board cleared', `${segmentState.deviceId}: color patches removed.`);
+                loadSegments();
+                updateStats();
+            });
+        }
+        function deleteColorPatch(deviceId, boardName, uid) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
+            fetch(`/color_board/${encodeURIComponent(deviceId)}/${encodeURIComponent(boardName)}/${encodeURIComponent(uid)}`, { method: 'DELETE' }).then(() => {
+                showOperation('Color patch removed', `${deviceId}: ${uid}`);
+                loadSegments();
+                updateStats();
+            });
+        }
         function deleteSegment(deviceId, segmentId) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
             fetch(`/segments/${encodeURIComponent(deviceId)}/${encodeURIComponent(segmentId)}`, { method: 'DELETE' })
                 .then(r => r.json())
                 .then(body => {
@@ -3247,6 +4714,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                 .catch(e => showOperation('Segment delete failed', `${deviceId}: ${e.message}`, 'bad'));
         }
         function deleteManualMarker(deviceId, uid) {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
             fetch(`/manual_marker/${deviceId}/${uid}`, { method: 'DELETE' }).then(() => {
                 showOperation('Manual tag removed', `${deviceId}: manual tag was removed and analysis regenerated.`);
                 loadSegments();
@@ -3380,7 +4851,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             };
         }
         function defaultGrowthControl() {
-            return { windowMode: 'all', customValue: 1, customUnit: 'days', windowHours: 0, maxY: '', trim: true };
+            return { windowMode: 'all', customValue: 1, customUnit: 'days', windowHours: 0, minX: '', maxX: '', minY: '', maxY: '', trim: true, outlierSensitivity: 2.5 };
         }
         function parseWindowMode(controls) {
             const mode = controls.windowMode || 'all';
@@ -3413,7 +4884,11 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const cutoff = newest - hours * 3600000;
                 filtered = raw.filter(h => Date.parse(h.timestamp || '') >= cutoff);
             }
-            return trimHistorySpikes(filtered, valueFn, controls.trim !== false);
+            const minX = Date.parse(controls.minX || '');
+            const maxX = Date.parse(controls.maxX || '');
+            if (Number.isFinite(minX)) filtered = filtered.filter(h => Date.parse(h.timestamp || '') >= minX);
+            if (Number.isFinite(maxX)) filtered = filtered.filter(h => Date.parse(h.timestamp || '') <= maxX);
+            return trimHistoryOutliers(filtered, valueFn, controls.trim !== false, Number(controls.outlierSensitivity || 2.5));
         }
         function dataPointDensity(points) {
             return points.length > 500 ? 0 : points.length > 250 ? 1 : 2;
@@ -3444,6 +4919,10 @@ OBSERVATORY_DASHBOARD_HTML = """
             const customVisible = (controls.windowMode || 'all') === 'custom';
             const sliderHours = Math.max(1, Math.min(maxHours, Math.round(parseWindowMode(controls) || maxHours)));
             return `
+                <div class="chart-slider-row">
+                    <label class="chart-field"><span>Time scroll</span><input id="${prefix}-time-slider" type="range" min="1" max="${Math.max(1, maxHours)}" step="1" value="${sliderHours}" oninput="${updateFnName}('windowHours', this.value, false); ${updateFnName}('windowMode', 'slider', false)"><span class="range-value" id="${prefix}-time-value">${sliderHours}h</span></label>
+                    <label class="chart-field"><span>Outlier sensitivity</span><input id="${prefix}-outlier-slider" type="range" min="0.5" max="5" step="0.1" value="${controls.outlierSensitivity || 2.5}" oninput="${updateFnName}('outlierSensitivity', this.value, false)"><span class="range-value" id="${prefix}-outlier-value">${fmt(Number(controls.outlierSensitivity || 2.5), 1)}</span></label>
+                </div>
                 <label class="chart-field"><span>Time window</span><select onchange="${updateFnName}('windowMode', this.value, true)">
                     <option value="all" ${(controls.windowMode || 'all') === 'all' ? 'selected' : ''}>All data</option>
                     <option value="1h" ${controls.windowMode === '1h' ? 'selected' : ''}>Last hour</option>
@@ -3454,9 +4933,12 @@ OBSERVATORY_DASHBOARD_HTML = """
                     <option value="7d" ${controls.windowMode === '7d' ? 'selected' : ''}>Last 7 days</option>
                     <option value="custom" ${customVisible ? 'selected' : ''}>Custom</option>
                 </select></label>
-                <label class="chart-field"><span>Time scroll</span><input id="${prefix}-time-slider" type="range" min="1" max="${Math.max(1, maxHours)}" step="1" value="${sliderHours}" oninput="${updateFnName}('windowHours', this.value, false); ${updateFnName}('windowMode', 'slider', false)"><span class="range-value" id="${prefix}-time-value">${sliderHours}h</span></label>
-                <label class="chart-field"><span>Custom range</span><div class="custom-window"><input type="number" min="0" step="1" value="${controls.customValue || 1}" ${customVisible ? '' : 'disabled'} oninput="${updateFnName}('customValue', this.value, false)"><select ${customVisible ? '' : 'disabled'} onchange="${updateFnName}('customUnit', this.value, false)"><option value="hours" ${(controls.customUnit || 'days') === 'hours' ? 'selected' : ''}>Hours</option><option value="days" ${(controls.customUnit || 'days') === 'days' ? 'selected' : ''}>Days</option></select></div></label>
-                <label class="chart-field"><span>Outliers</span><select onchange="${updateFnName}('trim', this.value, false)"><option value="true" ${controls.trim !== false ? 'selected' : ''}>Trim spikes</option><option value="false" ${controls.trim === false ? 'selected' : ''}>Show all</option></select></label>
+                <label class="chart-field"><span>Outliers</span><select onchange="${updateFnName}('trim', this.value, false)"><option value="true" ${controls.trim !== false ? 'selected' : ''}>Trim outliers</option><option value="false" ${controls.trim === false ? 'selected' : ''}>Show all</option></select></label>
+                <div class="chart-input-row">
+                    <label class="chart-field"><span>X min</span><input type="datetime-local" value="${controls.minX || ''}" oninput="${updateFnName}('minX', this.value, false)"></label>
+                    <label class="chart-field"><span>X max</span><input type="datetime-local" value="${controls.maxX || ''}" oninput="${updateFnName}('maxX', this.value, false)"></label>
+                    <label class="chart-field"><span>Custom range</span><div class="custom-window"><input type="number" min="0" step="1" value="${controls.customValue || 1}" ${customVisible ? '' : 'disabled'} oninput="${updateFnName}('customValue', this.value, false)"><select ${customVisible ? '' : 'disabled'} onchange="${updateFnName}('customUnit', this.value, false)"><option value="hours" ${(controls.customUnit || 'days') === 'hours' ? 'selected' : ''}>Hours</option><option value="days" ${(controls.customUnit || 'days') === 'days' ? 'selected' : ''}>Days</option></select></div></label>
+                </div>
             `;
         }
         function renderFleetControls(stats) {
@@ -3469,9 +4951,18 @@ OBSERVATORY_DASHBOARD_HTML = """
             const maxHours = historySpanHours(histories);
             const values = entries.flatMap(([, info]) => metricSeries(info.history || [], metricKey).map(p => Number(p.y))).filter(v => Number.isFinite(v) && v > 0);
             const highest = Math.max(1, ...values);
-            const sliderValue = Math.min(Math.ceil(highest), Math.max(1, Number(fleetControls.maxY || highest)));
+            const lowest = Math.min(...values, 0);
+            const yMinValue = Math.max(0, Math.min(Math.floor(highest), Number(fleetControls.minY || lowest)));
+            const yMaxValue = Math.min(Math.ceil(highest), Math.max(1, Number(fleetControls.maxY || highest)));
             root.innerHTML = renderWindowControls('fleet', fleetControls, maxHours, 'setFleetControl') + `
-                <label class="chart-field"><span>Y max</span><input id="fleet-y-slider" type="range" min="1" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${sliderValue}" oninput="setFleetControl('maxY', this.value, false)"><span class="range-value" id="fleet-y-value">${fmt(sliderValue, 0)}</span></label>
+                <div class="chart-slider-row">
+                    <label class="chart-field"><span>Y min</span><input id="fleet-y-min-slider" type="range" min="0" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${yMinValue}" oninput="setFleetControl('minY', this.value, false)"><span class="range-value" id="fleet-y-min-value">${fmt(yMinValue, 0)}</span></label>
+                    <label class="chart-field"><span>Y max</span><input id="fleet-y-max-slider" type="range" min="1" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${yMaxValue}" oninput="setFleetControl('maxY', this.value, false)"><span class="range-value" id="fleet-y-max-value">${fmt(yMaxValue, 0)}</span></label>
+                </div>
+                <div class="chart-input-row">
+                    <label class="chart-field"><span>Y min text</span><input type="number" step="any" value="${fleetControls.minY || ''}" placeholder="${fmt(yMinValue, 0)}" oninput="setFleetControl('minY', this.value, false)"></label>
+                    <label class="chart-field"><span>Y max text</span><input type="number" step="any" value="${fleetControls.maxY || ''}" placeholder="${fmt(yMaxValue, 0)}" oninput="setFleetControl('maxY', this.value, false)"></label>
+                </div>
                 <div class="chart-field"><span>Available data</span><strong class="muted">${historyRangeLabel(histories)}</strong></div>
             `;
         }
@@ -3487,8 +4978,9 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const points = downsamplePoints(metricSeries(history, metricKey));
                 return { label: aliasOf(id), deviceId: id, data: points, borderColor: colors[idx % colors.length], backgroundColor: 'transparent', tension: 0.25, pointRadius: dataPointDensity(points) };
             }).filter(ds => ds.data.some(p => p.y !== null && p.y !== undefined));
+            const minY = Number(fleetControls.minY || 0);
             const maxY = Number(fleetControls.maxY || 0);
-            const options = { yTitle: metric.unit, maxY: maxY > 0 ? maxY : undefined, onPointClick: showFleetPointPopover };
+            const options = { yTitle: metric.unit, minY: Number.isFinite(minY) && fleetControls.minY !== '' ? minY : undefined, maxY: maxY > 0 ? maxY : undefined, onPointClick: showFleetPointPopover };
             if (!charts.fleet) {
                 charts.fleet = new Chart(ctx, { type: 'line', data: { datasets }, options: chartOptions(options) });
             } else {
@@ -3508,9 +5000,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                     growthControls[id] = controls;
                     const rawValues = ((info || {}).history || []).filter(h => !h.ignored).map(h => Number(h.area || 0)).filter(v => Number.isFinite(v) && v > 0);
                     const highest = Math.max(1, ...rawValues);
-                    const sliderValue = Math.min(Math.ceil(highest), Math.max(1, Number(controls.maxY || highest)));
+                    const yMinValue = Math.max(0, Math.min(Math.floor(highest), Number(controls.minY || 0)));
+                    const yMaxValue = Math.min(Math.ceil(highest), Math.max(1, Number(controls.maxY || highest)));
                     const maxHours = historySpanHours((info || {}).history || []);
-                    return `<div class="event" style="grid-template-columns:1fr"><div><strong>${aliasOf(id)}</strong><div class="muted">${id}</div><div class="chart-controls">${renderWindowControls('growth-' + safeId, controls, maxHours, `setGrowthControl.bind(null,'${id}')`)}<label class="chart-field"><span>Area Y max</span><input id="growth-y-${safeId}" type="range" min="1" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${sliderValue}" oninput="setGrowthControl('${id}','maxY',this.value,false)"><span class="range-value" id="growth-y-value-${safeId}">${fmt(sliderValue, 0)}</span></label><div class="chart-field"><span>Available data</span><strong class="muted">${historyRangeLabel((info || {}).history || [])}</strong></div></div><div class="chart-wrap tall"><canvas id="area-chart-${safeId}"></canvas></div><div class="chart-wrap"><canvas id="speed-chart-${safeId}"></canvas></div><div class="chart-wrap"><canvas id="green-chart-${safeId}"></canvas></div></div></div>`;
+                    return `<div class="event" style="grid-template-columns:1fr"><div><strong>${aliasOf(id)}</strong><div class="muted">${id}</div><div class="chart-controls">${renderWindowControls('growth-' + safeId, controls, maxHours, `setGrowthControl.bind(null,'${id}')`)}<div class="chart-slider-row"><label class="chart-field"><span>Area Y min</span><input id="growth-y-min-${safeId}" type="range" min="0" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${yMinValue}" oninput="setGrowthControl('${id}','minY',this.value,false)"><span class="range-value" id="growth-y-min-value-${safeId}">${fmt(yMinValue, 0)}</span></label><label class="chart-field"><span>Area Y max</span><input id="growth-y-max-${safeId}" type="range" min="1" max="${Math.ceil(highest)}" step="${Math.max(1, Math.ceil(highest / 250))}" value="${yMaxValue}" oninput="setGrowthControl('${id}','maxY',this.value,false)"><span class="range-value" id="growth-y-max-value-${safeId}">${fmt(yMaxValue, 0)}</span></label></div><div class="chart-input-row"><label class="chart-field"><span>Y min text</span><input type="number" step="any" value="${controls.minY || ''}" placeholder="${fmt(yMinValue, 0)}" oninput="setGrowthControl('${id}','minY',this.value,false)"></label><label class="chart-field"><span>Y max text</span><input type="number" step="any" value="${controls.maxY || ''}" placeholder="${fmt(yMaxValue, 0)}" oninput="setGrowthControl('${id}','maxY',this.value,false)"></label></div><div class="chart-field"><span>Available data</span><strong class="muted">${historyRangeLabel((info || {}).history || [])}</strong></div></div><div class="chart-wrap tall"><canvas id="area-chart-${safeId}"></canvas></div><div class="chart-wrap"><canvas id="speed-chart-${safeId}"></canvas></div><div class="chart-wrap"><canvas id="green-chart-${safeId}"></canvas></div></div></div>`;
                 }).join('');
             }
             drawGrowthCharts(stats);
@@ -3530,6 +5023,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 history.forEach(h => (h.segments || []).forEach(s => segmentNames.set(s.id, s.name || s.id)));
                 const yValues = history.map(h => Number(h.area || 0)).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
                 const trimmedMax = yValues.length && controls.trim !== false ? yValues[Math.max(0, Math.floor(yValues.length * 0.95) - 1)] * 1.15 : undefined;
+                const manualMin = controls.minY === '' ? undefined : Number(controls.minY);
                 const manualMax = Number(controls.maxY || 0);
                 const areaData = downsamplePoints(history.map(h => ({ x: h.timestamp || '', y: Number(h.area || 0), timestamp: h.timestamp, filename: h.filename, segmentId: null })));
                 const datasets = [{
@@ -3552,7 +5046,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                     }));
                     datasets.push({ label: name, data: points, borderColor: colors[(idx + 1) % colors.length], backgroundColor: 'transparent', tension: 0.25, pointRadius: dataPointDensity(points) });
                 });
-                renderMetricChart('area-' + id, areaCtx, datasets, { yTitle: 'mm2', maxY: manualMax > 0 ? manualMax : trimmedMax, onPointClick: (event, chart) => showGrowthPointPopover(event, chart, id) });
+                renderMetricChart('area-' + id, areaCtx, datasets, { yTitle: 'mm2', minY: Number.isFinite(manualMin) ? manualMin : undefined, maxY: manualMax > 0 ? manualMax : trimmedMax, onPointClick: (event, chart) => showGrowthPointPopover(event, chart, id) });
                 const speedData = downsamplePoints(buildGrowthSpeedSeries(history));
                 renderMetricChart('speed-' + id, speedCtx, [{ label: 'Growth speed', data: speedData, borderColor: colors[1], backgroundColor: 'transparent', tension: 0.25, pointRadius: dataPointDensity(speedData) }], { yTitle: 'mm2/hr', onPointClick: (event, chart) => showGrowthPointPopover(event, chart, id) });
                 const greenData = downsamplePoints(history.map(h => ({ x: h.timestamp || '', y: colorMetricValue(h, 'green_index'), timestamp: h.timestamp, filename: h.filename })));
@@ -3567,21 +5061,28 @@ OBSERVATORY_DASHBOARD_HTML = """
                     options: chartOptions(options)
                 });
         }
-        function trimHistorySpikes(history, valueFn, enabled) {
+        function trimHistoryOutliers(history, valueFn, enabled, sensitivity = 2.5) {
             if (!enabled || history.length < 8) return history;
-            const values = history.map(valueFn).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+            const values = history.map(valueFn).filter(v => Number.isFinite(v)).sort((a, b) => a - b);
             if (values.length < 8) return history;
-            const median = values[Math.floor(values.length / 2)];
             const q1 = values[Math.floor(values.length * 0.25)];
             const q3 = values[Math.floor(values.length * 0.75)];
             const iqr = Math.max(1, q3 - q1);
-            const upper = Math.max(median * 3, q3 + 2.5 * iqr);
+            const factor = Math.max(0.5, Math.min(5, Number(sensitivity || 2.5)));
+            const lower = q1 - factor * iqr;
+            const upper = q3 + factor * iqr;
             return history.filter(h => {
                 const value = valueFn(h);
-                return !Number.isFinite(value) || value <= upper;
+                return !Number.isFinite(value) || (value >= lower && value <= upper);
             });
         }
         function colorMetricValue(entry, key) {
+            const correction = entry.color_correction || {};
+            const corrected = correction.active_corrected_color_metrics || {};
+            if (corrected[key] !== undefined && correction.enabled !== false && correction.mode && correction.mode !== 'off') {
+                const correctedValue = Number(corrected[key]);
+                if (Number.isFinite(correctedValue)) return correctedValue;
+            }
             const value = ((entry.color_metrics || {})[key]);
             return Number.isFinite(Number(value)) ? Number(value) : null;
         }
@@ -3599,9 +5100,13 @@ OBSERVATORY_DASHBOARD_HTML = """
         function setGrowthControl(deviceId, key, value, rebuild = false) {
             growthControls[deviceId] = growthControls[deviceId] || defaultGrowthControl();
             growthControls[deviceId][key] = key === 'trim' ? value === 'true' : value;
-            if (key === 'maxY') {
-                const label = document.getElementById('growth-y-value-' + cssEscape(deviceId));
+            if (key === 'minY' || key === 'maxY') {
+                const label = document.getElementById('growth-y-' + (key === 'minY' ? 'min' : 'max') + '-value-' + cssEscape(deviceId));
                 if (label) label.textContent = fmt(Number(value), 0);
+            }
+            if (key === 'outlierSensitivity') {
+                const label = document.getElementById('growth-' + cssEscape(deviceId) + '-outlier-value');
+                if (label) label.textContent = fmt(Number(value), 1);
             }
             if (key === 'windowHours') {
                 const label = document.getElementById('growth-' + cssEscape(deviceId) + '-time-value');
@@ -3611,10 +5116,17 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function setFleetControl(key, value, rebuild = false) {
             fleetControls[key] = key === 'trim' ? value === 'true' : value;
-            if (key === 'metric') fleetControls.maxY = '';
-            if (key === 'maxY') {
-                const label = document.getElementById('fleet-y-value');
+            if (key === 'metric') {
+                fleetControls.minY = '';
+                fleetControls.maxY = '';
+            }
+            if (key === 'minY' || key === 'maxY') {
+                const label = document.getElementById('fleet-y-' + (key === 'minY' ? 'min' : 'max') + '-value');
                 if (label) label.textContent = fmt(Number(value), 0);
+            }
+            if (key === 'outlierSensitivity') {
+                const label = document.getElementById('fleet-outlier-value');
+                if (label) label.textContent = fmt(Number(value), 1);
             }
             if (key === 'windowHours') {
                 const label = document.getElementById('fleet-time-value');
@@ -3666,6 +5178,10 @@ OBSERVATORY_DASHBOARD_HTML = """
             }).then(() => { closePointPopover(); updateStats(); });
         }
         function chartOptions(extra = {}) {
+            const yMin = Number.isFinite(Number(extra.minY)) ? Number(extra.minY) : undefined;
+            const yMax = Number.isFinite(Number(extra.maxY)) ? Number(extra.maxY) : undefined;
+            const usableMin = yMin !== undefined && (yMax === undefined || yMin < yMax) ? yMin : undefined;
+            const usableMax = yMax !== undefined && (yMin === undefined || yMin < yMax) ? yMax : undefined;
             return {
                 responsive: true,
                 maintainAspectRatio: false,
@@ -3673,7 +5189,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 plugins: { legend: { display: true, position: 'bottom', labels: { color: '#cbd6d0', boxWidth: 12 } } },
                 onClick: extra.onPointClick,
                 scales: {
-                    y: { suggestedMax: extra.maxY, max: extra.maxY, title: { display: true, text: extra.yTitle || 'mm2', color: '#8c9a94' }, grid: { color: '#27312d' }, ticks: { color: '#8c9a94' } },
+                    y: { suggestedMin: usableMin, suggestedMax: usableMax, min: usableMin, max: usableMax, title: { display: true, text: extra.yTitle || 'mm2', color: '#8c9a94' }, grid: { color: '#27312d' }, ticks: { color: '#8c9a94' } },
                     x: { grid: { display: false }, ticks: { color: '#8c9a94', maxRotation: 0, autoSkip: true, maxTicksLimit: 5 } }
                 }
             };
@@ -3691,6 +5207,13 @@ OBSERVATORY_DASHBOARD_HTML = """
         function openTimelapse(deviceId) {
             const target = document.getElementById('timelapse-player-' + cssEscape(deviceId));
             if (target) target.innerHTML = `<video controls preload="metadata" src="/video/${deviceId}?t=${Date.now()}" style="margin-top:8px"></video>`;
+        }
+        function loadMissionTimelapse(deviceId) {
+            const video = document.getElementById('vid-' + deviceId);
+            if (!video) return;
+            video.src = `/video/${deviceId}?t=${Date.now()}`;
+            video.load();
+            video.play().catch(() => {});
         }
         function makeCustomTimelapse() {
             const device = document.getElementById('custom-timelapse-device')?.value;
@@ -3747,27 +5270,49 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function updateMetricStoreStatus() {
             const el = document.getElementById('metric-store-status');
-            if (!el) return;
+            const videoStatus = document.getElementById('video-import-status');
+            if (!el && !videoStatus) return;
             fetch('/metrics/backfill').then(r => r.json()).then(s => {
                 const running = Number(s.running || 0) === 1;
-                el.textContent = running
+                const text = running
                     ? `Backfill running: ${s.processed || 0}/${s.total || 0} ${s.current_device || ''} ${s.message || ''}`
                     : `Backfill ${s.message || 'idle'}: ${s.processed || 0}/${s.total || 0}`;
+                if (el) el.textContent = text;
+                if (videoStatus) videoStatus.textContent = text;
             }).catch(() => {});
         }
         function autoTuneTags(deviceId) {
-            if (!confirm(`Run an automatic tag-detection sweep for ${deviceId}? This will take several captures.`)) return;
-            showOperation('Tag sweep running', `${deviceId}: trying settle, banding, focus, exposure, and ISO combinations...`);
-            fetch('/auto_tune_tags/' + deviceId, { method: 'POST' }).then(async r => {
+            if (isSetupLocked(deviceId)) {
+                showLockedSetupMessage(deviceId);
+                return;
+            }
+            const currentExpected = Number((deviceId === segmentState.deviceId ? document.getElementById('expected-tags-input')?.value : settingsCache[deviceId]?.expected_marker_count) || 4);
+            const entered = prompt(`How many individual visible markers should this camera see? Count each single ArUco tag once, and count each visible marker inside a ChArUco board once.`, String(currentExpected));
+            if (entered === null) return;
+            const expected = Math.max(1, Math.min(50, Number(entered) || currentExpected || 4));
+            if (deviceId === segmentState.deviceId) {
+                const input = document.getElementById('expected-tags-input');
+                if (input) input.value = expected;
+            }
+            if (!confirm(`Run measurement-profile calibration for ${deviceId} expecting ${expected} visible marker(s)? This will take several captures and lock the best profile.`)) return;
+            const operationId = newOperationId('profile');
+            watchSetupOperation(operationId);
+            showOperation('Lighting calibration running', `${deviceId}: scoring tag completeness, sharpness, scale consistency, green signal, and exposure stability...`);
+            fetch('/auto_tune_tags/' + deviceId, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ expected_markers: expected, lock: true, operation_id: operationId })
+            }).then(async r => {
                 const body = await r.json();
                 if (!r.ok) throw new Error(body.message || 'Sweep failed');
                 return body;
             }).then(d => {
-                const trials = (d.trials || []).map(t => `#${t.trial}: ${t.markers} markers`).join(', ');
+                const trials = (d.trials || []).map(t => `#${t.trial}: ${t.markers}/${d.expected_markers} tags, score ${Math.round((t.score || 0) * 100)}%, sharp ${t.sharpness}`).join(', ');
                 applyDeviceSettings(deviceId, d.best_profile || {});
-                showOperation('Tag sweep complete', `${deviceId}: best result ${d.best_markers} markers. ${trials}`);
+                renderSetupWorkbench();
+                showOperation('Lighting calibration complete', `${deviceId}: best score ${Math.round((d.best_score || 0) * 100)}%, ${d.best_markers}/${d.expected_markers} tags. ${trials}`);
                 updateStats();
-            }).catch(e => showOperation('Tag sweep failed', e.message, 'bad'));
+            }).catch(e => showOperation('Lighting calibration failed', e.message, 'bad'));
         }
         function updateStats() {
             fetch('/stats').then(r => r.json()).then(stats => {
@@ -3794,12 +5339,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                     const statsEl = document.getElementById('stats-' + id);
                     if (statsEl) {
                         statsEl.innerHTML = `
-                            <div><span>Markers</span><strong>${data.markers_found || 0} detected</strong></div>
-                            <div><span>Canopy</span><strong>${fmt(area)} mm2 / ${fmt(coverage)}%</strong></div>
-                            <div><span>Growth</span><strong>${fmt(rate, 2)} mm2/hr</strong></div>
-                            <div><span>Health</span><strong>${health}</strong></div>
-                            <div><span>Scale</span><strong>${data.scale_px_per_mm ? fmt(data.scale_px_per_mm, 2) + ' px/mm' : '--'}</strong></div>
-                            <div><span>Green Index</span><strong>${color.green_index !== undefined ? fmt(color.green_index, 3) : '--'}</strong></div>
+                            <div><span>Canopy Area</span><strong>${fmt(area)} mm2</strong></div>
                         `;
                     }
                     renderCalibrationOverlays(id, data);
@@ -3818,14 +5358,16 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const plants = document.getElementById('plants-list');
                 if (plants) plants.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div><strong>${aliasOf(id)}</strong><br><span class="muted">${id}</span><br>Area ${fmt(Number((info.data || {}).plant_area_mm2 || 0))} mm2, growth ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr</div></div>`).join('');
                 const ranking = document.getElementById('trait-ranking');
-                if (ranking) ranking.innerHTML = entries.slice().sort((a, b) => Number(b[1].growth_rate_mm2_hr || 0) - Number(a[1].growth_rate_mm2_hr || 0)).map(([id, info], idx) => `<div class="event"><time>#${idx + 1}</time><div><strong>${id}</strong><br>Grow speed ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr<br>Movement proxy: collecting centroid/canopy-width history<br>Recovery: ready after harvest events are logged</div></div>`).join('');
+                if (ranking) ranking.innerHTML = entries.slice().sort((a, b) => Number(b[1].growth_rate_mm2_hr || 0) - Number(a[1].growth_rate_mm2_hr || 0)).map(([id, info], idx) => {
+                    const movement = (info.data || {}).movement || (((info.history || []).slice(-1)[0] || {}).movement) || {};
+                    return `<div class="event"><time>#${idx + 1}</time><div><strong>${id}</strong><br>Grow speed ${fmt(Number(info.growth_rate_mm2_hr || 0), 2)} mm2/hr<br>Canopy movement ${fmt(Number(movement.displacement_mm || 0), 2)} mm (${fmt(Number(movement.speed_mm_hr || 0), 2)} mm/hr)<br>Recovery can now be compared against logged harvest/treatment events.</div></div>`;
+                }).join('');
                 renderTimelapses(stats);
                 renderGrowthCharts(stats);
+                renderMovementWorkspace(stats);
                 renderAllSegmentOverlays();
+                renderColorPatchList();
                 renderSetupWorkbench();
-                const health = document.getElementById('health-list');
-                if (health) health.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div>${id}: ${((info.data || {}).markers_found || 0)} markers, health ${(info.nutrient_deficiency || {}).severity || 'collecting'}</div></div>`).join('');
-                renderDeviceCapabilities();
                 updateMetricStoreStatus();
                 const calibration = document.getElementById('calibration-list');
                 if (calibration) calibration.innerHTML = entries.map(([id, info]) => `<div class="event"><time>${((info.data || {}).markers_found || 0) ? 'Seen' : 'Missing'}</time><div>${id}: ${((info.data || {}).markers_found || 0)} markers, scale ${((info.data || {}).scale_px_per_mm || '--')} px/mm</div></div>`).join('');
@@ -3833,19 +5375,245 @@ OBSERVATORY_DASHBOARD_HTML = """
                 if (volumeCameras) volumeCameras.innerHTML = entries.map(([id, info]) => `<div class="event"><time><input class="volume-camera-check" type="checkbox" value="${id}" checked></time><div><strong>${id}</strong><br>${((info.data || {}).markers_found || 0)} markers, ChArUco corners ${((info.data || {}).charuco_corners_found || 0)}</div></div>`).join('');
             }).catch(e => console.error("Update Stats Error:", e));
         }
-        function renderDeviceCapabilities() {
-            const health = document.getElementById('health-list');
-            if (!health || health.dataset.capabilitiesLoaded === '1') return;
-            fetch('/device_capabilities').then(r => r.json()).then(caps => {
-                health.dataset.capabilitiesLoaded = '1';
-                const items = Object.entries(caps || {}).filter(([id]) => connectedDevices.has(id)).map(([id, cap]) => {
-                    const c1 = cap.camera1 || {};
-                    const c2 = cap.camera2 || {};
-                    const camera2 = c2.available ? (c2.cameras || []).map(c => `level ${c.hardware_level}, manual ${c.manual_sensor ? 'yes' : 'no'}, RAW ${c.raw ? 'yes' : 'no'}`).join('; ') : (c2.reason || 'unavailable');
-                    return `<div class="event"><time>Caps</time><div><strong>${id}</strong><br>Camera1: zoom ${c1.zoom_supported ? 'yes' : 'no'}, exposure ${c1.min_exposure_compensation ?? '--'} to ${c1.max_exposure_compensation ?? '--'}, WB ${(c1.white_balance_modes || []).join(', ') || '--'}<br>Camera2: ${camera2}</div></div>`;
-                }).join('');
-                if (items) health.innerHTML += items;
+        function loadNetworkCameraStatus(probe = false) {
+            fetch('/network_camera_status' + (probe ? '?probe=1' : '')).then(r => r.json()).then(statuses => {
+                Object.assign(networkCameraStatus, statuses || {});
+                renderMovementWorkspace(latestStats);
             }).catch(() => {});
+        }
+        function movementAxis(history) {
+            const points = (history || []).map(h => (h.movement || {}).centroid_px).filter(p => Array.isArray(p) && p.length === 2);
+            if (points.length < 2) return null;
+            const first = points[0];
+            const last = points[points.length - 1];
+            const dx = Number(last[0]) - Number(first[0]);
+            const dy = Number(last[1]) - Number(first[1]);
+            return {dx, dy, angle: Math.atan2(dy, dx) * 180 / Math.PI, samples: points.length};
+        }
+        function renderMovementWorkspace(stats) {
+            const root = document.getElementById('movement-list');
+            if (!root) return;
+            const entries = Object.entries(stats || {});
+            fetch('/biology_state').then(r => r.json()).then(body => renderRhythmList(body.rhythms || {})).catch(() => {});
+            root.innerHTML = entries.length ? entries.map(([id, info]) => {
+                const history = info.history || [];
+                const latest = ((info.data || {}).movement) || ((history.slice(-1)[0] || {}).movement) || {};
+                const axis = movementAxis(history);
+                const network = networkCameraStatus[id] || {};
+                const speed = Number(latest.speed_mm_hr || 0);
+                const droop = speed > 0.8 ? 'Watch movement spike/droop against watering events' : 'Collecting baseline';
+                const brightness = axis && Math.abs(axis.dx) > Math.abs(axis.dy) * 2 ? 'Horizontal flattening/stretch signal candidate' : 'No flattening signal yet';
+                const identity = axis ? `Axis ${fmt(axis.angle, 0)} deg from ${axis.samples} samples; useful for identity once per-plant segments are stable.` : 'Need more centroid samples.';
+                const cameraState = network.configured ? `<br>Camera: ${network.reachable ? 'online' : 'offline'} ${network.host || ''}` : '';
+                return `<div class="event"><time>${(info.timestamp || '').split(' ')[1] || '--'}</time><div><strong>${aliasOf(id)}</strong>${cameraState}<br>Movement ${fmt(Number(latest.displacement_mm || 0), 2)} mm, ${fmt(speed, 2)} mm/hr<br>Circadian: ${identity}<br>Drought/droop: ${droop}<br>Brightness/stretch: ${brightness}</div></div>`;
+            }).join('') : '<div class="event"><time>Ready</time><div>Movement analysis will populate after calibrated captures produce canopy centroids.</div></div>';
+        }
+        function loadVideoImports() {
+            const select = document.getElementById('video-import-select');
+            if (!select) return;
+            fetch('/video_imports').then(r => r.json()).then(body => {
+                const videos = body.videos || [];
+                select.innerHTML = videos.length
+                    ? videos.map(v => `<option value="${v.name}" data-device="${v.device_id}">${v.name} (${v.size_mb} MB, ${v.device_id})</option>`).join('')
+                    : '<option value="">No videos found</option>';
+                const selected = select.options[select.selectedIndex];
+                const device = document.getElementById('video-import-device');
+                if (device && selected && !device.value) device.value = selected.dataset.device || '';
+                select.onchange = () => {
+                    const option = select.options[select.selectedIndex];
+                    if (device && option) device.value = option.dataset.device || '';
+                };
+            }).catch(e => {
+                const status = document.getElementById('video-import-status');
+                if (status) status.textContent = `Video list failed: ${e.message}`;
+            });
+        }
+        function importSelectedVideo() {
+            const select = document.getElementById('video-import-select');
+            const status = document.getElementById('video-import-status');
+            const video = select?.value;
+            if (!video) {
+                if (status) status.textContent = 'Choose a video first.';
+                return;
+            }
+            const payload = {
+                video,
+                device_id: document.getElementById('video-import-device')?.value || '',
+                sample_seconds: document.getElementById('video-import-sample')?.value || 60,
+                max_frames: document.getElementById('video-import-max')?.value || 240,
+            };
+            fetch('/video_imports/import', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Video import failed');
+                return body;
+            }).then(body => {
+                if (status) status.textContent = `${body.message}. Metric backfill is running.`;
+                showOperation('Video import started', `${video}: extracting frames and analyzing movement.`);
+                updateMetricStoreStatus();
+            }).catch(e => {
+                if (status) status.textContent = e.message;
+                showOperation('Video import failed', e.message, 'bad');
+            });
+        }
+        function loadActivity() {
+            fetch('/activity').then(r => r.json()).then(body => {
+                const el = document.getElementById('activity-console');
+                if (!el) return;
+                const lines = body.lines || [];
+                el.textContent = lines.length ? lines.join('\\\\n') : 'Waiting for live activity.';
+                el.scrollTop = el.scrollHeight;
+            }).catch(() => {});
+        }
+        function loadExperiments() {
+            fetch('/experiments').then(r => r.json()).then(body => {
+                const experiments = body.experiments || [];
+                const events = body.events || [];
+                const plants = body.plants || [];
+                const biology = body.biology || {};
+                const select = document.getElementById('experiment-event-id');
+                if (select) select.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
+                const root = document.getElementById('experiments-list');
+                if (root) root.innerHTML = experiments.length ? experiments.map(item => {
+                    const related = events.filter(event => event.experiment_id === item.id).slice(-5).reverse();
+                    const eventText = related.length ? related.map(event => `${event.timestamp} ${event.type}${event.device_id ? ` (${event.device_id})` : ''}: ${event.notes || ''}`).join('<br>') : 'No events logged.';
+                    return `<div class="event"><time>${item.status || 'active'}</time><div><strong>${item.name || item.id}</strong><br>${item.hypothesis || 'No hypothesis recorded.'}<br><span class="muted">Devices: ${(item.devices || []).join(', ') || 'not assigned'}</span><br>${eventText}</div></div>`;
+                }).join('') : '<div class="event"><time>Ready</time><div>Create the first experiment above, then log interventions and observations against it.</div></div>';
+                renderPlantRecords(plants, biology.rhythms || {});
+                renderExperimentCalendar(events, plants);
+                renderBiologyAlerts(biology.alerts || []);
+                renderRhythmList(biology.rhythms || {});
+            }).catch(() => {});
+        }
+        function renderBiologyAlerts(alerts) {
+            const root = document.getElementById('biology-alerts');
+            if (!root) return;
+            root.innerHTML = alerts.length ? alerts.slice(-12).reverse().map(alert => `<div class="event"><time>${alert.severity || 'info'}</time><div><strong>${alert.type || 'alert'}</strong><br>${alert.device_id || ''}: ${alert.message || ''}</div></div>`).join('') : '<div class="event"><time>OK</time><div>No rhythm, green-index, or droop alerts yet.</div></div>';
+            alerts.slice(-6).forEach(alert => {
+                const key = `${alert.type}:${alert.device_id}:${alert.message}`;
+                if (seenAlertKeys.has(key)) return;
+                seenAlertKeys.add(key);
+                if ('Notification' in window && Notification.permission === 'granted') {
+                    new Notification(`Plant alert: ${alert.type || 'change'}`, { body: `${alert.device_id || ''}: ${alert.message || ''}` });
+                }
+            });
+        }
+        function enablePlantNotifications() {
+            if (!('Notification' in window)) {
+                showOperation('Notifications unavailable', 'This browser window does not expose desktop notifications.', 'warn');
+                return;
+            }
+            Notification.requestPermission().then(permission => {
+                showOperation('Notifications', permission === 'granted' ? 'Plant alerts can now appear as desktop notifications.' : 'Notification permission was not granted.', permission === 'granted' ? 'normal' : 'warn');
+            });
+        }
+        function renderRhythmList(rhythms) {
+            const entries = Object.entries(rhythms || {});
+            const html = entries.length ? entries.map(([id, rhythm]) => `<div class="event"><time>${fmt(Number(rhythm.period_hours || 0), 1)}h</time><div><strong>${aliasOf(id)}</strong><br>Frequency ${Number(rhythm.frequency_hz || 0).toExponential(3)} Hz, amplitude ${fmt(Number(rhythm.amplitude_px || 0), 2)} px, strength ${fmt(Number(rhythm.strength || 0), 2)}<br><span class="muted">Fingerprint: ${rhythm.fingerprint || '--'}</span></div></div>`).join('') : '<div class="event"><time>Collect</time><div>Need at least several hours of movement samples to estimate rhythm.</div></div>';
+            ['rhythm-list', 'movement-rhythm-list'].forEach(id => {
+                const root = document.getElementById(id);
+                if (root) root.innerHTML = html;
+            });
+        }
+        function renderPlantRecords(plants, rhythms) {
+            const root = document.getElementById('plant-records-list');
+            if (!root) return;
+            root.innerHTML = plants.length ? plants.map(plant => {
+                const planted = plant.planted_date || '';
+                const germ = plant.first_germination_at || '';
+                let germText = '--';
+                if (planted && germ) {
+                    const days = (Date.parse(germ) - Date.parse(planted)) / 86400000;
+                    if (Number.isFinite(days)) germText = `${fmt(days, 1)} days`;
+                }
+                const rhythm = rhythms[plant.device_id] || {};
+                return `<div class="event"><time>${plant.tray_id || plant.plant_id}</time><div><strong>${plant.plant_name || plant.plant_id}</strong> ${plant.variety ? `(${plant.variety})` : ''}<br>Device ${plant.device_id || '--'}, segment ${plant.segment_id || '--'}<br>Planted ${planted || '--'}, germination ${germ || '--'} (${germText})<br>Irrigation ${plant.irrigation || '--'} | Fertilizer ${plant.fertilizer || '--'} | Harvest ${plant.harvest || '--'}<br>Parents ${plant.parent_mother || '--'} x ${plant.parent_father || '--'}<br>Rhythm ${rhythm.frequency_hz ? Number(rhythm.frequency_hz).toExponential(3) + ' Hz' : 'collecting'}<br><span class="muted">${plant.other || ''}</span></div></div>`;
+            }).join('') : '<div class="event"><time>Ready</time><div>Add a tray or plant record above. Use segment IDs when you want per-plant tracking later.</div></div>';
+        }
+        function renderExperimentCalendar(events, plants) {
+            const root = document.getElementById('experiment-calendar');
+            if (!root) return;
+            const plantEvents = plants.flatMap(plant => {
+                const rows = [];
+                if (plant.planted_date) rows.push({timestamp: plant.planted_date, type: 'planted', notes: plant.plant_name || plant.plant_id, plant_id: plant.plant_id});
+                if (plant.first_germination_at) rows.push({timestamp: plant.first_germination_at, type: 'germination', notes: plant.plant_name || plant.plant_id, plant_id: plant.plant_id});
+                return rows;
+            });
+            const rows = [...events, ...plantEvents].sort((a, b) => Date.parse(a.timestamp || '') - Date.parse(b.timestamp || '')).slice(-40).reverse();
+            root.innerHTML = rows.length ? rows.map(event => `<div class="event"><time>${(event.timestamp || '').split(' ')[0] || '--'}</time><div><strong>${event.type || 'event'}</strong> ${event.plant_id ? `(${event.plant_id})` : ''}<br>${event.device_id || event.tray_id || ''} ${event.segment_id || ''}<br>${event.notes || ''}</div></div>`).join('') : '<div class="event"><time>Ready</time><div>Calendar fills from planted, germination, fertilizer, irrigation, harvest, and observation events.</div></div>';
+        }
+        function saveExperiment() {
+            const id = document.getElementById('experiment-id').value.trim();
+            const name = document.getElementById('experiment-name').value.trim();
+            const hypothesis = document.getElementById('experiment-hypothesis').value.trim();
+            const devices = Array.from(connectedDevices);
+            fetch('/experiments', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id, name, hypothesis, devices, status: 'active'})
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Experiment save failed');
+                return body;
+            }).then(() => {
+                showOperation('Experiment saved', `${name || id}: tracking ${devices.length} connected/configured device(s).`);
+                loadExperiments();
+            }).catch(error => showOperation('Experiment save failed', error.message, 'bad'));
+        }
+        function logExperimentEvent() {
+            const experimentId = document.getElementById('experiment-event-id').value;
+            const type = document.getElementById('experiment-event-type').value;
+            const deviceId = document.getElementById('experiment-event-device').value;
+            const plantId = document.getElementById('experiment-event-plant').value.trim();
+            const notes = document.getElementById('experiment-event-notes').value.trim();
+            fetch('/experiment_events', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({experiment_id: experimentId, type, device_id: deviceId, plant_id: plantId, tray_id: plantId, notes})
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Event save failed');
+                return body;
+            }).then(() => {
+                document.getElementById('experiment-event-notes').value = '';
+                showOperation('Experiment event logged', `${type}${deviceId ? ` for ${deviceId}` : ''}.`);
+                loadExperiments();
+            }).catch(error => showOperation('Event save failed', error.message, 'bad'));
+        }
+        function savePlantRecord() {
+            const experimentId = document.getElementById('experiment-event-id')?.value || document.getElementById('experiment-id')?.value || '';
+            const payload = {
+                plant_id: document.getElementById('plant-record-id').value.trim(),
+                experiment_id: experimentId,
+                tray_id: document.getElementById('plant-record-id').value.trim(),
+                plant_name: document.getElementById('plant-record-name').value.trim(),
+                variety: document.getElementById('plant-record-variety').value.trim(),
+                planted_date: document.getElementById('plant-record-planted').value,
+                first_germination_at: document.getElementById('plant-record-germination').value,
+                device_id: document.getElementById('plant-record-device').value.trim(),
+                segment_id: document.getElementById('plant-record-segment').value.trim(),
+                irrigation: document.getElementById('plant-record-irrigation').value.trim(),
+                fertilizer: document.getElementById('plant-record-fertilizer').value.trim(),
+                harvest: document.getElementById('plant-record-harvest').value.trim(),
+                parent_mother: document.getElementById('plant-record-mother').value.trim(),
+                parent_father: document.getElementById('plant-record-father').value.trim(),
+                other: document.getElementById('plant-record-notes').value.trim(),
+            };
+            fetch('/plant_records', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Plant save failed');
+                return body;
+            }).then(() => {
+                showOperation('Plant/tray saved', `${payload.plant_name || payload.plant_id}: record updated.`);
+                loadExperiments();
+            }).catch(error => showOperation('Plant save failed', error.message, 'bad'));
         }
         setInterval(() => {
             if (document.hidden) {
@@ -3854,17 +5622,25 @@ OBSERVATORY_DASHBOARD_HTML = """
             }
             refreshVisibleFrames();
             updateStats();
+            loadActivity();
+            if (activeView === 'experiments') loadExperiments();
         }, 30000);
         document.addEventListener('visibilitychange', () => {
             pauseHiddenVideos();
             if (!document.hidden) {
                 refreshVisibleFrames();
                 updateStats();
+                loadActivity();
             }
         });
         loadDeviceSettings();
+        loadAdbTransportStatus();
+        loadNetworkCameraStatus(true);
+        loadExperiments();
+        loadActivity();
         loadSegments();
         updateStats();
+        setInterval(loadActivity, 2500);
         window.addEventListener('resize', () => {
             Object.entries(latestStats || {}).forEach(([id, info]) => renderCalibrationOverlays(id, (info || {}).data || {}));
         });
@@ -3879,6 +5655,7 @@ def run_app():
     load_device_aliases()
     load_device_metadata()
     load_video_manifest()
+    load_night_skip_state()
     # Start the timelapse thread immediately
     t = threading.Thread(target=timelapse_loop, daemon=True)
     t.start()
