@@ -104,8 +104,46 @@ def ensure_db():
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS plant_metric_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plant_id TEXT NOT NULL,
+                    tray_id TEXT,
+                    cell_id TEXT,
+                    device_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    area REAL,
+                    coverage REAL,
+                    canopy_pixels INTEGER,
+                    delta_pixels INTEGER,
+                    status TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(plant_id, filename)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lighting_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    from_mode TEXT,
+                    to_mode TEXT NOT NULL,
+                    filename TEXT,
+                    luma REAL,
+                    confidence REAL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(device_id, timestamp, to_mode)
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_metric_history_device_time ON metric_history(device_id, timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_metric_history_device_ignored ON metric_history(device_id, ignored)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_plant_metric_history_plant_time ON plant_metric_history(plant_id, timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_lighting_transitions_device_time ON lighting_transitions(device_id, timestamp)")
             conn.execute(
                 """
                 INSERT OR IGNORE INTO backfill_status
@@ -173,6 +211,141 @@ def upsert_history_point(device_id, entry):
         )
 
 
+def upsert_plant_metric_points(device_id, timestamp, filename, cells):
+    rows = [cell for cell in (cells or []) if cell.get("plant_id")]
+    if not rows:
+        return 0
+    with connect() as conn:
+        for cell in rows:
+            conn.execute(
+                """
+                INSERT INTO plant_metric_history (
+                    plant_id, tray_id, cell_id, device_id, timestamp, filename,
+                    area, coverage, canopy_pixels, delta_pixels, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plant_id, filename) DO UPDATE SET
+                    tray_id=excluded.tray_id,
+                    cell_id=excluded.cell_id,
+                    device_id=excluded.device_id,
+                    timestamp=excluded.timestamp,
+                    area=excluded.area,
+                    coverage=excluded.coverage,
+                    canopy_pixels=excluded.canopy_pixels,
+                    delta_pixels=excluded.delta_pixels,
+                    status=excluded.status
+                """,
+                (
+                    cell.get("plant_id"),
+                    cell.get("tray_id"),
+                    cell.get("cell_id"),
+                    device_id,
+                    timestamp,
+                    filename,
+                    cell.get("area_mm2"),
+                    cell.get("coverage"),
+                    cell.get("canopy_pixels"),
+                    cell.get("delta_pixels"),
+                    cell.get("status"),
+                ),
+            )
+    return len(rows)
+
+
+def history_for_plant(plant_id, max_points=MAX_DASHBOARD_POINTS):
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM plant_metric_history
+            WHERE plant_id = ?
+            ORDER BY timestamp
+            LIMIT ?
+            """,
+            (plant_id, max_points),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def latest_lighting_transition(device_id):
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM lighting_transitions
+            WHERE device_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (device_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_lighting_transition(device_id, timestamp, to_mode, filename=None, luma=None, confidence=None):
+    previous = latest_lighting_transition(device_id)
+    from_mode = previous.get("to_mode") if previous else None
+    if from_mode == to_mode:
+        return None
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO lighting_transitions (
+                device_id, timestamp, from_mode, to_mode, filename, luma, confidence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (device_id, timestamp, from_mode, to_mode, filename, luma, confidence),
+        )
+    return {
+        "device_id": device_id,
+        "timestamp": timestamp,
+        "from_mode": from_mode,
+        "to_mode": to_mode,
+        "filename": filename,
+        "luma": luma,
+        "confidence": confidence,
+    }
+
+
+def lighting_transitions_for_device(device_id, limit=200):
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM lighting_transitions
+            WHERE device_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (device_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def all_lighting_transitions(limit=100000):
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM lighting_transitions
+            ORDER BY device_id, timestamp
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def all_plant_history(limit=100000):
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM plant_metric_history
+            ORDER BY plant_id, timestamp
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def row_to_history(row):
     def load_json(key, fallback):
         raw = row[key]
@@ -184,6 +357,7 @@ def row_to_history(row):
             return fallback
 
     return {
+        "device_id": row["device_id"],
         "timestamp": row["timestamp"],
         "filename": row["filename"],
         "scale": row["scale"],
@@ -206,6 +380,13 @@ def list_devices():
     with connect() as conn:
         rows = conn.execute("SELECT DISTINCT device_id FROM metric_history ORDER BY device_id").fetchall()
     return [row["device_id"] for row in rows]
+
+
+def all_device_history(limit_per_device=100000):
+    rows = []
+    for device_id in list_devices():
+        rows.extend(history_for_device(device_id, max_points=limit_per_device))
+    return rows
 
 
 def history_for_device(device_id, max_points=MAX_DASHBOARD_POINTS):

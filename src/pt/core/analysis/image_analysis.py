@@ -8,8 +8,9 @@ from pt.core.utils.path_utils import get_data_root
 from pt.core.analysis.metrics import build_metrics_snapshot
 from pt.core.analysis.calibration_store import calib_store
 from pt.core.analysis.charuco_catalog import default_target, load_catalog
-from pt.core.analysis.metric_store import refresh_rollups, upsert_history_point
+from pt.core.analysis.metric_store import refresh_rollups, upsert_history_point, upsert_plant_metric_points
 from pt.core.analysis.segmentation_store import segmentation_store
+from pt.core.analysis.tray_store import analyze_device_cells
 
 # Common ArUco dictionaries to check
 DICTIONARIES = {
@@ -115,7 +116,80 @@ def charuco_bbox(charuco_corners):
     }
 
 
-def detect_charuco_target(gray, params, device_id=None):
+def _charuco_homography(charuco_detection):
+    if not charuco_detection:
+        return None
+    target = charuco_detection.get("target") or {}
+    corners = charuco_detection.get("charuco_corners")
+    ids = charuco_detection.get("charuco_ids")
+    if corners is None or ids is None or len(ids) < 4:
+        return None
+    board = get_charuco_board(target=target)
+    object_corners = np.asarray(board.getChessboardCorners(), dtype=np.float32)
+    source = []
+    destination = []
+    for idx, corner_id in enumerate(ids.reshape(-1)):
+        corner_id = int(corner_id)
+        if 0 <= corner_id < len(object_corners):
+            source.append(object_corners[corner_id][:2])
+            destination.append(corners[idx][0])
+    if len(source) < 4:
+        return None
+    homography, _ = cv2.findHomography(np.asarray(source), np.asarray(destination), cv2.RANSAC, 3.0)
+    return homography
+
+
+def _project_charuco_polygon(charuco_detection, polygon_mm):
+    homography = _charuco_homography(charuco_detection)
+    if homography is None or not polygon_mm or len(polygon_mm) < 3:
+        return None
+    projected = cv2.perspectiveTransform(
+        np.asarray(polygon_mm, dtype=np.float32).reshape(1, -1, 2),
+        homography,
+    )[0]
+    return projected
+
+
+def charuco_board_polygon(charuco_detection):
+    target = (charuco_detection or {}).get("target") or {}
+    try:
+        width = float(target["squares_x"]) * float(target["square_size_mm"])
+        height = float(target["squares_y"]) * float(target["square_size_mm"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return _project_charuco_polygon(charuco_detection, [[0, 0], [width, 0], [width, height], [0, height]])
+
+
+def charuco_ignore_mask(image_shape, charuco_detections, color_boards=None, dilation_px=9):
+    height, width = image_shape[:2]
+    ignore = np.zeros((height, width), dtype=np.uint8)
+    ignored_boards = 0
+    ignored_patches = 0
+    for detection in charuco_detections or []:
+        board_polygon = charuco_board_polygon(detection)
+        if board_polygon is not None and len(board_polygon) >= 3:
+            pts = np.round(board_polygon).astype(np.int32)
+            cv2.fillPoly(ignore, [pts], 255)
+            ignored_boards += 1
+    for board in color_boards or []:
+        if board.get("source") != "charuco_native":
+            continue
+        for patch in board.get("patches") or []:
+            polygon = patch.get("polygon")
+            if polygon and len(polygon) >= 3:
+                cv2.fillPoly(ignore, [np.round(np.asarray(polygon, dtype=np.float32)).astype(np.int32)], 255)
+                ignored_patches += 1
+    if dilation_px > 0 and cv2.countNonZero(ignore) > 0:
+        kernel = np.ones((int(dilation_px), int(dilation_px)), np.uint8)
+        ignore = cv2.dilate(ignore, kernel, iterations=1)
+    return ignore, {
+        "ignored_charuco_boards": ignored_boards,
+        "ignored_charuco_patches": ignored_patches,
+        "ignored_charuco_pixels": int(cv2.countNonZero(ignore)),
+    }
+
+
+def detect_charuco_targets(gray, params, device_id=None):
     targets = get_charuco_targets(device_id)
     dictionary_name = targets[0]["dictionary"]
     aruco_dict = DICTIONARIES[dictionary_name]
@@ -124,7 +198,7 @@ def detect_charuco_target(gray, params, device_id=None):
     if marker_ids is None or len(marker_ids) == 0:
         return None
 
-    best = None
+    detections = []
     for target in targets:
         board = get_charuco_board(device_id, target)
         charuco_corners = None
@@ -150,19 +224,29 @@ def detect_charuco_target(gray, params, device_id=None):
             "charuco_bbox": charuco_bbox(charuco_corners),
             "target": target,
         }
-        if best is None or candidate["score"] > best["score"]:
-            best = candidate
+        if candidate["score"] >= 4:
+            candidate.pop("score", None)
+            candidate["board_polygon"] = make_json_safe(charuco_board_polygon(candidate))
+            detections.append(candidate)
 
+    detections.sort(key=lambda item: 0 if item.get("charuco_ids") is None else len(item.get("charuco_ids")), reverse=True)
+    return detections
+
+
+def detect_charuco_target(gray, params, device_id=None):
+    targets = get_charuco_targets(device_id)
+    detections = detect_charuco_targets(gray, params, device_id)
+    best = detections[0] if detections else None
     if best is None:
         return None
-    best.pop("score", None)
     best["available_targets"] = [
         {"name": target.get("name"), "ids": target.get("ids"), "square_size_mm": target.get("square_size_mm"), "marker_size_mm": target.get("marker_size_mm")}
         for target in targets
     ]
+    best["charuco_detections"] = detections
     return best
 
-def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
+def calculate_canopy_metrics(frame, px_per_mm, device_id=None, auto_ignore_mask=None):
     """Segment canopy pixels and report calibrated area plus color features."""
     if px_per_mm is None or px_per_mm == 0:
         return {
@@ -172,9 +256,11 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
             "bounding_box": None,
             "color_metrics": {},
             "mask": None,
+            "auto_ignore": {},
         }
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    working_frame = frame.copy()
+    hsv = cv2.cvtColor(working_frame, cv2.COLOR_BGR2HSV)
 
     # Apply ignore regions if any
     if device_id:
@@ -186,16 +272,23 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
             if y2 > y1 and x2 > x1:
                 # Black out ignored region in HSV (or set S=0, V=0)
                 hsv[y1:y2, x1:x2] = 0
-                frame[y1:y2, x1:x2] = 0
+                working_frame[y1:y2, x1:x2] = 0
         for polygon in calib_store.get_ignore_polygons(device_id):
             if len(polygon) >= 3:
                 pts = np.array(polygon, dtype=np.int32)
                 poly_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
                 cv2.fillPoly(poly_mask, [pts], 255)
                 hsv[poly_mask > 0] = 0
-                frame[poly_mask > 0] = 0
+                working_frame[poly_mask > 0] = 0
 
-    b, g, r = cv2.split(frame.astype(np.float32))
+    auto_ignore = {}
+    if auto_ignore_mask is not None and cv2.countNonZero(auto_ignore_mask) > 0:
+        auto_ignore_mask = auto_ignore_mask.astype(np.uint8)
+        hsv[auto_ignore_mask > 0] = 0
+        working_frame[auto_ignore_mask > 0] = 0
+        auto_ignore = {"ignored_pixels": int(cv2.countNonZero(auto_ignore_mask))}
+
+    b, g, r = cv2.split(working_frame.astype(np.float32))
 
     exg = (2 * g) - r - b
     exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -231,8 +324,8 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
             "center": [float(x + w / 2.0), float(y + h / 2.0)],
         }
         selected_hsv = hsv[mask > 0]
-        selected_bgr = frame[mask > 0].astype(np.float32)
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        selected_bgr = working_frame[mask > 0].astype(np.float32)
+        lab = cv2.cvtColor(working_frame, cv2.COLOR_BGR2LAB)
         selected_lab = lab[mask > 0].astype(np.float32)
 
         selected_b = selected_bgr[:, 0]
@@ -264,6 +357,7 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None):
         "bounding_box": bbox,
         "color_metrics": color_metrics,
         "mask": mask,
+        "auto_ignore": auto_ignore,
     }
 
 
@@ -297,24 +391,7 @@ def sample_native_charuco_colors(image, charuco_detection):
         return []
     target = charuco_detection.get("target") or {}
     patch_specs = target.get("color_patches") or []
-    corners = charuco_detection.get("charuco_corners")
-    ids = charuco_detection.get("charuco_ids")
-    if not patch_specs or corners is None or ids is None or len(ids) < 4:
-        return []
-
-    board = get_charuco_board(target=target)
-    object_corners = np.asarray(board.getChessboardCorners(), dtype=np.float32)
-    source = []
-    destination = []
-    for idx, corner_id in enumerate(ids.reshape(-1)):
-        corner_id = int(corner_id)
-        if 0 <= corner_id < len(object_corners):
-            source.append(object_corners[corner_id][:2])
-            destination.append(corners[idx][0])
-    if len(source) < 4:
-        return []
-    homography, _ = cv2.findHomography(np.asarray(source), np.asarray(destination), cv2.RANSAC, 3.0)
-    if homography is None:
+    if not patch_specs:
         return []
 
     board_width = float(target["squares_x"]) * float(target["square_size_mm"])
@@ -329,10 +406,9 @@ def sample_native_charuco_colors(image, charuco_detection):
             ]
         if not polygon or len(polygon) < 3:
             continue
-        projected = cv2.perspectiveTransform(
-            np.asarray(polygon, dtype=np.float32).reshape(1, -1, 2),
-            homography,
-        )[0]
+        projected = _project_charuco_polygon(charuco_detection, polygon)
+        if projected is None:
+            continue
         sampled = _sample_patch_pixels(image, projected)
         if not sampled:
             continue
@@ -369,7 +445,18 @@ def sample_color_boards(image, device_id, charuco_detection=None):
             })
             patches.append(sampled_patch)
         sampled.append({"name": board.get("name"), "patches": patches})
-    return sample_native_charuco_colors(image, charuco_detection) + sampled
+    detections = []
+    if charuco_detection:
+        detections = charuco_detection.get("charuco_detections") or [charuco_detection]
+    native = []
+    seen = set()
+    for detection in detections:
+        name = ((detection.get("target") or {}).get("name") or "")
+        if name in seen:
+            continue
+        seen.add(name)
+        native.extend(sample_native_charuco_colors(image, detection))
+    return native + sampled
 
 
 def native_reference_baseline(color_boards):
@@ -514,9 +601,15 @@ def calculate_color_correction(frame, mask, device_id, current_boards):
     reference = calib_store.get_color_reference(device_id) if device_id else {}
     baseline = (reference or {}).get("baseline") or {}
     baseline_boards = baseline.get("color_boards") or []
-    native_baseline = native_reference_baseline(current_boards)
-    if native_baseline:
+    baseline_source = baseline.get("source") or ("locked_sample" if baseline_boards else None)
+    if baseline_boards and baseline_source == "charuco_native":
+        baseline_source = "locked_charuco_sample"
+    if not baseline_boards:
+        native_baseline = native_reference_baseline(current_boards)
         baseline_boards = native_baseline
+        baseline_source = "charuco_native_reference" if native_baseline else None
+    else:
+        baseline_source = baseline_source or "locked_sample"
     enabled = bool(reference.get("enabled", True))
     mode = reference.get("mode", "off")
     drift = compute_color_drift(current_boards, baseline_boards) if baseline_boards else {"status": "no_baseline", "confidence": 0.0}
@@ -524,6 +617,7 @@ def calculate_color_correction(frame, mask, device_id, current_boards):
         "enabled": enabled,
         "mode": mode,
         "baseline_timestamp": baseline.get("timestamp"),
+        "baseline_source": baseline_source,
         "drift": drift,
         "simple": None,
         "advanced": None,
@@ -721,6 +815,24 @@ def serialize_analysis_results(results):
         serializable["mask_path"] = mask_path
     return serializable
 
+
+def summarize_charuco_detections(detections):
+    summaries = []
+    for detection in detections or []:
+        target = detection.get("target") or {}
+        charuco_ids = detection.get("charuco_ids")
+        marker_ids = detection.get("marker_ids")
+        summaries.append({
+            "name": target.get("name"),
+            "ids": target.get("ids"),
+            "charuco_corners_found": 0 if charuco_ids is None else int(len(charuco_ids)),
+            "markers_found": 0 if marker_ids is None else int(len(marker_ids)),
+            "charuco_bbox": detection.get("charuco_bbox"),
+            "board_polygon": detection.get("board_polygon"),
+            "scale_px_per_mm": detection.get("charuco_scale_px_per_mm"),
+        })
+    return summaries
+
 def analyze_image(image_path, device_id=None):
     """
     Detects ArUco markers with aggressive multi-channel fallback for 3D prints & grow lights.
@@ -876,18 +988,39 @@ def analyze_image(image_path, device_id=None):
                 results["scale_source"] = "charuco_corner_spacing"
 
             if charuco_detection:
+                all_charuco_detections = charuco_detection.get("charuco_detections") or [charuco_detection]
                 results["charuco_corners_found"] = (
                     0 if charuco_detection["charuco_ids"] is None
                     else int(len(charuco_detection["charuco_ids"]))
                 )
                 results["charuco_target"] = charuco_detection.get("target")
                 results["charuco_bbox"] = charuco_detection.get("charuco_bbox")
+                results["charuco_detections"] = summarize_charuco_detections(all_charuco_detections)
+            else:
+                all_charuco_detections = []
 
             results["color_boards"] = sample_color_boards(frame, device_id, charuco_detection)
-            canopy = calculate_canopy_metrics(frame, results["scale_px_per_mm"], device_id)
+            auto_ignore_mask, auto_ignore = charuco_ignore_mask(
+                frame.shape,
+                all_charuco_detections,
+                results.get("color_boards") or [],
+            )
+            canopy = calculate_canopy_metrics(
+                frame,
+                results["scale_px_per_mm"],
+                device_id,
+                auto_ignore_mask=auto_ignore_mask,
+            )
             plant_area = canopy["canopy_area_mm2"]
             plant_mask = canopy["mask"]
             color_correction = calculate_color_correction(frame, plant_mask, device_id, results.get("color_boards", []))
+            tray_cells = analyze_device_cells(
+                device_id,
+                plant_mask,
+                results["scale_px_per_mm"],
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                os.path.basename(image_path),
+            ) if device_id else []
             results.update({
                 "plant_area_mm2": plant_area,
                 "canopy_area_mm2": plant_area,
@@ -896,8 +1029,10 @@ def analyze_image(image_path, device_id=None):
                 "canopy_bounding_box": canopy["bounding_box"],
                 "color_metrics": canopy["color_metrics"],
                 "color_correction": color_correction,
+                "auto_ignore": {**auto_ignore, **(canopy.get("auto_ignore") or {})},
                 "mask": plant_mask,
                 "segments": calculate_segment_metrics(plant_mask, results["scale_px_per_mm"], device_id),
+                "tray_cells": tray_cells,
             })
 
             # Highlight plant in debug view (subtle green tint)
@@ -1079,6 +1214,7 @@ def process_latest_captures(captures_dir):
                     "area": current_area,
                     "growth_rate_mm2_hr": growth_rate,
                     "segments": results.get("segments", []),
+                    "tray_cells": results.get("tray_cells", []),
                     "canopy_coverage": results.get("canopy_coverage"),
                     "color_metrics": results.get("color_metrics"),
                     "color_correction": results.get("color_correction"),
@@ -1088,6 +1224,7 @@ def process_latest_captures(captures_dir):
                 }
                 history.append(history_entry)
                 upsert_history_point(device_id, history_entry)
+                upsert_plant_metric_points(device_id, history_entry["timestamp"], files[-1], results.get("tray_cells", []))
                 refresh_rollups(device_id)
                 all_stats[device_id]["history"] = history[-MAX_HISTORY_ENTRIES:]
 

@@ -5,15 +5,19 @@ import threading
 import subprocess
 import json
 import shutil
+import csv
+import io
+import zipfile
 import cv2
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template_string, jsonify, send_from_directory, request, Response, stream_with_context
+from flask import Flask, render_template_string, jsonify, send_from_directory, request, Response, stream_with_context, send_file
 
 from pt.core.analysis import process_latest_captures
 from pt.core.analysis.calibration_store import calib_store
 import pt.core.analysis.metric_store as metric_store
 from pt.core.analysis.segmentation_store import segmentation_store
+from pt.core.analysis.tray_store import add_cell, delete_cell, list_trays, set_cell_status, upsert_tray
 from pt.core.analysis.volumetric import calibrate_extrinsics, reconstruct_visual_hull
 from pt.core.experiments import add_event, load_events, load_experiments, load_plant_records, upsert_experiment, upsert_plant_record
 from pt.core.utils.path_utils import get_captures_dir, get_data_root
@@ -182,6 +186,80 @@ def _frame_timestamp(filename):
         return datetime.strptime(f"{match.group(2)}_{match.group(3)}", "%Y%m%d_%H%M%S")
     except ValueError:
         return None
+
+
+def network_camera_statuses(probe=False):
+    return {
+        camera_id: network_camera_status(camera_id, probe=probe)
+        for camera_id in configured_camera_ids()
+    }
+
+
+def reachable_network_camera_ids(statuses=None, probe=False):
+    statuses = statuses if statuses is not None else network_camera_statuses(probe=probe)
+    return [
+        camera_id
+        for camera_id, status in statuses.items()
+        if status.get("configured") and status.get("reachable")
+    ]
+
+
+def visible_device_ids(statuses=None, probe_network=False):
+    seen = set()
+    devices = []
+    for device_id in detect_connected_devices() + reachable_network_camera_ids(statuses, probe=probe_network):
+        if device_id and device_id not in seen:
+            devices.append(device_id)
+            seen.add(device_id)
+    return devices
+
+
+def _parse_capture_timestamp(timestamp):
+    if not timestamp:
+        return None
+    try:
+        return datetime.strptime(str(timestamp), "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def _format_capture_timestamp(dt):
+    return dt.strftime("%Y%m%d_%H%M%S")
+
+
+def _format_display_timestamp(timestamp):
+    dt = _parse_capture_timestamp(timestamp)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else str(timestamp or "unknown")
+
+
+def _capture_timestamp_to_display(timestamp):
+    dt = _parse_capture_timestamp(timestamp)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _light_transition_confidence(luma):
+    if luma is None:
+        return None
+    distance = abs(float(luma) - NIGHT_LUMA_THRESHOLD)
+    return round(max(0.0, min(1.0, distance / max(1.0, NIGHT_LUMA_THRESHOLD))), 3)
+
+
+def record_light_transition_if_changed(device_id, timestamp, mode, filename=None, luma=None):
+    normalized = "dark" if mode == "night_ir" else "light"
+    transition = metric_store.record_lighting_transition(
+        device_id,
+        _capture_timestamp_to_display(timestamp),
+        normalized,
+        filename=filename,
+        luma=luma,
+        confidence=_light_transition_confidence(luma),
+    )
+    if transition and transition.get("from_mode"):
+        log_activity(
+            f"Lighting transition recorded: {transition['from_mode']} -> {transition['to_mode']} at {transition['timestamp']}.",
+            device_id,
+        )
+    return transition
 
 
 def _frame_files_for_device(device_id, start_dt=None, end_dt=None):
@@ -447,6 +525,39 @@ def _format_duration(seconds):
     return f"{secs}s"
 
 
+def _parse_display_timestamp(timestamp):
+    try:
+        return datetime.strptime(str(timestamp), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def lighting_summary(device_id):
+    transitions = list(reversed(metric_store.lighting_transitions_for_device(device_id, limit=20)))
+    summary = {
+        "first_dark": None,
+        "first_light": None,
+        "dark_seconds": None,
+        "light_seconds": None,
+    }
+    for transition in transitions:
+        if transition.get("to_mode") == "dark":
+            summary["first_dark"] = transition.get("timestamp")
+        elif transition.get("to_mode") == "light":
+            summary["first_light"] = transition.get("timestamp")
+    for prev, current in zip(transitions, transitions[1:]):
+        start = _parse_display_timestamp(prev.get("timestamp"))
+        end = _parse_display_timestamp(current.get("timestamp"))
+        if not start or not end or end < start:
+            continue
+        seconds = (end - start).total_seconds()
+        if prev.get("to_mode") == "dark" and current.get("to_mode") == "light":
+            summary["dark_seconds"] = seconds
+        elif prev.get("to_mode") == "light" and current.get("to_mode") == "dark":
+            summary["light_seconds"] = seconds
+    return summary
+
+
 def load_night_skip_state():
     night_skip_started.clear()
     if not os.path.exists(night_skip_state_file):
@@ -467,29 +578,56 @@ def save_night_skip_state():
 
 
 def start_night_skip(device_id, timestamp):
-    if device_id not in night_skip_started:
+    state = night_skip_started.get(device_id)
+    now = time.time()
+    if not state:
         night_skip_started[device_id] = {
-            "started_at": time.time(),
+            "started_at": now,
+            "last_seen_at": now,
+            "first_timestamp": timestamp,
+            "last_timestamp": timestamp,
             "timestamp": timestamp,
         }
-        save_night_skip_state()
+    else:
+        state.setdefault("first_timestamp", state.get("timestamp") or timestamp)
+        state.setdefault("timestamp", state.get("first_timestamp") or timestamp)
+        state["last_seen_at"] = now
+        state["last_timestamp"] = timestamp
+    save_night_skip_state()
 
 
-def finish_night_skip(device_id, logger=None):
+def finish_night_skip(device_id, logger=None, daylight_timestamp=None):
     state = night_skip_started.pop(device_id, None)
     if not state:
         return None
     save_night_skip_state()
     started_at = float(state.get("started_at") or time.time())
-    timestamp = state.get("timestamp") or time.strftime("%Y%m%d_%H%M%S", time.localtime(started_at))
-    duration = max(0.0, time.time() - started_at)
-    placeholder = create_night_placeholder(device_id, timestamp, duration)
+    first_timestamp = state.get("first_timestamp") or state.get("timestamp") or time.strftime("%Y%m%d_%H%M%S", time.localtime(started_at))
+    last_timestamp = state.get("last_timestamp") or first_timestamp
+    end_timestamp = daylight_timestamp or last_timestamp
+    start_dt = _parse_capture_timestamp(first_timestamp)
+    end_dt = _parse_capture_timestamp(end_timestamp)
+    if start_dt and end_dt and end_dt >= start_dt:
+        duration = (end_dt - start_dt).total_seconds()
+        placeholder_dt = start_dt + ((end_dt - start_dt) / 2)
+        placeholder_timestamp = _format_capture_timestamp(placeholder_dt)
+    else:
+        duration = max(0.0, time.time() - started_at)
+        placeholder_timestamp = first_timestamp
+    placeholder = create_night_placeholder(
+        device_id,
+        placeholder_timestamp,
+        duration,
+        first_timestamp=first_timestamp,
+        last_timestamp=last_timestamp,
+        daylight_timestamp=daylight_timestamp,
+    )
     if logger:
         logger.log(f"Night interval summarized in {placeholder}: {_format_duration(duration)}.", major=True)
     return placeholder
 
 
-def create_night_placeholder(device_id, timestamp, duration_seconds):
+def create_night_placeholder(device_id, timestamp, duration_seconds, first_timestamp=None, last_timestamp=None, daylight_timestamp=None):
     device_dir = os.path.join(CAPTURES_DIR, device_id)
     os.makedirs(device_dir, exist_ok=True)
     filename = f"night_{timestamp}.jpg"
@@ -504,12 +642,24 @@ def create_night_placeholder(device_id, timestamp, duration_seconds):
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (1280, 720), (8, 14, 12), -1)
     frame = cv2.addWeighted(overlay, 0.78, frame, 0.22, 0)
+    summary = lighting_summary(device_id)
+    first_dark = summary.get("first_dark") or _format_display_timestamp(first_timestamp or timestamp)
+    first_light = summary.get("first_light") or (_format_display_timestamp(daylight_timestamp) if daylight_timestamp else "collecting")
+    dark_duration = summary.get("dark_seconds")
+    light_duration = summary.get("light_seconds")
     lines = [
-        "Night interval",
+        "Past 24h lighting",
         f"{device_aliases.get(device_id, device_id)}",
-        f"Duration: {_format_duration(duration_seconds)}",
-        "Night frame collection disabled",
+        f"Dark started: {first_dark}",
+        f"Light started: {first_light}",
+        f"Dark: {_format_duration(dark_duration if dark_duration is not None else duration_seconds)}",
     ]
+    if light_duration is not None:
+        lines.append(f"Light: {_format_duration(light_duration)}")
+    lines.extend([
+        "Estimated from capture transitions",
+        "Record at night disabled",
+    ])
     y = 230
     for idx, text in enumerate(lines):
         scale = 1.7 if idx == 0 else 1.0
@@ -722,6 +872,7 @@ def capture_and_sync(device_id):
             f"Launching camera capture {filename}; focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}.",
             device_id,
         )
+        record_light_transition_if_changed(device_id, timestamp, settings["active_light_mode"], filename=filename, luma=settings["latest_luminance"])
         if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
             start_night_skip(device_id, timestamp)
             last_capture[device_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -729,7 +880,7 @@ def capture_and_sync(device_id):
             log_activity("Night capture skipped; waiting to summarize this night interval.", device_id)
             return True
 
-        finish_night_skip(device_id, logger)
+        finish_night_skip(device_id, logger, daylight_timestamp=timestamp)
         log_activity("Sending capture command to phone.", device_id)
         if capture.capture_on_device(
             device_id,
@@ -770,15 +921,21 @@ def capture_network_and_analyze(camera_id):
         log_activity("Network camera capture skipped because a capture is already running.", camera_id)
         return False
     try:
+        status = network_camera_status(camera_id, probe=True)
+        if not status.get("reachable"):
+            last_capture[camera_id] = f"Offline: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            log_activity(f"Network camera offline; capture skipped ({status.get('host') or 'no host'}).", camera_id)
+            return False
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
         settings = effective_capture_settings(camera_id)
+        record_light_transition_if_changed(camera_id, timestamp, settings["active_light_mode"], filename=filename, luma=settings["latest_luminance"])
         if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
             start_night_skip(camera_id, timestamp)
             last_capture[camera_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
             log_activity("Night network capture skipped; waiting to summarize this interval.", camera_id)
             return True
-        finish_night_skip(camera_id)
+        finish_night_skip(camera_id, daylight_timestamp=timestamp)
         log_activity(f"Requesting network camera frame {filename}.", camera_id)
         if capture_network_camera(camera_id, filename):
             last_capture[camera_id] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -964,6 +1121,10 @@ def timelapse_loop():
                     print(f"Error on device {d}: {e}")
             for camera_id in configured_camera_ids():
                 try:
+                    status = network_camera_status(camera_id, probe=True)
+                    if not status.get("reachable"):
+                        log_activity(f"Network camera offline; skipping capture loop ({status.get('host') or 'no host'}).", camera_id)
+                        continue
                     capture_network_and_analyze(camera_id)
                 except Exception as e:
                     print(f"Error on network camera {camera_id}: {e}")
@@ -971,7 +1132,7 @@ def timelapse_loop():
 @app.route("/calibrate_multicam")
 def run_multicam_calibration():
     selected = request.args.get("devices", "")
-    devices = [d for d in selected.split(",") if d] if selected else detect_connected_devices() + configured_camera_ids()
+    devices = [d for d in selected.split(",") if d] if selected else visible_device_ids(probe_network=True)
     device_images = {}
     for d in devices:
         device_dir = os.path.join(CAPTURES_DIR, d)
@@ -1376,8 +1537,9 @@ def run_reconstruction():
 
 @app.route("/")
 def dashboard():
-    devices = detect_connected_devices() + configured_camera_ids()
-    network_stream_ids = {device_id for device_id in configured_camera_ids() if camera_has_live_stream(device_id)}
+    network_statuses = network_camera_statuses(probe=True)
+    devices = visible_device_ids(network_statuses)
+    network_stream_ids = {device_id for device_id in reachable_network_camera_ids(network_statuses) if camera_has_live_stream(device_id)}
     # Load debug logs for each device
     logs = {}
     for d in devices:
@@ -1396,6 +1558,7 @@ def dashboard():
         running=timelapse_running,
         logs=logs,
         network_stream_ids=network_stream_ids,
+        network_camera_statuses=network_statuses,
         device_aliases=device_aliases,
         device_metadata=device_metadata,
     )
@@ -2021,8 +2184,7 @@ def delete_growth_point(device_id):
 
 @app.route("/device_settings")
 def get_device_settings():
-    devices = detect_connected_devices() + configured_camera_ids()
-    known = sorted(set(devices) | set(device_settings.keys()))
+    known = visible_device_ids(probe_network=True)
     return jsonify({device_id: settings_response(device_id) for device_id in known})
 
 
@@ -2095,10 +2257,83 @@ def get_device_capabilities():
 @app.route("/network_camera_status")
 def get_network_camera_status():
     probe = request.args.get("probe", "0") == "1"
-    return jsonify({
-        camera_id: network_camera_status(camera_id, probe=probe)
-        for camera_id in configured_camera_ids()
-    })
+    return jsonify(network_camera_statuses(probe=probe))
+
+
+def csv_value(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return "" if value is None else value
+
+
+def write_csv_to_zip(bundle, filename, rows, fieldnames=None):
+    rows = list(rows or [])
+    if fieldnames is None:
+        fieldnames = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+    text = io.StringIO()
+    writer = csv.DictWriter(text, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: csv_value(row.get(key)) for key in fieldnames})
+    bundle.writestr(filename, text.getvalue())
+
+
+def build_experiment_export():
+    experiments = load_experiments()
+    events = load_events()
+    plants = load_plant_records()
+    trays = list_trays()
+    tray_rows = []
+    cell_rows = []
+    for tray in trays:
+        cells = tray.get("cells") or []
+        tray_rows.append({**{key: value for key, value in tray.items() if key != "cells"}, "cell_count": len(cells)})
+        for cell in cells:
+            cell_rows.append({**cell, "tray_id": tray.get("tray_id"), "tray_name": tray.get("name"), "device_id": cell.get("device_id") or tray.get("device_id")})
+    metric_rows = []
+    for row in metric_store.all_device_history():
+        metric_rows.append({
+            **row,
+            "device_alias": device_aliases.get(row.get("device_id"), row.get("device_id")),
+            "segment_count": len(row.get("segments") or []),
+            "movement_status": (row.get("movement") or {}).get("status", ""),
+            "movement_droop_px": (row.get("movement") or {}).get("droop_px", ""),
+            "green_index": (row.get("color_metrics") or {}).get("green_index", ""),
+        })
+    plant_metric_rows = metric_store.all_plant_history()
+    harvest_rows = [event for event in events if event.get("type") in {"harvest", "stress", "treatment"}]
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    readme = (
+        f"Plant Observatory trial export\nGenerated: {generated_at}\n\n"
+        "CSV files:\n"
+        "- experiments.csv: trial names, hypotheses, status, devices, and notes.\n"
+        "- trays.csv and tray_cells.csv: tray layout and plant/cell mapping.\n"
+        "- plant_records.csv: human-entered plant, variety, parentage, and germination records.\n"
+        "- experiment_events.csv: observations, irrigation, fertilizer, stress, treatment, and harvest logs.\n"
+        "- harvest_biomass_events.csv: structured harvest/stress/treatment subset for biomass work.\n"
+        "- lighting_transitions.csv: first light/dark transition timestamps detected from capture frames.\n"
+        "- metric_history.csv: device-level canopy, color, confidence, movement, and segmentation metrics.\n"
+        "- plant_metric_history.csv: plant/cell-level history when tray cells are mapped.\n\n"
+        "Multiple cameras can be joined through tray_id, cell_id, plant_id, segment_id, and device_id.\n"
+    )
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, "w", zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("README.txt", readme)
+        write_csv_to_zip(bundle, "experiments.csv", experiments, ["id", "name", "status", "hypothesis", "devices", "plants", "started_at", "notes"])
+        write_csv_to_zip(bundle, "trays.csv", tray_rows, ["tray_id", "name", "variety", "experiment_id", "device_id", "rows", "cols", "planted_at", "notes", "cell_count", "created_at", "updated_at"])
+        write_csv_to_zip(bundle, "tray_cells.csv", cell_rows, ["tray_id", "tray_name", "cell_id", "plant_id", "name", "status", "device_id", "segment_id", "roi", "candidate_count", "first_seen_at", "last_seen_at", "last_area_mm2", "last_coverage"])
+        write_csv_to_zip(bundle, "plant_records.csv", plants, ["plant_id", "experiment_id", "tray_id", "device_id", "segment_id", "cell_id", "plant_name", "variety", "parent_mother", "parent_father", "planted_date", "first_germination_at", "irrigation", "fertilizer", "harvest", "other", "created_at", "updated_at"])
+        write_csv_to_zip(bundle, "experiment_events.csv", events, ["id", "experiment_id", "timestamp", "type", "device_id", "plant_id", "tray_id", "segment_id", "cell_id", "value", "fresh_weight_g", "dry_weight_g", "cut_height_mm", "area_removed_mm2", "notes", "data"])
+        write_csv_to_zip(bundle, "harvest_biomass_events.csv", harvest_rows, ["id", "experiment_id", "timestamp", "type", "device_id", "plant_id", "tray_id", "segment_id", "cell_id", "fresh_weight_g", "dry_weight_g", "cut_height_mm", "area_removed_mm2", "notes", "data"])
+        write_csv_to_zip(bundle, "lighting_transitions.csv", metric_store.all_lighting_transitions(), ["id", "device_id", "timestamp", "from_mode", "to_mode", "filename", "luma", "confidence", "created_at"])
+        write_csv_to_zip(bundle, "metric_history.csv", metric_rows, ["device_id", "device_alias", "timestamp", "filename", "scale", "detected_scale", "scale_rejected", "area", "growth_rate_mm2_hr", "canopy_coverage", "green_index", "segment_count", "movement_status", "movement_droop_px", "ignored", "segments", "ignored_segments", "color_metrics", "color_correction", "nutrient_deficiency", "movement"])
+        write_csv_to_zip(bundle, "plant_metric_history.csv", plant_metric_rows, ["id", "plant_id", "tray_id", "cell_id", "device_id", "timestamp", "filename", "area", "coverage", "canopy_pixels", "delta_pixels", "status", "created_at"])
+    memory_file.seek(0)
+    return memory_file
 
 
 @app.route("/experiments", methods=["GET", "POST"])
@@ -2108,12 +2343,23 @@ def experiments_api():
             "experiments": load_experiments(),
             "events": load_events(),
             "plants": load_plant_records(),
+            "trays": list_trays(),
             "biology": _biology_state(),
         })
     try:
         return jsonify({"status": "ok", "experiment": upsert_experiment(request.get_json(silent=True) or {})})
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/experiments/export.zip")
+def experiments_export_api():
+    return send_file(
+        build_experiment_export(),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"plant_observatory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+    )
 
 
 @app.route("/experiment_events", methods=["POST"])
@@ -2132,6 +2378,56 @@ def plant_records_api():
         return jsonify({"status": "ok", "plant": upsert_plant_record(request.get_json(silent=True) or {})})
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/trays", methods=["GET", "POST"])
+def trays_api():
+    if request.method == "GET":
+        return jsonify({"trays": list_trays(request.args.get("device_id"))})
+    try:
+        return jsonify({"status": "ok", "tray": upsert_tray(request.get_json(silent=True) or {})})
+    except (TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/trays/<tray_id>/cells", methods=["POST"])
+def tray_cells_api(tray_id):
+    data = request.get_json(silent=True) or {}
+    device_id = data.get("device_id", "")
+    if measurement_setup_locked(device_id):
+        return locked_setup_response(device_id)
+    data["tray_id"] = tray_id
+    try:
+        return jsonify({"status": "ok", "cell": add_cell(data)})
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/trays/<tray_id>/cells/<cell_id>", methods=["DELETE", "POST"])
+def tray_cell_api(tray_id, cell_id):
+    if request.method == "DELETE":
+        deleted = delete_cell(tray_id, cell_id)
+        return jsonify({"status": "ok", "tray_id": tray_id, "cell_id": cell_id, "deleted": deleted})
+    data = request.get_json(silent=True) or {}
+    status = str(data.get("status") or "").strip()
+    if status not in ("empty", "candidate", "germinated", "failed"):
+        return jsonify({"status": "error", "message": "status must be empty, candidate, germinated, or failed"}), 400
+    cell = set_cell_status(tray_id, cell_id, status, plant_id=data.get("plant_id"), timestamp=data.get("timestamp"))
+    return jsonify({"status": "ok", "cell": cell})
+
+
+@app.route("/plant_metrics/<plant_id>")
+def plant_metrics_api(plant_id):
+    return jsonify({"plant_id": plant_id, "history": metric_store.history_for_plant(plant_id)})
+
+
+@app.route("/lighting_transitions/<device_id>")
+def lighting_transitions_api(device_id):
+    return jsonify({
+        "device_id": device_id,
+        "summary": lighting_summary(device_id),
+        "transitions": metric_store.lighting_transitions_for_device(device_id),
+    })
 
 
 @app.route("/biology_state")
@@ -2402,7 +2698,8 @@ def serve_analysis_debug(device_id):
     latest = _latest_capture_file(os.listdir(device_dir))
     if not latest: return "No images", 404
     debug_path = os.path.join(debug_dir, latest)
-    if not os.path.exists(debug_path): return "No debug image", 404
+    if not os.path.exists(debug_path):
+        return send_from_directory(device_dir, latest)
     return send_from_directory(debug_dir, latest)
 
 @app.route("/last_frame/<device_id>")
@@ -2419,6 +2716,9 @@ def live_stream(camera_id):
     global active_live_stream_device
     if camera_id not in configured_camera_ids() or not camera_has_live_stream(camera_id):
         return "No live stream configured", 404
+    status = network_camera_status(camera_id, probe=True)
+    if not status.get("reachable"):
+        return "Network camera offline", 503
 
     if not live_stream_lock.acquire(blocking=False):
         return "Another live stream is already active", 409
@@ -2442,6 +2742,10 @@ def live_stream(camera_id):
 @app.route("/capture/<device_id>")
 def manual_capture(device_id):
     if device_id in configured_camera_ids():
+        status = network_camera_status(device_id, probe=True)
+        if not status.get("reachable"):
+            last_capture[device_id] = f"Offline: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            return "Offline", 503
         if capture_network_and_analyze(device_id): return "OK"
         return "Failed", 500
     if capture_and_sync(device_id): return "OK"
@@ -2452,6 +2756,9 @@ def manual_capture(device_id):
 def move_network_camera(camera_id, direction):
     if camera_id not in configured_camera_ids():
         return jsonify({"status": "error", "message": "Unknown network camera"}), 404
+    status = network_camera_status(camera_id, probe=True)
+    if not status.get("reachable"):
+        return jsonify({"status": "error", "message": "Network camera offline"}), 503
     data = request.get_json(silent=True) or {}
     result = ptz_move(
         camera_id,
@@ -2466,6 +2773,9 @@ def move_network_camera(camera_id, direction):
 def stop_network_camera(camera_id):
     if camera_id not in configured_camera_ids():
         return jsonify({"status": "error", "message": "Unknown network camera"}), 404
+    status = network_camera_status(camera_id, probe=True)
+    if not status.get("reachable"):
+        return jsonify({"status": "error", "message": "Network camera offline"}), 503
     result = ptz_stop(camera_id)
     return jsonify(result), (200 if result.get("status") == "ok" else 502)
 
@@ -2889,6 +3199,12 @@ OBSERVATORY_DASHBOARD_HTML = """
             padding: 2px 5px;
             text-shadow: 0 1px 2px #000;
         }
+        .segment-box.highlighted-plant {
+            border-color: var(--amber) !important;
+            border-width: 4px;
+            background: rgba(216, 173, 95, .22) !important;
+            box-shadow: 0 0 0 2px rgba(216, 173, 95, .35), 0 0 18px rgba(216, 173, 95, .45);
+        }
         .draw-segment-active { outline: 2px solid var(--cyan); cursor: crosshair; }
         .live-active { outline: 2px solid var(--green); }
         .split-grid { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(320px, 1.1fr); gap: 16px; align-items: start; }
@@ -2932,7 +3248,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             <div class="nav-item" data-view="segmentation" onclick="showSection('segmentation', this)">Setup</div>
             <div class="nav-item" data-view="growth" onclick="showSection('growth', this)">Growth Analytics</div>
             <div class="nav-item" data-view="movement" onclick="showSection('movement', this)">Movement</div>
-            <div class="nav-item" data-view="experiments" onclick="showSection('experiments', this)">Active Experiments</div>
+            <div class="nav-item" data-view="experiments" onclick="showSection('experiments', this)">Trial Management</div>
             <div class="nav-section">Operations</div>
             <div class="nav-item" data-view="volume" onclick="showSection('volume', this)">Canopy Volume</div>
             <div class="nav-item" data-view="settings" onclick="showSection('settings', this)">Settings</div>
@@ -2952,7 +3268,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             </div>
             <section class="summary">
                 <div class="metric"><div class="label">System</div><div class="value {{ 'running' if running else 'stopped' }}"><span class="status-dot"></span>{{ 'Running' if running else 'Stopped' }}</div><div class="hint">capture interval 180s</div></div>
-                <div class="metric"><div class="label">Cameras Online</div><div class="value">{{ devices|length }}</div><div class="hint">ADB devices detected</div></div>
+                <div class="metric"><div class="label">Cameras Online</div><div class="value">{{ devices|length }}</div><div class="hint">connected ADB + reachable network</div></div>
                 <div class="metric"><div class="label">Last Capture</div><div class="value" id="last-capture-summary">--</div><div class="hint">latest synced frame</div></div>
                 <div class="metric"><div class="label">Fastest Plant</div><div class="value" id="fastest-summary">--</div><div class="hint">by area gain</div></div>
                 <div class="metric"><div class="label">Calibration</div><div class="value" id="calibration-summary">--</div><div class="hint">marker detection state</div></div>
@@ -2968,7 +3284,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="device-title"><div class="device-id" id="title-{{ d }}">{{ device_aliases.get(d, d) }}</div><span class="badge" id="badge-{{ d }}" style="display:none">Fastest</span></div>
                             <div class="muted">Last sync: <span id="last-{{ d }}">{{ last.get(d, 'Initializing') }}</span></div>
                             <div class="image-wrap mission-image-wrap" id="image-wrap-{{d}}" style="--rotation:0deg">
-                                <img id="analysis-{{d}}" src="/analysis_debug/{{d}}" onload="renderCalibrationOverlays('{{d}}', (latestStats['{{d}}'] || {}).data || {}); renderAllSegmentOverlays()" onpointerdown="startIgnoreDrag(event, '{{d}}')" onpointermove="moveIgnoreDrag(event, '{{d}}')" onpointerup="finishIgnoreDrag(event, '{{d}}')" onpointercancel="cancelIgnoreDrag('{{d}}')" onerror="this.onerror=null; this.src='/last_frame/{{d}}'">
+                                <img id="analysis-{{d}}" src="/analysis_debug/{{d}}" onload="renderCalibrationOverlays('{{d}}', (latestStats['{{d}}'] || {}).data || {}); renderAllSegmentOverlays()" onpointerdown="startIgnoreDrag(event, '{{d}}')" onpointermove="moveIgnoreDrag(event, '{{d}}')" onpointerup="finishIgnoreDrag(event, '{{d}}')" onpointercancel="cancelIgnoreDrag('{{d}}')" onerror="handleMissionImageError(this, '{{d}}')">
                                 <div class="calib-overlay" id="segment-overlay-{{d}}"></div>
                                 <div class="calib-overlay" id="calib-overlay-{{d}}"></div>
                                 <div id="selection-{{d}}" style="position:absolute; border: 2px dashed var(--amber); pointer-events:none; display:none;"></div>
@@ -3082,6 +3398,8 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <h3>Segmentation</h3>
                             <div class="muted">Define trays/plants and exclude false green areas.</div>
                             <div class="controls">
+                                <select id="setup-tray-select"></select>
+                                <button data-locked-edit onclick="enableTrayCellMode()" title="Drag a fixed tray cell for germination and per-plant tracking.">Add Tray Cell</button>
                                 <button data-locked-edit onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region.">Segment Box</button>
                                 <button data-locked-edit onclick="enablePolygonSegmentMode()" title="Click around a skewed tray, then double-click.">Segment Polygon</button>
                                 <button data-locked-edit onclick="enableIgnoreEditorMode('ignore-box')" title="Drag over false green/artifact space.">Ignore Box</button>
@@ -3119,7 +3437,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="settings-row"><label class="muted" for="chamber-{{d}}">Chamber</label><input id="chamber-{{d}}" type="text" value="{{ (device_metadata.get(d, {}) or {}).get('chamber', '') }}" placeholder="Chamber A" onchange="saveDeviceMetadata('{{d}}', 'chamber', this.value)"><strong></strong></div>
                             <div class="settings-row"><label class="muted" for="role-{{d}}">Role</label><select id="role-{{d}}" onchange="saveDeviceMetadata('{{d}}', 'role', this.value)">{% set role = (device_metadata.get(d, {}) or {}).get('role', 'tray') %}<option value="tray" {{ 'selected' if role == 'tray' else '' }}>Tray</option><option value="wall" {{ 'selected' if role == 'wall' else '' }}>Wall</option><option value="overview" {{ 'selected' if role == 'overview' else '' }}>Overview</option><option value="night_vision" {{ 'selected' if role == 'night_vision' else '' }}>Night vision</option><option value="calibration" {{ 'selected' if role == 'calibration' else '' }}>Calibration</option><option value="other" {{ 'selected' if role == 'other' else '' }}>Other</option></select><strong></strong></div>
                             <div class="controls" style="margin-top:12px"><button id="live-button-{{d}}" onclick="toggleLiveView('{{d}}')">Live View</button><button onclick="autoTuneTags('{{d}}')">Calibrate Measurement Profile</button><button id="auto-light-{{d}}" onclick="setAutoLight('{{d}}')">Auto Light</button></div>
-                            <label class="settings-row" title="When off, this device contributes a one-second labeled night placeholder instead of black frames. Measurements ignore placeholders, but timelapse timing stays aligned."><span class="muted">Night frames</span><input id="collect-night-{{d}}" type="checkbox" onchange="saveDeviceSetting('{{d}}', 'collect_night_frames', this.checked)"><strong id="collect-night-label-{{d}}">Collect</strong></label>
+                            <label class="settings-row" title="When off, this device records light/dark transition timestamps and contributes a one-second lighting summary frame instead of night captures. Measurements ignore placeholders, but timelapse timing stays aligned."><span class="muted">Record at night</span><input id="collect-night-{{d}}" type="checkbox" onchange="saveDeviceSetting('{{d}}', 'collect_night_frames', this.checked)"><strong id="collect-night-label-{{d}}">On</strong></label>
                             <div class="settings-row"><label class="muted" for="zoom-{{d}}">Zoom</label><input id="zoom-{{d}}" type="range" min="0" max="100" value="0" oninput="previewZoom('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'zoom_percent', this.value)"><strong id="zoom-value-{{d}}">0%</strong></div>
                             <div class="settings-row"><label class="muted" for="delay-{{d}}">Settle</label><input id="delay-{{d}}" type="range" min="500" max="15000" step="500" value="5000" oninput="previewDelay('{{d}}', this.value)" onchange="saveDeviceSetting('{{d}}', 'delay_ms', this.value)"><strong id="delay-value-{{d}}">5.0s</strong></div>
                             <div class="settings-row"><label class="muted" for="antibanding-{{d}}">Banding</label><select id="antibanding-{{d}}" onchange="saveDeviceSetting('{{d}}', 'antibanding', this.value)"><option value="60hz">60 Hz</option><option value="50hz">50 Hz</option><option value="auto">Auto</option><option value="off">Off</option></select><strong></strong></div>
@@ -3169,49 +3487,95 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <div class="timeline" id="movement-list"></div>
             </section>
             <section class="panel view-section" id="view-experiments">
-                <h2>Active Experiments</h2>
-                <div class="muted" style="margin-top:6px">Assign cameras/plants, record interventions, and compare growth, color, and canopy movement against those events.</div>
+                <h2>Trial Management</h2>
+                <div class="muted" style="margin-top:6px">Walk a trial from experiment setup to device coverage, tray/variety segmentation, plant records, highlights, events, and export.</div>
+                <div class="timeline" style="margin-top:12px">
+                    <div class="event"><time>1</time><div><strong>Add experiment</strong><br>Name the trial and choose the camera device IDs that cover it.</div></div>
+                    <div class="event"><time>2</time><div><strong>Map tray varieties</strong><br>Create one tray/variety record per device view, then jump to Setup to draw tray cells.</div></div>
+                    <div class="event"><time>3</time><div><strong>Let cells become plants</strong><br>As germination is detected, cells lock to plant IDs and plant histories start joining by tray_id, cell_id, plant_id, segment_id, and device_id.</div></div>
+                    <div class="event"><time>4</time><div><strong>Find the plant behind the data</strong><br>Highlight a plant/cell from recorded data and its outline appears on the camera view.</div></div>
+                </div>
+                <h3 style="margin-top:18px">1. Add Experiment</h3>
                 <div class="controls" style="margin-top:12px">
                     <input id="experiment-id" type="text" placeholder="experiment_id">
                     <input id="experiment-name" type="text" placeholder="Experiment name">
                     <input id="experiment-hypothesis" type="text" placeholder="Hypothesis">
                     <button class="primary" onclick="saveExperiment()">Save Experiment</button>
+                    <button onclick="downloadExperimentExport()">Export CSV ZIP</button>
                 </div>
+                <div class="controls" id="experiment-device-list" style="margin-top:8px"></div>
+                <div class="timeline" id="experiments-list"></div>
+                <h3 style="margin-top:18px">2. Map Trays And Varieties</h3>
                 <div class="controls" style="margin-top:8px">
-                    <select id="experiment-event-id"></select>
-                    <select id="experiment-event-type"><option value="observation">Observation</option><option value="planted">Planted</option><option value="germination">Germination / first plant</option><option value="irrigation">Irrigation</option><option value="fertilizer">Fertilizer</option><option value="light_change">Light change</option><option value="harvest">Harvest</option><option value="stress">Stress</option><option value="treatment">Treatment</option><option value="breeding">Breeding / parentage</option></select>
-                    <select id="experiment-event-device"><option value="">All devices</option>{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
-                    <input id="experiment-event-plant" type="text" placeholder="plant/tray id">
-                    <input id="experiment-event-notes" type="text" placeholder="Event notes">
-                    <button onclick="logExperimentEvent()">Log Event</button>
-                    <button onclick="enablePlantNotifications()">Enable Notifications</button>
+                    <select id="tray-experiment-id"></select>
+                    <input id="tray-id" type="text" placeholder="tray_id">
+                    <input id="tray-name" type="text" placeholder="Tray name">
+                    <input id="tray-variety" type="text" placeholder="variety">
+                    <select id="tray-device"><option value="">Device</option>{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
+                    <input id="tray-rows" type="number" min="1" max="50" value="4" title="Rows">
+                    <input id="tray-cols" type="number" min="1" max="50" value="6" title="Columns">
+                    <input id="tray-planted" type="date" title="planted date">
+                    <button class="primary" onclick="saveTrayRecord()">Save Tray</button>
                 </div>
-                <h3 style="margin-top:18px">Tray / Plant Records</h3>
+                <div class="timeline" id="tray-records-list"></div>
+                <h3 style="margin-top:18px">3. Plant Records</h3>
                 <div class="controls" style="margin-top:8px">
-                    <input id="plant-record-id" type="text" placeholder="plant_or_tray_id">
-                    <input id="plant-record-name" type="text" placeholder="plant / tray name">
+                    <input id="plant-record-id" type="text" placeholder="plant_id">
+                    <input id="plant-record-name" type="text" placeholder="plant name">
                     <input id="plant-record-variety" type="text" placeholder="variety">
                     <input id="plant-record-planted" type="date" title="planted date">
                     <input id="plant-record-germination" type="datetime-local" title="first germination / first plant">
-                    <input id="plant-record-device" type="text" placeholder="phone/device id">
-                    <input id="plant-record-segment" type="text" placeholder="segment id">
+                    <input id="plant-record-device" type="text" placeholder="device_id">
+                    <input id="plant-record-segment" type="text" placeholder="segment_id">
+                    <input id="plant-record-cell" type="text" placeholder="cell_id">
                     <input id="plant-record-irrigation" type="text" placeholder="irrigation">
                     <input id="plant-record-fertilizer" type="text" placeholder="fertilizer">
                     <input id="plant-record-harvest" type="text" placeholder="harvest">
                     <input id="plant-record-mother" type="text" placeholder="mother parent">
                     <input id="plant-record-father" type="text" placeholder="father parent">
                     <input id="plant-record-notes" type="text" placeholder="other notes">
-                    <button class="primary" onclick="savePlantRecord()">Save Plant/Tray</button>
+                    <button class="primary" onclick="savePlantRecord()">Save Plant</button>
+                </div>
+                <div class="timeline" id="plant-records-list"></div>
+                <h3 style="margin-top:18px">4. Plant Data Lookup / Highlight</h3>
+                <div class="controls" style="margin-top:8px">
+                    <select id="plant-highlight-select"></select>
+                    <button class="primary" onclick="applySelectedPlantHighlight()">Highlight</button>
+                    <button onclick="highlightBestPlant('largest')">Largest Canopy</button>
+                    <button onclick="highlightBestPlant('smallest')">Smallest Canopy</button>
+                    <button onclick="highlightBestPlant('candidate')">Strongest Germination Signal</button>
+                    <button onclick="clearPlantHighlight()">Clear Highlight</button>
+                </div>
+                <div class="timeline" id="plant-highlight-list"></div>
+                <h3 style="margin-top:18px">Event Log</h3>
+                <div class="controls" style="margin-top:8px">
+                    <select id="experiment-event-id"></select>
+                    <select id="experiment-event-type"><option value="observation">Observation</option><option value="planted">Planted</option><option value="germination">Germination / first plant</option><option value="irrigation">Irrigation</option><option value="fertilizer">Fertilizer</option><option value="light_change">Light change</option><option value="harvest">Harvest</option><option value="stress">Stress</option><option value="treatment">Treatment</option><option value="breeding">Breeding / parentage</option></select>
+                    <select id="experiment-event-device"><option value="">All devices</option>{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
+                    <input id="experiment-event-plant" type="text" placeholder="plant_id">
+                    <input id="experiment-event-tray" type="text" placeholder="tray_id">
+                    <input id="experiment-event-cell" type="text" placeholder="cell_id">
+                    <input id="experiment-event-notes" type="text" placeholder="Event notes">
+                    <button onclick="logExperimentEvent()">Log Event</button>
+                    <button onclick="enablePlantNotifications()">Enable Notifications</button>
+                </div>
+                <h3 style="margin-top:18px">Harvest / Biomass</h3>
+                <div class="controls" style="margin-top:8px">
+                    <select id="harvest-experiment-id"></select>
+                    <input id="harvest-plant-id" type="text" placeholder="plant_id">
+                    <input id="harvest-tray-id" type="text" placeholder="tray_id">
+                    <input id="harvest-cell-id" type="text" placeholder="cell_id">
+                    <input id="harvest-fresh-weight" type="number" step="0.01" min="0" placeholder="fresh g">
+                    <input id="harvest-dry-weight" type="number" step="0.01" min="0" placeholder="dry g">
+                    <input id="harvest-cut-height" type="number" step="0.1" min="0" placeholder="cut mm">
+                    <input id="harvest-notes" type="text" placeholder="harvest notes">
+                    <button class="primary" onclick="logHarvestEvent()">Log Harvest</button>
                 </div>
                 <div class="timeline" id="biology-alerts"></div>
-                <div class="timeline" id="plant-records-list"></div>
                 <h3 style="margin-top:18px">Calendar</h3>
                 <div class="timeline" id="experiment-calendar"></div>
                 <h3 style="margin-top:18px">Circadian Fingerprints</h3>
                 <div class="timeline" id="rhythm-list"></div>
-                <div class="timeline" id="experiments-list"></div>
-                <h3 style="margin-top:18px">Trait And Movement Ranking</h3>
-                <div class="timeline" id="trait-ranking"></div>
             </section>
             <section class="panel view-section" id="view-volume">
                 <h2>Canopy Volume</h2>
@@ -3307,7 +3671,7 @@ OBSERVATORY_DASHBOARD_HTML = """
     <script>
         const charts = {};
         const ignoreState = {};
-        const segmentState = { deviceId: null, enabled: false, dragging: false, mode: 'box', points: [], roi: null, manualMarkers: {}, colorBoards: {}, segments: {} };
+        const segmentState = { deviceId: null, enabled: false, dragging: false, mode: 'box', points: [], roi: null, manualMarkers: {}, colorBoards: {}, segments: {}, trays: [] };
         const growthControls = {};
         const fleetControls = { metric: 'area', windowMode: 'all', customValue: 1, customUnit: 'days', windowHours: 0, minX: '', maxX: '', minY: '', maxY: '', trim: true, outlierSensitivity: 2.5 };
         const MAX_CHART_POINTS = 700;
@@ -3317,7 +3681,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         const deviceLogs = {{ logs|tojson }};
         const settingsCache = {};
         const colorReferenceCache = {};
-        const networkCameraStatus = {};
+        const networkCameraStatus = {{ network_camera_statuses|tojson }};
         let showSetupGreenMask = true;
         let showMissionGreenMask = true;
         const missionGreenMaskState = {};
@@ -3328,10 +3692,15 @@ OBSERVATORY_DASHBOARD_HTML = """
         let liveTimer = null;
         let liveBusy = false;
         let latestStats = {};
+        let experimentCache = { experiments: [], events: [], plants: [], trays: [], biology: {} };
+        let highlightedPlant = null;
         let activeView = 'mission';
         const seenAlertKeys = new Set();
         function fmt(value, digits = 1) { return Number.isFinite(value) ? value.toFixed(digits) : '--'; }
         function aliasOf(deviceId) { return deviceAliases[deviceId] || deviceId; }
+        function escapeAttr(value) {
+            return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
         function showOperation(title, detail, tone = 'normal') {
             const el = document.getElementById('operation-result');
             el.style.display = 'block';
@@ -3515,13 +3884,29 @@ OBSERVATORY_DASHBOARD_HTML = """
         function frameUrl(deviceId, greenmask) {
             return (greenmask ? '/analysis_debug/' : '/last_frame/') + deviceId + '?t=' + Date.now();
         }
+        function setMissionFrameSource(img, deviceId, greenmask) {
+            if (!img) return;
+            img.style.display = 'block';
+            img.dataset.frameMode = greenmask ? 'greenmask' : 'raw';
+            img.dataset.fallback = '0';
+            img.onerror = () => handleMissionImageError(img, deviceId);
+            img.src = frameUrl(deviceId, greenmask);
+        }
+        function handleMissionImageError(img, deviceId) {
+            if (!img) return;
+            const wantedGreenmask = img.dataset.frameMode === 'greenmask' || (img.currentSrc || img.src || '').includes('/analysis_debug/');
+            if (wantedGreenmask && img.dataset.fallback !== '1') {
+                img.dataset.fallback = '1';
+                img.dataset.frameMode = 'raw';
+                img.src = frameUrl(deviceId, false);
+                return;
+            }
+            img.onerror = null;
+        }
         function refreshFrame(deviceId) {
             const img = document.getElementById('analysis-' + deviceId);
             const greenmask = missionGreenMaskState[deviceId] !== false;
-            if (img) {
-                img.style.display = 'block';
-                img.src = frameUrl(deviceId, greenmask);
-            }
+            setMissionFrameSource(img, deviceId, greenmask);
         }
         function toggleMissionGreenMask(deviceId = null) {
             if (deviceId) {
@@ -3571,9 +3956,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             return document.querySelector(`[data-device="${deviceId}"]`)?.dataset.liveStream === '1';
         }
         function stopLiveStreamImage(deviceId) {
-            const img = document.getElementById('analysis-' + deviceId);
-            if (!img) return;
-            img.src = '/analysis_debug/' + deviceId + '?t=' + Date.now();
+            refreshFrame(deviceId);
         }
         function liveCaptureOnce(deviceId) {
             if (liveBusy || liveDevice !== deviceId || document.hidden) return;
@@ -3629,7 +4012,9 @@ OBSERVATORY_DASHBOARD_HTML = """
         function refreshVisibleFrames() {
             if (document.hidden) return;
             document.querySelectorAll('.view-section.active img[id^="analysis-"]').forEach(img => {
-                if (isElementVisible(img)) img.src = img.src.split('?')[0] + '?t=' + Date.now();
+                if (!isElementVisible(img)) return;
+                const deviceId = img.id.replace(/^analysis-/, '');
+                if (deviceId) refreshFrame(deviceId);
             });
         }
         function pauseHiddenVideos() {
@@ -3822,7 +4207,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 return body;
             }).then(settings => {
                 applyDeviceSettings(deviceId, settings);
-                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, night frames ${settings.collect_night_frames ? 'on' : 'off'}. It applies on the next capture.`);
+                showOperation('Camera setting saved', `${deviceId}: zoom ${settings.zoom_percent}%, settle ${(settings.delay_ms / 1000).toFixed(1)}s, exposure ${settings.exposure_compensation}, ISO ${settings.iso}, focus ${settings.focus_mode}, WB ${settings.white_balance}, record at night ${settings.collect_night_frames ? 'on' : 'off'}. It applies on the next capture.`);
                 return settings;
             }).catch(error => {
                 showOperation('Camera setting blocked', error.message, 'bad');
@@ -3920,7 +4305,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (setupRotationNumber) setupRotationNumber.value = Math.round(settings.display_rotation_deg || 0);
             previewRotation(deviceId, settings.display_rotation_deg || 0);
             if (collectNight) collectNight.checked = settings.collect_night_frames !== false;
-            if (collectNightLabel) collectNightLabel.textContent = settings.collect_night_frames === false ? 'Skip' : 'Collect';
+            if (collectNightLabel) collectNightLabel.textContent = settings.collect_night_frames === false ? 'Off' : 'On';
             if (expectedTags && segmentState.deviceId === deviceId) expectedTags.value = settings.expected_marker_count || 4;
             if (auto) {
                 const luma = settings.latest_luminance === null || settings.latest_luminance === undefined ? '--' : Number(settings.latest_luminance).toFixed(0);
@@ -3943,7 +4328,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 segmentState.manualMarkers = manualMarkers || {};
                 segmentState.colorBoards = colorBoards || {};
                 if (!segmentState.deviceId) {
-                    const first = Object.keys(segmentState.segments || {})[0] || Object.keys(latestStats || {})[0] || Array.from(connectedDevices)[0];
+                    const first = Array.from(connectedDevices).find(id => (segmentState.segments || {})[id] || latestStats[id]) || Array.from(connectedDevices)[0];
                     if (first) selectSegmentationDevice(first);
                 }
                 renderAllSegmentOverlays();
@@ -4077,6 +4462,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             const crop = document.getElementById('manual-marker-crop');
             if (crop) crop.style.display = 'none';
             renderSegmentList();
+            renderSetupTraySelect();
             renderColorPatchList();
             renderSetupWorkbench();
             applyDeviceSettings(deviceId, settingsCache[deviceId] || {});
@@ -4191,6 +4577,28 @@ OBSERVATORY_DASHBOARD_HTML = """
             document.getElementById('segment-image')?.classList.add('draw-segment-active');
             showOperation('Segmentation draw mode', 'Drag across the selected image to define a tray or individual plant region.');
         }
+        function activeTrayForSetup() {
+            const select = document.getElementById('setup-tray-select');
+            const trayId = select?.value || '';
+            return (segmentState.trays || []).find(tray => tray.tray_id === trayId);
+        }
+        function enableTrayCellMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            if (selectedSetupIsLocked()) return;
+            const tray = activeTrayForSetup();
+            if (!tray) {
+                showOperation('Choose tray first', 'Create or select a tray in Trial Management before drawing a cell.', 'warn');
+                return;
+            }
+            segmentState.enabled = true;
+            segmentState.mode = 'tray-cell';
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            showOperation('Tray cell draw mode', `${tray.tray_id}: drag across one planted cell.`);
+        }
         function enablePolygonSegmentMode() {
             if (!segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
@@ -4288,7 +4696,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             sel.style.display = 'block';
         }
         function moveSegmentDrag(event) {
-            if (!segmentState.dragging || !['box', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
+            if (!segmentState.dragging || !['box', 'tray-cell', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
             event.preventDefault();
             const point = segmentImagePoint(event, event.target);
             segmentState.current = point;
@@ -4299,7 +4707,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             sel.style.height = Math.abs(point.sy - segmentState.start.sy) + 'px';
         }
         function finishSegmentDrag(event) {
-            if (!segmentState.dragging || !['box', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
+            if (!segmentState.dragging || !['box', 'tray-cell', 'ignore-box', 'manual-roi'].includes(segmentState.mode)) return;
             moveSegmentDrag(event);
             const region = [
                 Math.min(segmentState.start.x, segmentState.current.x),
@@ -4323,6 +4731,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                 segmentState.points = [];
                 drawManualCrop();
                 showOperation('Manual tag crop ready', 'Click the four outer marker corners on the magnified crop. Order should go around the perimeter, clockwise or counter-clockwise.');
+                return;
+            }
+            if (segmentState.mode === 'tray-cell') {
+                saveTrayCellFromEditor(region);
                 return;
             }
             const name = prompt('Segment name', `Tray ${(segmentState.segments[segmentState.deviceId] || []).length + 1}`);
@@ -4445,6 +4857,32 @@ OBSERVATORY_DASHBOARD_HTML = """
                 updateStats();
             });
         }
+        function saveTrayCellFromEditor(region) {
+            const tray = activeTrayForSetup();
+            if (!tray) {
+                showOperation('Tray cell skipped', 'Select a tray before drawing cells.', 'warn');
+                return;
+            }
+            const cells = tray.cells || [];
+            const index = cells.length;
+            const row = Math.floor(index / Math.max(1, Number(tray.cols || 1)));
+            const col = index % Math.max(1, Number(tray.cols || 1));
+            const name = prompt('Cell name', `R${row + 1}C${col + 1}`) || `R${row + 1}C${col + 1}`;
+            fetch(`/trays/${encodeURIComponent(tray.tray_id)}/cells`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ device_id: segmentState.deviceId, row, col, name, region })
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Cell save failed');
+                return body;
+            }).then(() => {
+                stopPointMode();
+                showOperation('Tray cell saved', `${tray.tray_id}: ${name}`);
+                loadExperiments();
+                updateStats();
+            }).catch(e => showOperation('Tray cell save failed', e.message, 'bad'));
+        }
         function clearEditorIgnores() {
             if (!segmentState.deviceId) return;
             if (selectedSetupIsLocked()) return;
@@ -4537,7 +4975,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             const poly = points.length > 1 ? `<svg class="segment-box" style="left:0;top:0;width:${rect.width}px;height:${rect.height}px;padding:0;border:0;background:transparent" viewBox="0 0 ${rect.width} ${rect.height}" preserveAspectRatio="none"><polyline points="${points.map(p => p.join(',')).join(' ')}" fill="none" stroke="${stroke}" stroke-width="2"></polyline></svg>` : '';
             overlay.innerHTML += poly + segmentState.points.map((p, idx) => `<div class="segment-box" style="left:${p.x * sx - 5}px;top:${p.y * sy - 5}px;width:10px;height:10px;border-color:${stroke}">${idx + 1}</div>`).join('');
         }
-        function renderSegmentBoxes(container, img, segments, colorBoards = []) {
+        function renderSegmentBoxes(container, img, segments, colorBoards = [], trayCells = []) {
             if (!container || !img || !img.naturalWidth) return;
             const rect = img.getBoundingClientRect();
             const sx = rect.width / Math.max(1, img.naturalWidth);
@@ -4562,16 +5000,32 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const points = pts.map(p => `${(p[0] - minX) * sx},${(p[1] - minY) * sy}`).join(' ');
                 return `<svg class="segment-box" style="left:${minX * sx}px;top:${minY * sy}px;width:${(Math.max(...xs) - minX) * sx}px;height:${(Math.max(...ys) - minY) * sy}px;padding:0;border-color:#d8ad5f" viewBox="0 0 ${(Math.max(...xs) - minX) * sx} ${(Math.max(...ys) - minY) * sy}" preserveAspectRatio="none"><polygon points="${points}" fill="rgba(216,173,95,.12)" stroke="#d8ad5f" stroke-width="2"></polygon><text x="4" y="14" fill="#fff">${patch.name || patch.code || 'color'}</text></svg>`;
             })).join('');
-            container.innerHTML = segmentHtml + colorHtml;
+            const cellHtml = (trayCells || []).map(cell => {
+                const [x1, y1, x2, y2] = cell.region || [0, 0, 0, 0];
+                const color = cell.status === 'germinated' ? '#85c977' : (cell.candidate_count > 0 ? '#d8ad5f' : '#a7aeb2');
+                const highlighted = highlightedPlant && (
+                    (highlightedPlant.plant_id && highlightedPlant.plant_id === cell.plant_id) ||
+                    (highlightedPlant.tray_id === cell.tray_id && highlightedPlant.cell_id === cell.cell_id)
+                );
+                return `<div class="segment-box ${highlighted ? 'highlighted-plant' : ''}" title="${cell.name || cell.cell_id}" style="left:${x1 * sx}px;top:${y1 * sy}px;width:${(x2 - x1) * sx}px;height:${(y2 - y1) * sy}px;border-color:${color};background:rgba(255,255,255,.04)">${cell.name || cell.cell_id}</div>`;
+            }).join('');
+            container.innerHTML = segmentHtml + colorHtml + cellHtml;
+        }
+        function trayCellsForDevice(deviceId) {
+            return (segmentState.trays || [])
+                .filter(tray => tray.device_id === deviceId)
+                .flatMap(tray => (tray.cells || []).map(cell => ({...cell, tray_id: tray.tray_id, tray_name: tray.name, device_id: tray.device_id})));
         }
         function renderSegmentationEditorOverlays() {
-            renderSegmentBoxes(document.getElementById('segment-overlays'), document.getElementById('segment-image'), segmentState.segments[segmentState.deviceId] || [], segmentState.colorBoards[segmentState.deviceId] || []);
+            renderSegmentBoxes(document.getElementById('segment-overlays'), document.getElementById('segment-image'), segmentState.segments[segmentState.deviceId] || [], segmentState.colorBoards[segmentState.deviceId] || [], trayCellsForDevice(segmentState.deviceId));
         }
         function renderAllSegmentOverlays() {
-            Object.entries(segmentState.segments || {}).forEach(([deviceId, segments]) => {
+            const devices = new Set([...Object.keys(segmentState.segments || {}), ...(segmentState.trays || []).map(tray => tray.device_id).filter(Boolean)]);
+            devices.forEach(deviceId => {
+                const segments = (segmentState.segments || {})[deviceId] || [];
                 const img = document.getElementById('analysis-' + deviceId);
                 const overlay = document.getElementById('segment-overlay-' + deviceId);
-                renderSegmentBoxes(overlay, img, segments);
+                renderSegmentBoxes(overlay, img, segments, [], trayCellsForDevice(deviceId));
             });
             renderSegmentationEditorOverlays();
         }
@@ -5201,7 +5655,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (activeView !== 'settings') return;
             const timelapses = document.getElementById('timelapse-list');
             if (!timelapses) return;
-            const entries = Object.entries(stats || {});
+            const entries = Object.entries(stats || {}).filter(([id]) => connectedDevices.has(id));
             timelapses.innerHTML = entries.map(([id]) => `<div class="event"><time>Video</time><div><strong>${id}</strong><div class="controls"><button onclick="openTimelapse('${id}')">Open</button><button onclick="showFileLocation('video','${id}')">Show File</button><button onclick="resetTimelapse('${id}')">Archive + Reset</button></div><div id="timelapse-player-${cssEscape(id)}"></div></div></div>`).join('');
         }
         function openTimelapse(deviceId) {
@@ -5473,9 +5927,19 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const experiments = body.experiments || [];
                 const events = body.events || [];
                 const plants = body.plants || [];
+                const trays = body.trays || [];
                 const biology = body.biology || {};
+                experimentCache = { experiments, events, plants, trays, biology };
+                segmentState.trays = trays;
+                renderExperimentDeviceList(experiments);
+                renderTrayRecords(trays);
+                renderSetupTraySelect();
                 const select = document.getElementById('experiment-event-id');
                 if (select) select.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
+                const traySelect = document.getElementById('tray-experiment-id');
+                if (traySelect) traySelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
+                const harvestSelect = document.getElementById('harvest-experiment-id');
+                if (harvestSelect) harvestSelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
                 const root = document.getElementById('experiments-list');
                 if (root) root.innerHTML = experiments.length ? experiments.map(item => {
                     const related = events.filter(event => event.experiment_id === item.id).slice(-5).reverse();
@@ -5483,10 +5947,27 @@ OBSERVATORY_DASHBOARD_HTML = """
                     return `<div class="event"><time>${item.status || 'active'}</time><div><strong>${item.name || item.id}</strong><br>${item.hypothesis || 'No hypothesis recorded.'}<br><span class="muted">Devices: ${(item.devices || []).join(', ') || 'not assigned'}</span><br>${eventText}</div></div>`;
                 }).join('') : '<div class="event"><time>Ready</time><div>Create the first experiment above, then log interventions and observations against it.</div></div>';
                 renderPlantRecords(plants, biology.rhythms || {});
+                renderPlantHighlightTools(plants, trays);
                 renderExperimentCalendar(events, plants);
                 renderBiologyAlerts(biology.alerts || []);
                 renderRhythmList(biology.rhythms || {});
+                renderAllSegmentOverlays();
             }).catch(() => {});
+        }
+        function selectedExperimentDeviceIds() {
+            return Array.from(document.querySelectorAll('.experiment-device-check:checked')).map(input => input.value);
+        }
+        function renderExperimentDeviceList(experiments) {
+            const root = document.getElementById('experiment-device-list');
+            if (!root) return;
+            const activeId = document.getElementById('experiment-id')?.value.trim() || document.getElementById('experiment-event-id')?.value || '';
+            const active = experiments.find(item => item.id === activeId) || experiments[0] || {};
+            const saved = new Set(active.devices || []);
+            const devices = Array.from(connectedDevices);
+            root.innerHTML = devices.length ? devices.map(deviceId => {
+                const checked = saved.has(deviceId) || (!saved.size && devices.length === 1);
+                return `<label><input class="experiment-device-check" type="checkbox" value="${escapeAttr(deviceId)}" ${checked ? 'checked' : ''}> ${aliasOf(deviceId)} <span class="muted">${deviceId}</span></label>`;
+            }).join('') : '<span class="muted">No reachable devices are online. Connect a camera before assigning coverage.</span>';
         }
         function renderBiologyAlerts(alerts) {
             const root = document.getElementById('biology-alerts');
@@ -5518,6 +5999,90 @@ OBSERVATORY_DASHBOARD_HTML = """
                 if (root) root.innerHTML = html;
             });
         }
+        function renderSetupTraySelect() {
+            const select = document.getElementById('setup-tray-select');
+            if (!select) return;
+            const trays = (segmentState.trays || []).filter(tray => !segmentState.deviceId || tray.device_id === segmentState.deviceId);
+            const previous = select.value;
+            select.innerHTML = trays.length
+                ? trays.map(tray => `<option value="${tray.tray_id}">${tray.name || tray.tray_id}</option>`).join('')
+                : '<option value="">No tray for device</option>';
+            if (trays.some(tray => tray.tray_id === previous)) select.value = previous;
+        }
+        function renderTrayRecords(trays) {
+            const root = document.getElementById('tray-records-list');
+            if (!root) return;
+            root.innerHTML = trays.length ? trays.map(tray => {
+                const cells = tray.cells || [];
+                const germinated = cells.filter(cell => cell.status === 'germinated').length;
+                const candidates = cells.filter(cell => Number(cell.candidate_count || 0) > 0 && cell.status !== 'germinated').length;
+                const cellRows = cells.length ? cells.map(cell => {
+                    const count = Number(cell.candidate_count || 0);
+                    const metrics = cell.last_seen_at ? `Area ${fmt(Number(cell.last_area_mm2 || 0), 1)} mm2, green ${fmt(Number(cell.last_coverage || 0) * 100, 1)}%, confidence ${count}/3` : 'Awaiting baseline frame';
+                    return `<div class="event"><time>${cell.status || 'empty'}</time><div><strong>${cell.name || cell.cell_id}</strong> ${cell.plant_id ? `(${cell.plant_id})` : ''}<br>${metrics}<br><button onclick="highlightPlant(${JSON.stringify(tray.device_id || '')},${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},${JSON.stringify(cell.plant_id || '')})">Highlight</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'empty')">Empty</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'failed')">Failed</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'germinated', ${JSON.stringify(cell.plant_id || `${tray.tray_id}_${cell.cell_id}`)})">Confirm Germinated</button><button class="warn" onclick="deleteTrayCell(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)})">Delete</button></div></div>`;
+                }).join('') : '<div class="event"><time>Cells</time><div>No cells drawn yet. Select this tray in Setup and use Add Tray Cell.</div></div>';
+                return `<div class="event"><time>${germinated}/${cells.length}</time><div><strong>${tray.name || tray.tray_id}</strong> ${tray.variety ? `(${tray.variety})` : ''}<br>Device ${tray.device_id || '--'}, planted ${tray.planted_at || '--'}, layout ${tray.rows || 1}x${tray.cols || 1}, candidates ${candidates}<br><span class="muted">${tray.notes || ''}</span><br><button onclick="goSegmentTray(${JSON.stringify(tray.device_id || '')},${JSON.stringify(tray.tray_id)})">Segment This Tray</button></div></div>${cellRows}`;
+            }).join('') : '<div class="event"><time>Ready</time><div>Create a tray, then draw fixed cells in Setup for automatic germination locking.</div></div>';
+        }
+        function saveTrayRecord() {
+            const experimentId = document.getElementById('tray-experiment-id')?.value || document.getElementById('experiment-id')?.value || '';
+            const payload = {
+                tray_id: document.getElementById('tray-id').value.trim(),
+                name: document.getElementById('tray-name').value.trim(),
+                variety: document.getElementById('tray-variety').value.trim(),
+                experiment_id: experimentId,
+                device_id: document.getElementById('tray-device').value,
+                rows: document.getElementById('tray-rows').value,
+                cols: document.getElementById('tray-cols').value,
+                planted_at: document.getElementById('tray-planted').value,
+            };
+            fetch('/trays', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Tray save failed');
+                return body;
+            }).then(() => {
+                showOperation('Tray saved', `${payload.name || payload.tray_id}: draw cells in Setup.`);
+                loadExperiments();
+            }).catch(e => showOperation('Tray save failed', e.message, 'bad'));
+        }
+        function goSegmentTray(deviceId, trayId) {
+            if (!deviceId) {
+                showOperation('Choose device', 'Save a device_id on the tray before segmentation.', 'warn');
+                return;
+            }
+            showSection('segmentation', document.querySelector('[data-view="segmentation"]'));
+            selectSegmentationDevice(deviceId);
+            setTimeout(() => {
+                const select = document.getElementById('setup-tray-select');
+                if (select && trayId) select.value = trayId;
+            }, 150);
+        }
+        function setTrayCellStatus(trayId, cellId, status, plantId = '') {
+            fetch(`/trays/${encodeURIComponent(trayId)}/cells/${encodeURIComponent(cellId)}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ status, plant_id: plantId })
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Cell update failed');
+                return body;
+            }).then(() => {
+                showOperation('Cell updated', `${cellId}: ${status}`);
+                loadExperiments();
+            }).catch(e => showOperation('Cell update failed', e.message, 'bad'));
+        }
+        function deleteTrayCell(trayId, cellId) {
+            if (!confirm(`Delete cell ${cellId}?`)) return;
+            fetch(`/trays/${encodeURIComponent(trayId)}/cells/${encodeURIComponent(cellId)}`, { method: 'DELETE' })
+                .then(() => {
+                    showOperation('Cell deleted', `${trayId}: ${cellId}`);
+                    loadExperiments();
+                });
+        }
         function renderPlantRecords(plants, rhythms) {
             const root = document.getElementById('plant-records-list');
             if (!root) return;
@@ -5530,8 +6095,80 @@ OBSERVATORY_DASHBOARD_HTML = """
                     if (Number.isFinite(days)) germText = `${fmt(days, 1)} days`;
                 }
                 const rhythm = rhythms[plant.device_id] || {};
-                return `<div class="event"><time>${plant.tray_id || plant.plant_id}</time><div><strong>${plant.plant_name || plant.plant_id}</strong> ${plant.variety ? `(${plant.variety})` : ''}<br>Device ${plant.device_id || '--'}, segment ${plant.segment_id || '--'}<br>Planted ${planted || '--'}, germination ${germ || '--'} (${germText})<br>Irrigation ${plant.irrigation || '--'} | Fertilizer ${plant.fertilizer || '--'} | Harvest ${plant.harvest || '--'}<br>Parents ${plant.parent_mother || '--'} x ${plant.parent_father || '--'}<br>Rhythm ${rhythm.frequency_hz ? Number(rhythm.frequency_hz).toExponential(3) + ' Hz' : 'collecting'}<br><span class="muted">${plant.other || ''}</span></div></div>`;
+                return `<div class="event"><time>${plant.tray_id || plant.plant_id}</time><div><strong>${plant.plant_name || plant.plant_id}</strong> ${plant.variety ? `(${plant.variety})` : ''}<br>Device ${plant.device_id || '--'}, cell ${plant.cell_id || '--'}, segment ${plant.segment_id || '--'}<br>Planted ${planted || '--'}, germination ${germ || '--'} (${germText})<br>Irrigation ${plant.irrigation || '--'} | Fertilizer ${plant.fertilizer || '--'} | Harvest ${plant.harvest || '--'}<br>Parents ${plant.parent_mother || '--'} x ${plant.parent_father || '--'}<br>Rhythm ${rhythm.frequency_hz ? Number(rhythm.frequency_hz).toExponential(3) + ' Hz' : 'collecting'}<br><span class="muted">${plant.other || ''}</span><br><button onclick="highlightPlant(${JSON.stringify(plant.device_id || '')},${JSON.stringify(plant.tray_id || '')},${JSON.stringify(plant.cell_id || '')},${JSON.stringify(plant.plant_id || '')})">Highlight</button></div></div>`;
             }).join('') : '<div class="event"><time>Ready</time><div>Add a tray or plant record above. Use segment IDs when you want per-plant tracking later.</div></div>';
+        }
+        function plantHighlightCandidates(plants, trays) {
+            const rows = [];
+            (trays || []).forEach(tray => (tray.cells || []).forEach(cell => {
+                rows.push({
+                    device_id: tray.device_id || '',
+                    tray_id: tray.tray_id || '',
+                    cell_id: cell.cell_id || '',
+                    plant_id: cell.plant_id || `${tray.tray_id}_${cell.cell_id}`,
+                    label: `${cell.plant_id || cell.cell_id} - ${tray.name || tray.tray_id}${tray.variety ? ' / ' + tray.variety : ''}`,
+                    area: Number(cell.last_area_mm2 || 0),
+                    candidate_count: Number(cell.candidate_count || 0),
+                    status: cell.status || 'empty',
+                });
+            }));
+            (plants || []).forEach(plant => {
+                if (rows.some(row => row.plant_id === plant.plant_id || (row.tray_id === plant.tray_id && row.cell_id === plant.cell_id))) return;
+                rows.push({
+                    device_id: plant.device_id || '',
+                    tray_id: plant.tray_id || '',
+                    cell_id: plant.cell_id || '',
+                    plant_id: plant.plant_id || '',
+                    label: `${plant.plant_name || plant.plant_id}${plant.variety ? ' / ' + plant.variety : ''}`,
+                    area: 0,
+                    candidate_count: 0,
+                    status: plant.first_germination_at ? 'germinated' : 'record',
+                });
+            });
+            return rows;
+        }
+        function renderPlantHighlightTools(plants, trays) {
+            const candidates = plantHighlightCandidates(plants, trays);
+            const select = document.getElementById('plant-highlight-select');
+            if (select) {
+                select.innerHTML = candidates.length ? candidates.map((row, idx) => `<option value="${idx}" data-device="${escapeAttr(row.device_id)}" data-tray="${escapeAttr(row.tray_id)}" data-cell="${escapeAttr(row.cell_id)}" data-plant="${escapeAttr(row.plant_id)}">${row.label} (${row.status}, ${fmt(row.area, 1)} mm2)</option>`).join('') : '<option value="">No plant/cell data yet</option>';
+            }
+            const root = document.getElementById('plant-highlight-list');
+            if (!root) return;
+            root.innerHTML = candidates.length ? candidates.slice().sort((a, b) => b.area - a.area).slice(0, 12).map(row => `<div class="event"><time>${row.status}</time><div><strong>${row.label}</strong><br>Device ${row.device_id || '--'}, tray ${row.tray_id || '--'}, cell ${row.cell_id || '--'}, canopy ${fmt(row.area, 1)} mm2, germination signal ${row.candidate_count || 0}/3<br><button onclick="highlightPlant(${JSON.stringify(row.device_id)},${JSON.stringify(row.tray_id)},${JSON.stringify(row.cell_id)},${JSON.stringify(row.plant_id)})">Highlight</button></div></div>`).join('') : '<div class="event"><time>Ready</time><div>Once tray cells or plants exist, choose one here to outline it on the camera view.</div></div>';
+        }
+        function applySelectedPlantHighlight() {
+            const select = document.getElementById('plant-highlight-select');
+            const option = select?.selectedOptions?.[0];
+            if (!option || option.value === '') return;
+            highlightPlant(option.dataset.device || '', option.dataset.tray || '', option.dataset.cell || '', option.dataset.plant || '');
+        }
+        function highlightBestPlant(mode) {
+            const candidates = plantHighlightCandidates(experimentCache.plants, experimentCache.trays);
+            let chosen = null;
+            if (mode === 'largest') chosen = candidates.slice().sort((a, b) => b.area - a.area)[0];
+            if (mode === 'smallest') chosen = candidates.filter(row => row.area > 0).sort((a, b) => a.area - b.area)[0];
+            if (mode === 'candidate') chosen = candidates.slice().sort((a, b) => b.candidate_count - a.candidate_count)[0];
+            if (!chosen) {
+                showOperation('No plant data yet', 'Draw tray cells and collect germination/canopy samples first.', 'warn');
+                return;
+            }
+            highlightPlant(chosen.device_id, chosen.tray_id, chosen.cell_id, chosen.plant_id);
+        }
+        function highlightPlant(deviceId, trayId, cellId, plantId) {
+            highlightedPlant = { device_id: deviceId || '', tray_id: trayId || '', cell_id: cellId || '', plant_id: plantId || '' };
+            if (deviceId) {
+                const img = document.getElementById('analysis-' + deviceId);
+                if (img) img.scrollIntoView({block: 'center', behavior: 'smooth'});
+                if (activeView === 'segmentation') selectSegmentationDevice(deviceId);
+            }
+            renderAllSegmentOverlays();
+            showOperation('Plant highlighted', `${plantId || cellId || trayId || 'selection'} is outlined on the camera view.`);
+        }
+        function clearPlantHighlight() {
+            highlightedPlant = null;
+            renderAllSegmentOverlays();
+            showOperation('Highlight cleared', 'Plant/cell overlay highlight removed.');
         }
         function renderExperimentCalendar(events, plants) {
             const root = document.getElementById('experiment-calendar');
@@ -5549,7 +6186,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             const id = document.getElementById('experiment-id').value.trim();
             const name = document.getElementById('experiment-name').value.trim();
             const hypothesis = document.getElementById('experiment-hypothesis').value.trim();
-            const devices = Array.from(connectedDevices);
+            const devices = selectedExperimentDeviceIds();
             fetch('/experiments', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -5559,29 +6196,70 @@ OBSERVATORY_DASHBOARD_HTML = """
                 if (!r.ok) throw new Error(body.message || 'Experiment save failed');
                 return body;
             }).then(() => {
-                showOperation('Experiment saved', `${name || id}: tracking ${devices.length} connected/configured device(s).`);
+                showOperation('Experiment saved', `${name || id}: tracking ${devices.length} selected device(s).`);
                 loadExperiments();
             }).catch(error => showOperation('Experiment save failed', error.message, 'bad'));
+        }
+        function downloadExperimentExport() {
+            showOperation('Export started', 'Building trial CSV bundle.');
+            window.location.href = '/experiments/export.zip';
         }
         function logExperimentEvent() {
             const experimentId = document.getElementById('experiment-event-id').value;
             const type = document.getElementById('experiment-event-type').value;
             const deviceId = document.getElementById('experiment-event-device').value;
             const plantId = document.getElementById('experiment-event-plant').value.trim();
+            const trayId = document.getElementById('experiment-event-tray').value.trim();
+            const cellId = document.getElementById('experiment-event-cell').value.trim();
             const notes = document.getElementById('experiment-event-notes').value.trim();
             fetch('/experiment_events', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({experiment_id: experimentId, type, device_id: deviceId, plant_id: plantId, tray_id: plantId, notes})
+                body: JSON.stringify({experiment_id: experimentId, type, device_id: deviceId, plant_id: plantId, tray_id: trayId, cell_id: cellId, notes})
             }).then(async r => {
                 const body = await r.json();
                 if (!r.ok) throw new Error(body.message || 'Event save failed');
                 return body;
             }).then(() => {
+                document.getElementById('experiment-event-plant').value = '';
+                document.getElementById('experiment-event-tray').value = '';
+                document.getElementById('experiment-event-cell').value = '';
                 document.getElementById('experiment-event-notes').value = '';
                 showOperation('Experiment event logged', `${type}${deviceId ? ` for ${deviceId}` : ''}.`);
                 loadExperiments();
             }).catch(error => showOperation('Event save failed', error.message, 'bad'));
+        }
+        function logHarvestEvent() {
+            const experimentId = document.getElementById('harvest-experiment-id').value;
+            const payload = {
+                experiment_id: experimentId,
+                type: 'harvest',
+                plant_id: document.getElementById('harvest-plant-id').value.trim(),
+                tray_id: document.getElementById('harvest-tray-id').value.trim(),
+                cell_id: document.getElementById('harvest-cell-id').value.trim(),
+                notes: document.getElementById('harvest-notes').value.trim(),
+                data: {
+                    fresh_weight_g: document.getElementById('harvest-fresh-weight').value,
+                    dry_weight_g: document.getElementById('harvest-dry-weight').value,
+                    cut_height_mm: document.getElementById('harvest-cut-height').value,
+                }
+            };
+            fetch('/experiment_events', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Harvest save failed');
+                return body;
+            }).then(() => {
+                ['harvest-plant-id', 'harvest-tray-id', 'harvest-cell-id', 'harvest-fresh-weight', 'harvest-dry-weight', 'harvest-cut-height', 'harvest-notes'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.value = '';
+                });
+                showOperation('Harvest logged', `${payload.plant_id || payload.tray_id || 'trial'} biomass record saved.`);
+                loadExperiments();
+            }).catch(error => showOperation('Harvest save failed', error.message, 'bad'));
         }
         function savePlantRecord() {
             const experimentId = document.getElementById('experiment-event-id')?.value || document.getElementById('experiment-id')?.value || '';
@@ -5595,6 +6273,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 first_germination_at: document.getElementById('plant-record-germination').value,
                 device_id: document.getElementById('plant-record-device').value.trim(),
                 segment_id: document.getElementById('plant-record-segment').value.trim(),
+                cell_id: document.getElementById('plant-record-cell').value.trim(),
                 irrigation: document.getElementById('plant-record-irrigation').value.trim(),
                 fertilizer: document.getElementById('plant-record-fertilizer').value.trim(),
                 harvest: document.getElementById('plant-record-harvest').value.trim(),

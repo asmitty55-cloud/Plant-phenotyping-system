@@ -93,6 +93,7 @@ def upsert_plant_record(payload):
         "tray_id": str(payload.get("tray_id") or "").strip(),
         "device_id": str(payload.get("device_id") or "").strip(),
         "segment_id": str(payload.get("segment_id") or "").strip(),
+        "cell_id": str(payload.get("cell_id") or "").strip(),
         "plant_name": str(payload.get("plant_name") or payload.get("plant") or "").strip(),
         "variety": str(payload.get("variety") or "").strip(),
         "parent_mother": str(payload.get("parent_mother") or "").strip(),
@@ -123,6 +124,7 @@ def add_event(payload):
     event_type = str(payload.get("type") or "observation").strip()
     if not experiment_id:
         raise ValueError("Choose an experiment before logging an event.")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     event = {
         "id": f"event_{int(datetime.now().timestamp() * 1000)}",
         "experiment_id": experiment_id,
@@ -132,7 +134,13 @@ def add_event(payload):
         "plant_id": str(payload.get("plant_id") or "").strip(),
         "tray_id": str(payload.get("tray_id") or "").strip(),
         "segment_id": str(payload.get("segment_id") or "").strip(),
+        "cell_id": str(payload.get("cell_id") or "").strip(),
         "value": payload.get("value"),
+        "fresh_weight_g": data.get("fresh_weight_g", payload.get("fresh_weight_g")),
+        "dry_weight_g": data.get("dry_weight_g", payload.get("dry_weight_g")),
+        "cut_height_mm": data.get("cut_height_mm", payload.get("cut_height_mm")),
+        "area_removed_mm2": data.get("area_removed_mm2", payload.get("area_removed_mm2")),
+        "data": data,
         "notes": str(payload.get("notes") or "").strip(),
     }
     events = load_events()
