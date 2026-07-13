@@ -24,6 +24,7 @@ class CalibrationStore:
             "color_boards": {},
             "color_reference": {},
             "camera_params": {},     # device_id -> { "K": [[...]], "dist": [...], "R": [...], "T": [...] }
+            "landmarks": {},         # dictionary:id -> physical size and world pose
             "world_origin_device": None # The device ID that defines the origin
         }
 
@@ -35,26 +36,42 @@ class CalibrationStore:
         self.data.setdefault("color_boards", {})
         self.data.setdefault("color_reference", {})
         self.data.setdefault("camera_params", {})
+        self.data.setdefault("landmarks", {})
 
     def save(self):
         os.makedirs(os.path.dirname(CALIBRATION_FILE), exist_ok=True)
         with open(CALIBRATION_FILE, 'w') as f:
             json.dump(self.data, f, indent=4)
 
-    def get_marker_size(self, marker_id, device_id=None):
+    @staticmethod
+    def marker_key(dictionary, marker_id):
+        dictionary = str(dictionary or "4X4_50").replace("DICT_", "")
+        return f"{dictionary}:{int(marker_id)}"
+
+    def get_marker_size(self, marker_id, device_id=None, dictionary="4X4_50"):
         self._ensure_defaults()
         marker_text = str(marker_id)
+        marker_key = self.marker_key(dictionary, marker_id)
         # 1. Check device-specific override
         if device_id and device_id in self.data["device_overrides"]:
             dev_over = self.data["device_overrides"][device_id]
-            if marker_text in dev_over.get("marker_overrides", {}):
-                return dev_over["marker_overrides"][marker_text]
+            marker_overrides = dev_over.get("marker_overrides", {})
+            if marker_key in marker_overrides:
+                return marker_overrides[marker_key]
+            if dictionary == "4X4_50" and marker_text in marker_overrides:
+                return marker_overrides[marker_text]
 
         # 2. Check global marker override
-        if marker_text in self.data["marker_overrides"]:
+        if marker_key in self.data["marker_overrides"]:
+            return self.data["marker_overrides"][marker_key]
+        if dictionary == "4X4_50" and marker_text in self.data["marker_overrides"]:
             return self.data["marker_overrides"][marker_text]
 
-        catalog_size = wall_marker_size(marker_id)
+        landmark = self.data["landmarks"].get(marker_key)
+        if landmark and landmark.get("enabled", True):
+            return landmark.get("size_mm")
+
+        catalog_size = wall_marker_size(marker_id) if dictionary == "4X4_50" else None
         if catalog_size:
             return catalog_size
 
@@ -66,17 +83,65 @@ class CalibrationStore:
             return self.data["device_overrides"][device_id].get("ignore_regions", [])
         return []
 
-    def set_marker_size(self, marker_id, size_mm, device_id=None):
+    def set_marker_size(self, marker_id, size_mm, device_id=None, dictionary="4X4_50"):
         self._ensure_defaults()
+        marker_key = self.marker_key(dictionary, marker_id)
         if device_id:
             if device_id not in self.data["device_overrides"]:
                 self.data["device_overrides"][device_id] = {}
             if "marker_overrides" not in self.data["device_overrides"][device_id]:
                 self.data["device_overrides"][device_id]["marker_overrides"] = {}
-            self.data["device_overrides"][device_id]["marker_overrides"][str(marker_id)] = float(size_mm)
+            self.data["device_overrides"][device_id]["marker_overrides"][marker_key] = float(size_mm)
         else:
-            self.data["marker_overrides"][str(marker_id)] = float(size_mm)
+            self.data["marker_overrides"][marker_key] = float(size_mm)
         self.save()
+
+    def upsert_landmark(self, landmark):
+        self._ensure_defaults()
+        dictionary = str(landmark.get("dictionary") or "6X6_250").replace("DICT_", "")
+        marker_id = int(landmark["id"])
+        limits = {"4X4_50": 50, "6X6_250": 250}
+        if dictionary not in limits:
+            raise ValueError(f"Unsupported landmark dictionary: {dictionary}")
+        if not 0 <= marker_id < limits[dictionary]:
+            raise ValueError(f"{dictionary} marker ID must be between 0 and {limits[dictionary] - 1}")
+        key = self.marker_key(dictionary, marker_id)
+        current = self.data["landmarks"].get(key, {})
+        size_mm = float(landmark.get("size_mm", current.get("size_mm", 52.0)))
+        if size_mm <= 0:
+            raise ValueError("size_mm must be greater than zero")
+        current.update({
+            "dictionary": dictionary,
+            "id": marker_id,
+            "label": str(landmark.get("label") or current.get("label") or key),
+            "size_mm": size_mm,
+            "position_mm": [float(value) for value in landmark.get("position_mm", current.get("position_mm", [0, 0, 0]))],
+            "rotation_deg": [float(value) for value in landmark.get("rotation_deg", current.get("rotation_deg", [0, 0, 0]))],
+            "enabled": bool(landmark.get("enabled", current.get("enabled", True))),
+        })
+        if len(current["position_mm"]) != 3 or len(current["rotation_deg"]) != 3:
+            raise ValueError("position_mm and rotation_deg must each contain three values")
+        self.data["landmarks"][key] = current
+        self.save()
+        return dict(current)
+
+    def get_landmark(self, dictionary, marker_id):
+        self._ensure_defaults()
+        landmark = self.data["landmarks"].get(self.marker_key(dictionary, marker_id))
+        return dict(landmark) if landmark else None
+
+    def list_landmarks(self, enabled_only=False):
+        self._ensure_defaults()
+        landmarks = [dict(value) for value in self.data["landmarks"].values()]
+        if enabled_only:
+            landmarks = [landmark for landmark in landmarks if landmark.get("enabled", True)]
+        return sorted(landmarks, key=lambda item: (item.get("dictionary", ""), int(item.get("id", 0))))
+
+    def delete_landmark(self, dictionary, marker_id):
+        self._ensure_defaults()
+        removed = self.data["landmarks"].pop(self.marker_key(dictionary, marker_id), None)
+        self.save()
+        return removed is not None
 
     def add_ignore_region(self, device_id, region):
         """region is [x1, y1, x2, y2]"""

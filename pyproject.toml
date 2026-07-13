@@ -14,7 +14,9 @@ dependencies = [
     "numpy",
     "opencv-python",
     "pandas",
+    "pillow",
     "pyyaml",
+    "reportlab",
     "scikit-image",
     "scipy",
 ]

@@ -129,6 +129,12 @@ def pair(endpoint, pairing_code):
         raise ValueError("A wireless-debugging pairing code is required.")
     out, err, returncode = run_adb(["pair", endpoint, code], timeout=20)
     message = out or err
+    if "protocol fault" in message.lower():
+        message = (
+            f"{message}. Use the temporary pairing IP:port shown inside 'Pair device with pairing code', "
+            "not the normal wireless-debugging connect port. If the code screen timed out, open a new code. "
+            "If it still fails, toggle Wireless debugging off/on or restart the ADB server."
+        )
     return {
         "ok": returncode == 0 and "successfully paired" in message.lower(),
         "endpoint": endpoint,

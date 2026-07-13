@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.pt.capture"
-    android:versionCode="2026052002"
-    android:versionName="2026.05.20.2">
+    android:versionCode="2026061201"
+    android:versionName="2026.06.12.1">
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />

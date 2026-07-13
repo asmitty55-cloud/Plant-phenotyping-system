@@ -10,7 +10,7 @@ from pt.device import adb_transport
 ADB = "adb"
 REMOTE_DIR = "/sdcard/PTCaptures"
 LOCAL_DIR = get_images_dir()
-REQUIRED_APK_VERSION_CODE = 2026052002
+REQUIRED_APK_VERSION_CODE = 2026061201
 
 APK_CANDIDATES = [
     os.path.join(os.getcwd(), "ptcapture.apk"),
@@ -161,7 +161,7 @@ def uninstall_apk(device):
 # -------------------------
 # Capture engine
 # -------------------------
-def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso="auto", zoom_percent=0, focus_mode="continuous-picture", antibanding="60hz", white_balance="daylight"):
+def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso="auto", zoom_percent=0, focus_mode="continuous-picture", antibanding="60hz", white_balance="daylight", target_elapsed_realtime_ms=None):
     """Capture photo on single device using custom APK with advanced options"""
     try:
         # 1. Force stop app to prevent "Fail to connect to camera"
@@ -193,6 +193,8 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
                "--es", "focusMode", focus_mode,
                "--es", "antibanding", antibanding,
                "--es", "whiteBalance", white_balance]
+        if target_elapsed_realtime_ms is not None:
+            cmd.extend(["--el", "targetElapsedRealtimeMs", str(int(target_elapsed_realtime_ms))])
 
         # Clear logcat before starting to avoid reading old completion signals
         adb(["logcat", "-c"], device)
@@ -204,6 +206,61 @@ def capture_on_device(device, filename, mode="jpg", delay=5000, exposure=-1, iso
     except Exception as e:
         print(f"Error capturing on {device}: {e}")
         return False
+
+
+def _parse_device_uptime_ms(value):
+    first = str(value or "").strip().split()[0]
+    return int(round(float(first) * 1000))
+
+
+def measure_device_clock_offset_ms(device, samples=5):
+    """Estimate Android monotonic uptime offset using midpoint RTT sampling."""
+    readings = []
+    for _ in range(max(1, int(samples))):
+        host_before = time.monotonic_ns() / 1_000_000.0
+        out, _ = adb(["shell", "cat", "/proc/uptime"], device)
+        host_after = time.monotonic_ns() / 1_000_000.0
+        try:
+            device_ms = _parse_device_uptime_ms(out)
+        except (ValueError, IndexError):
+            continue
+        midpoint = (host_before + host_after) / 2.0
+        readings.append((host_after - host_before, device_ms - midpoint))
+    if not readings:
+        raise RuntimeError(f"Could not read monotonic uptime from {device}")
+    readings.sort(key=lambda item: item[0])
+    best = readings[:max(1, min(3, len(readings)))]
+    offsets = sorted(item[1] for item in best)
+    return int(round(offsets[len(offsets) // 2]))
+
+
+def synchronized_device_targets(devices, lead_ms=12000):
+    """Return one host target and the corresponding wall-clock target per phone."""
+    offsets = {}
+    errors = {}
+
+    def measure(device):
+        try:
+            offsets[device] = measure_device_clock_offset_ms(device)
+        except Exception as exc:
+            errors[device] = str(exc)
+
+    threads = [threading.Thread(target=measure, args=(device,)) for device in devices]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise RuntimeError("; ".join(f"{device}: {message}" for device, message in errors.items()))
+    host_target_ms = int(time.monotonic_ns() / 1_000_000) + max(3000, int(lead_ms))
+    return {
+        "host_target_ms": host_target_ms,
+        "device_target_ms": {
+            device: host_target_ms + offsets[device]
+            for device in devices
+        },
+        "clock_offset_ms": offsets,
+    }
 
 def wait_for_capture_complete(device, filename):
     """Wait for logcat signal that capture is complete"""

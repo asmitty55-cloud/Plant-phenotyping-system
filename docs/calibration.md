@@ -17,6 +17,18 @@ Because this target is mounted on the back wall, the resulting scale is a wall-p
 scale. Keep plants at a consistent depth relative to the wall, or add a plant-plane
 target if absolute area measurements need to account for depth.
 
+## Distributed Spatial Landmarks
+
+`DICT_6X6_250` tags are a separate camera-pose system. They do not contribute to
+the canopy scale above. Register each installed tag in Canopy Volume with its exact
+printed size, center position in millimeters, and XYZ rotation in degrees. Marker
+identity is the pair `(dictionary, id)`, so `4X4_50:7` and `6X6_250:7` are distinct.
+
+Multi-camera calibration prefers a visible ChArUco board. If it is unavailable,
+PT uses visible mapped 6x6 landmarks to solve the camera pose. The 52 mm standard
+set is the default; 39 mm compact and 75 mm long-range sheets are available under
+`images/aruco_print_sheets`.
+
 ## Canopy and Deficiency Tracking
 
 Canopy measurement uses the wall-plane scale plus a vegetation mask built from HSV

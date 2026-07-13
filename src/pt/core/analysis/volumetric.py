@@ -5,6 +5,71 @@ import json
 from pt.core.analysis.calibration_store import calib_store
 from pt.core.analysis.image_analysis import get_charuco_board, get_detector_params, DICTIONARIES, get_charuco_target
 
+
+def _camera_intrinsics(device_id, gray):
+    stored_params = calib_store.get_camera_params(device_id)
+    if stored_params and "K" in stored_params:
+        return np.array(stored_params["K"]), np.array(stored_params["dist"])
+    h, w = gray.shape
+    f = w
+    return np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]], dtype=np.float32), np.zeros(5, dtype=np.float32)
+
+
+def _landmark_world_corners(landmark):
+    size = float(landmark["size_mm"])
+    half = size / 2.0
+    local = np.array([
+        [-half, half, 0],
+        [half, half, 0],
+        [half, -half, 0],
+        [-half, -half, 0],
+    ], dtype=np.float32)
+    rx, ry, rz = np.radians(np.asarray(landmark.get("rotation_deg", [0, 0, 0]), dtype=np.float64))
+    rotation_x = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+    rotation_y = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+    rotation_z = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+    rotation = rotation_z @ rotation_y @ rotation_x
+    position = np.asarray(landmark.get("position_mm", [0, 0, 0]), dtype=np.float64)
+    return (local @ rotation.T + position).astype(np.float32)
+
+
+def estimate_pose_from_landmarks(gray, device_id, params):
+    object_points = []
+    image_points = []
+    landmarks_used = []
+    by_dictionary = {}
+    for landmark in calib_store.list_landmarks(enabled_only=True):
+        by_dictionary.setdefault(landmark["dictionary"], {})[int(landmark["id"])] = landmark
+    for dictionary_name, landmarks in by_dictionary.items():
+        aruco_dict = DICTIONARIES.get(dictionary_name)
+        if aruco_dict is None:
+            continue
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
+        if ids is None:
+            continue
+        for index, raw_id in enumerate(ids.reshape(-1)):
+            landmark = landmarks.get(int(raw_id))
+            if not landmark:
+                continue
+            object_points.extend(_landmark_world_corners(landmark))
+            image_points.extend(corners[index][0])
+            landmarks_used.append(f"{dictionary_name}:{int(raw_id)}")
+    if len(object_points) < 4:
+        return None
+    K, dist = _camera_intrinsics(device_id, gray)
+    valid, rvec, tvec, inliers = cv2.solvePnPRansac(
+        np.asarray(object_points, dtype=np.float32),
+        np.asarray(image_points, dtype=np.float32),
+        K,
+        dist,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+        reprojectionError=5.0,
+    )
+    if not valid:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    return {"K": K, "dist": dist, "R": R, "T": tvec, "landmarks": landmarks_used, "inliers": 0 if inliers is None else len(inliers)}
+
 def calibrate_extrinsics(device_images):
     """
     device_images: dict of device_id -> image_path
@@ -36,16 +101,7 @@ def calibrate_extrinsics(device_images):
             if charuco_ids is not None and len(charuco_ids) >= 4:
                 # Need camera intrinsics. If not calibrated, we might have to estimate or use defaults.
                 # For now, let's assume we have them or use a heuristic.
-                stored_params = calib_store.get_camera_params(device_id)
-                if stored_params and "K" in stored_params:
-                    K = np.array(stored_params["K"])
-                    dist = np.array(stored_params["dist"])
-                else:
-                    # Heuristic intrinsics if unknown
-                    h, w = gray.shape
-                    f = w # Focal length approx
-                    K = np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]], dtype=np.float32)
-                    dist = np.zeros(5, dtype=np.float32)
+                K, dist = _camera_intrinsics(device_id, gray)
 
                 valid, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
                     charuco_corners, charuco_ids, board, K, dist, None, None
@@ -55,7 +111,25 @@ def calibrate_extrinsics(device_images):
                     # Convert rvec to rotation matrix
                     R, _ = cv2.Rodrigues(rvec)
                     calib_store.set_camera_params(device_id, K, dist, R, tvec)
-                    results[device_id] = {"R": R.tolist(), "T": tvec.tolist()}
+                    results[device_id] = {"R": R.tolist(), "T": tvec.tolist(), "source": "charuco"}
+                    continue
+
+        landmark_pose = estimate_pose_from_landmarks(gray, device_id, params)
+        if landmark_pose:
+            calib_store.set_camera_params(
+                device_id,
+                landmark_pose["K"],
+                landmark_pose["dist"],
+                landmark_pose["R"],
+                landmark_pose["T"],
+            )
+            results[device_id] = {
+                "R": landmark_pose["R"].tolist(),
+                "T": landmark_pose["T"].tolist(),
+                "source": "mapped_landmarks",
+                "landmarks": landmark_pose["landmarks"],
+                "inliers": landmark_pose["inliers"],
+            }
 
     return results
 

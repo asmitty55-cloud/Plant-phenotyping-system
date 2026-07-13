@@ -143,11 +143,11 @@ def capture_with_ffmpeg(camera, url, output_path, transport=None):
         "-y",
         "-rtsp_transport",
         transport,
-        "-rw_timeout",
-        "5000000",
         "-i",
         url,
         "-frames:v",
+        "1",
+        "-update",
         "1",
         output_path,
     ]
@@ -156,6 +156,28 @@ def capture_with_ffmpeg(camera, url, output_path, transport=None):
     except subprocess.TimeoutExpired:
         return False
     if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return False
+    if has_smeared_bottom_half(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def capture_with_opencv(url, output_path):
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        cap.release()
+        return False
+    try:
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if not ok or frame is None:
+        return False
+    if not cv2.imwrite(output_path, frame):
         return False
     if has_smeared_bottom_half(output_path):
         try:
@@ -235,6 +257,17 @@ def capture_network_camera(camera_id, filename=None):
                 }
                 print(f"[NETWORK_CAMERA] Captured {camera_id}: {output_path}")
                 return output_path
+        if capture_with_opencv(url, output_path):
+            CAMERA_STATUS[camera_id] = {
+                **status,
+                "reachable": True,
+                "last_capture": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_error": "",
+                "transport": "opencv-auto",
+                "url_path": url.rsplit("/", 1)[-1],
+            }
+            print(f"[NETWORK_CAMERA] Captured {camera_id} with OpenCV fallback: {output_path}")
+            return output_path
 
     CAMERA_STATUS[camera_id] = {
         **status,
@@ -258,7 +291,10 @@ def mjpeg_live_frames(camera_id, fps=3, jpeg_quality=65, max_width=960):
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             cap.release()
-            continue
+            cap = cv2.VideoCapture(url)
+            if not cap.isOpened():
+                cap.release()
+                continue
 
         try:
             while True:

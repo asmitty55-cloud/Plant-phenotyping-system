@@ -1,1 +1,12 @@
-experiments: []
+experiments:
+- id: spinach
+  name: lakeside, seaside, space
+  status: active
+  hypothesis: ''
+  devices:
+  - 0123456789ABCDEF
+  - BV9700PRO00001133
+  - escam_penguin_qf521
+  plants: []
+  started_at: '2026-06-09 21:45:40'
+  notes: ''

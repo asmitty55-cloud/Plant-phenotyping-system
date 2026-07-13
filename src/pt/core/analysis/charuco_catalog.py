@@ -23,9 +23,12 @@ def _catalog_candidates():
         / "opencv_charuco_color_reference_config.json"
     )
     legacy_rel = Path("images") / "charuco_boards_3x5_with_rulers_letterfit" / "opencv_charuco_config.json"
+    supplemental_rel = Path("images") / "aruco_print_sheets" / "supplemental_charuco_config.json"
     return [
         Path(get_data_root()) / color_rel,
         _repo_root() / color_rel,
+        Path(get_data_root()) / supplemental_rel,
+        _repo_root() / supplemental_rel,
         Path(get_data_root()) / legacy_rel,
         _repo_root() / legacy_rel,
     ]
@@ -36,9 +39,13 @@ def _dict_name(value):
 
 
 def load_catalog():
+    catalogs = []
+    seen_paths = set()
     for path in _catalog_candidates():
-        if not path.exists():
+        resolved = path.resolve()
+        if not path.exists() or resolved in seen_paths:
             continue
+        seen_paths.add(resolved)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -78,9 +85,12 @@ def load_catalog():
                     "color_patches": color_patches,
                 })
             if boards:
-                return boards
+                catalogs.extend(boards)
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             continue
+
+    if catalogs:
+        return catalogs
 
     return [
         {

@@ -56,12 +56,22 @@ def list_trays(device_id=None):
 def upsert_tray(payload):
     tray_id = _safe_id(payload.get("tray_id") or payload.get("id") or payload.get("name"))
     now = _now()
+    layout_type = str(payload.get("layout_type") or payload.get("layout") or "freeform").strip().lower()
+    if layout_type not in ("freeform", "grid", "radial"):
+        layout_type = "freeform"
+    try:
+        target_count = int(max(0, min(500, int(payload.get("target_count") or 0))))
+    except (TypeError, ValueError):
+        target_count = 0
     record = {
         "tray_id": tray_id,
         "experiment_id": str(payload.get("experiment_id") or "").strip(),
         "device_id": str(payload.get("device_id") or "").strip(),
         "name": str(payload.get("name") or tray_id).strip(),
         "variety": str(payload.get("variety") or "").strip(),
+        "layout_type": layout_type,
+        "target_count": target_count,
+        "center_feature": str(payload.get("center_feature") or "").strip(),
         "rows": int(max(1, min(50, int(payload.get("rows") or 1)))),
         "cols": int(max(1, min(50, int(payload.get("cols") or 1)))),
         "planted_at": str(payload.get("planted_at") or "").strip(),
@@ -105,12 +115,19 @@ def add_cell(payload):
         cells = tray.setdefault("cells", [])
         row = int(payload.get("row") or 0)
         col = int(payload.get("col") or 0)
-        cell_id = _safe_id(payload.get("cell_id") or f"{tray_id}_r{row + 1}_c{col + 1}")
+        position_index = int(payload.get("position_index") if payload.get("position_index") is not None else len(cells))
+        default_label = (
+            f"P{position_index + 1}"
+            if tray.get("layout_type") in ("freeform", "radial")
+            else f"R{row + 1}C{col + 1}"
+        )
+        cell_id = _safe_id(payload.get("cell_id") or f"{tray_id}_{default_label.lower()}")
         cell = {
             "cell_id": cell_id,
             "row": row,
             "col": col,
-            "name": str(payload.get("name") or cell_id).strip(),
+            "position_index": position_index,
+            "name": str(payload.get("name") or default_label).strip(),
             "region": [int(v) for v in region],
             "status": str(payload.get("status") or "empty").strip() or "empty",
             "candidate_count": 0,

@@ -15,7 +15,6 @@ from pt.core.analysis.tray_store import analyze_device_cells
 # Common ArUco dictionaries to check
 DICTIONARIES = {
     "4X4_50": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50),
-    "4X4_250": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250),
     "6X6_250": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250),
     "APRILTAG_36h11": cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
 }
@@ -871,6 +870,7 @@ def analyze_image(image_path, device_id=None):
         debug_frame = frame.copy()
 
         best_score = -1
+        detections_by_dictionary = {}
         for method_name, img in processing_variants:
             # 1. Enhance Contrast
             enhanced = clahe.apply(img)
@@ -923,10 +923,13 @@ def analyze_image(image_path, device_id=None):
                         best_ids = np.array(valid_ids)
                         detected_dict = dict_name
                         used_method = method_name + suffix
-                if best_score >= 4:
-                    break
-            if best_score >= 4:
-                break
+                    previous = detections_by_dictionary.get(dict_name)
+                    if valid_ids and (previous is None or len(valid_ids) > len(previous["ids"])):
+                        detections_by_dictionary[dict_name] = {
+                            "ids": np.array(valid_ids),
+                            "corners": valid_corners,
+                            "method": method_name + suffix,
+                        }
 
         # Results packaging
         results = {
@@ -937,6 +940,8 @@ def analyze_image(image_path, device_id=None):
             "method": used_method,
             "calibration_target": get_charuco_target(device_id),
             "color_boards": [],
+            "markers_by_dictionary": {},
+            "landmarks": [],
         }
 
         # Setup debug frame
@@ -944,44 +949,54 @@ def analyze_image(image_path, device_id=None):
 
         manual_markers = manual_marker_measurements(device_id)
 
-        if best_ids is not None or manual_markers:
+        if detections_by_dictionary or manual_markers:
             if best_ids is None:
                 best_ids = []
                 best_corners = []
-            results["markers_found"] = len(best_ids)
             scales = []
-            for i in range(len(best_ids)):
-                marker_id = int(best_ids[i][0])
-                marker_corners = best_corners[i][0]
-                # Calculate side lengths
-                s1 = float(np.linalg.norm(marker_corners[0] - marker_corners[1]))
-                s2 = float(np.linalg.norm(marker_corners[1] - marker_corners[2]))
-                s3 = float(np.linalg.norm(marker_corners[2] - marker_corners[3]))
-                s4 = float(np.linalg.norm(marker_corners[3] - marker_corners[0]))
+            for dict_name, detection in detections_by_dictionary.items():
+                dictionary_markers = []
+                for i in range(len(detection["ids"])):
+                    marker_id = int(detection["ids"][i][0])
+                    marker_corners = detection["corners"][i][0]
+                    # Calculate side lengths
+                    s1 = float(np.linalg.norm(marker_corners[0] - marker_corners[1]))
+                    s2 = float(np.linalg.norm(marker_corners[1] - marker_corners[2]))
+                    s3 = float(np.linalg.norm(marker_corners[2] - marker_corners[3]))
+                    s4 = float(np.linalg.norm(marker_corners[3] - marker_corners[0]))
 
-                avg_side_px = (s1 + s2 + s3 + s4) / 4.0
+                    avg_side_px = (s1 + s2 + s3 + s4) / 4.0
 
-                # Check for marker size override
-                marker_size_mm = calib_store.get_marker_size(marker_id, device_id) or MARKER_SIZE_MM
+                    marker_size_mm = calib_store.get_marker_size(marker_id, device_id, dict_name)
+                    px_per_mm = float(avg_side_px / marker_size_mm) if marker_size_mm else None
+                    if dict_name == "4X4_50" and px_per_mm:
+                        scales.append(px_per_mm)
 
-                px_per_mm = float(avg_side_px / marker_size_mm)
-                scales.append(px_per_mm)
-
-                center = np.mean(marker_corners, axis=0)
-                results["markers"].append({
-                    "id": marker_id,
-                    "center": [float(center[0]), float(center[1])],
-                    "corners": marker_corners.astype(float).tolist(),
-                    "px_per_mm": px_per_mm,
-                    "size_mm": marker_size_mm
-                })
+                    center = np.mean(marker_corners, axis=0)
+                    marker = {
+                        "dictionary": dict_name,
+                        "id": marker_id,
+                        "key": calib_store.marker_key(dict_name, marker_id),
+                        "center": [float(center[0]), float(center[1])],
+                        "corners": marker_corners.astype(float).tolist(),
+                        "px_per_mm": px_per_mm,
+                        "size_mm": marker_size_mm,
+                    }
+                    landmark = calib_store.get_landmark(dict_name, marker_id)
+                    if landmark and landmark.get("enabled", True):
+                        marker["landmark"] = landmark
+                        results["landmarks"].append(marker)
+                    dictionary_markers.append(marker)
+                    results["markers"].append(marker)
+                results["markers_by_dictionary"][dict_name] = dictionary_markers
             for marker in manual_markers:
                 scales.append(marker["px_per_mm"])
                 results["markers"].append(marker)
             results["markers_found"] = len(results["markers"])
-            marker_scale = float(np.mean(scales))
-            results["scale_px_per_mm"] = marker_scale
-            results["scale_source"] = "manual_marker" if manual_markers and len(manual_markers) == len(results["markers"]) else "charuco_marker_size"
+            results["dictionary"] = ",".join(sorted(detections_by_dictionary)) or detected_dict
+            if scales:
+                results["scale_px_per_mm"] = float(np.mean(scales))
+                results["scale_source"] = "manual_marker" if manual_markers and not detections_by_dictionary else "4x4_marker_size"
 
             if charuco_detection and charuco_detection["charuco_scale_px_per_mm"]:
                 results["scale_px_per_mm"] = charuco_detection["charuco_scale_px_per_mm"]
@@ -1050,10 +1065,11 @@ def analyze_image(image_path, device_id=None):
                         2,
                     )
 
-            if len(best_corners):
-                for marker_corners in best_corners:
+            for dict_name, detection in detections_by_dictionary.items():
+                color = (255, 0, 0) if dict_name == "4X4_50" else (0, 180, 255)
+                for marker_corners in detection["corners"]:
                     pts = marker_corners[0].astype(np.int32)
-                    cv2.polylines(debug_frame, [pts], True, (255, 0, 0), 2)
+                    cv2.polylines(debug_frame, [pts], True, color, 2)
             for marker in manual_markers:
                 pts = np.array(marker["corners"], dtype=np.int32)
                 cv2.polylines(debug_frame, [pts], True, (0, 0, 255), 3)

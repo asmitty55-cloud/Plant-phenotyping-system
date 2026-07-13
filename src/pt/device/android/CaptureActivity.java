@@ -6,6 +6,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Range;
 import android.view.SurfaceView;
@@ -31,6 +32,7 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
     private String mFileName;
     private int mZoomPercent = 0;
     private int mDelayMs = 5000;
+    private long mTargetElapsedRealtimeMs = 0L;
     private int mExposureCompensation = 0;
     private String mIso = "auto";
     private String mFocusMode = "continuous-picture";
@@ -97,6 +99,7 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
         if (mode != null) mMode = mode;
         mZoomPercent = getIntent().getIntExtra("zoomPercent", 0);
         mDelayMs = getIntent().getIntExtra("delay", 5000);
+        mTargetElapsedRealtimeMs = getIntent().getLongExtra("targetElapsedRealtimeMs", 0L);
         mExposureCompensation = getIntent().getIntExtra("exposureCompensation", 0);
         String iso = getIntent().getStringExtra("iso");
         if (iso != null) mIso = iso;
@@ -277,12 +280,18 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
             mCamera.setPreviewDisplay(mHolder);
             mCamera.startPreview();
             
+            long waitMs = Math.max(500, mDelayMs);
+            if (mTargetElapsedRealtimeMs > 0L) {
+                waitMs = Math.max(0L, mTargetElapsedRealtimeMs - SystemClock.elapsedRealtime());
+                Log.i(TAG, "Synchronized monotonic target: " + mTargetElapsedRealtimeMs + " wait=" + waitMs + "ms");
+            }
+
             new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     takePicture();
                 }
-            }, Math.max(500, mDelayMs));
+            }, waitMs);
 
         } catch (Exception e) {
             Log.e(TAG, "Capture failed: " + e.getMessage());
@@ -353,6 +362,7 @@ public class CaptureActivity extends Activity implements SurfaceHolder.Callback 
                 safeFinish();
                 return;
             }
+            Log.i(TAG, "SHUTTER_REQUEST:" + mFileName + ":" + SystemClock.elapsedRealtime());
             mCamera.takePicture(null, null, new Camera.PictureCallback() {
                 @Override
                 public void onPictureTaken(byte[] data, Camera camera) {

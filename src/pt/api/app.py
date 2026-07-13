@@ -207,7 +207,10 @@ def reachable_network_camera_ids(statuses=None, probe=False):
 def visible_device_ids(statuses=None, probe_network=False):
     seen = set()
     devices = []
-    for device_id in detect_connected_devices() + reachable_network_camera_ids(statuses, probe=probe_network):
+    if statuses is None:
+        statuses = network_camera_statuses(probe=probe_network)
+    network_ids = reachable_network_camera_ids(statuses)
+    for device_id in detect_connected_devices() + network_ids:
         if device_id and device_id not in seen:
             devices.append(device_id)
             seen.add(device_id)
@@ -484,11 +487,22 @@ def latest_luminance(device_id):
     return float(frame.mean())
 
 
+def frame_luminance(image_path):
+    frame = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE) if image_path else None
+    if frame is None:
+        return None
+    return float(frame.mean())
+
+
+def light_mode_from_luminance(luma):
+    if luma is None:
+        return "day"
+    return "night_ir" if float(luma) < NIGHT_LUMA_THRESHOLD else "day"
+
+
 def sensed_light_mode(device_id):
     luma = latest_luminance(device_id)
-    if luma is None:
-        return "day", None
-    return ("night_ir" if luma < NIGHT_LUMA_THRESHOLD else "day"), luma
+    return light_mode_from_luminance(luma), luma
 
 
 def effective_capture_settings(device_id):
@@ -929,15 +943,30 @@ def capture_network_and_analyze(camera_id):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
         settings = effective_capture_settings(camera_id)
-        record_light_transition_if_changed(camera_id, timestamp, settings["active_light_mode"], filename=filename, luma=settings["latest_luminance"])
-        if settings["active_light_mode"] == "night_ir" and not settings["collect_night_frames"]:
-            start_night_skip(camera_id, timestamp)
-            last_capture[camera_id] = f"Night skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            log_activity("Night network capture skipped; waiting to summarize this interval.", camera_id)
-            return True
-        finish_night_skip(camera_id, daylight_timestamp=timestamp)
         log_activity(f"Requesting network camera frame {filename}.", camera_id)
-        if capture_network_camera(camera_id, filename):
+        capture_path = capture_network_camera(camera_id, filename)
+        if capture_path:
+            actual_luma = frame_luminance(capture_path)
+            actual_mode = (
+                light_mode_from_luminance(actual_luma)
+                if settings["light_mode"] == "auto"
+                else settings["active_light_mode"]
+            )
+            record_light_transition_if_changed(camera_id, timestamp, actual_mode, filename=filename, luma=actual_luma)
+            if actual_mode == "night_ir" and not settings["collect_night_frames"]:
+                start_night_skip(camera_id, timestamp)
+                try:
+                    os.remove(capture_path)
+                except OSError:
+                    pass
+                last_capture[camera_id] = f"Night probe skipped: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                luma_label = f"{actual_luma:.1f}" if actual_luma is not None else "unknown"
+                log_activity(
+                    f"Fresh frame still looks dark (luma {luma_label}); skipping greenmask until daylight.",
+                    camera_id,
+                )
+                return True
+            finish_night_skip(camera_id, daylight_timestamp=timestamp)
             last_capture[camera_id] = time.strftime("%Y-%m-%d %H:%M:%S")
             try:
                 log_activity("Analyzing network frame greenspace, markers, color, and movement.", camera_id)
@@ -1145,7 +1174,7 @@ def run_multicam_calibration():
         return "No images found", 400
 
     results = calibrate_extrinsics(device_images)
-    return jsonify({"status": "ok", "calibrated": list(results.keys())})
+    return jsonify({"status": "ok", "calibrated": list(results.keys()), "poses": results})
 
 @app.route("/ignore_region/<device_id>", methods=["POST"])
 def add_ignore(device_id):
@@ -1332,9 +1361,26 @@ def set_marker_size():
     if data.get("device_id") and measurement_setup_locked(data.get("device_id")):
         return locked_setup_response(data.get("device_id"))
     # data: { marker_id, size_mm, device_id (optional) }
-    calib_store.set_marker_size(data["marker_id"], data["size_mm"], data.get("device_id"))
+    calib_store.set_marker_size(data["marker_id"], data["size_mm"], data.get("device_id"), data.get("dictionary", "4X4_50"))
     stats = process_latest_captures(CAPTURES_DIR)
     return jsonify({"status": "ok", "stats": stats.get(data.get("device_id"), {}) if data.get("device_id") else {}})
+
+
+@app.route("/landmarks", methods=["GET", "POST"])
+def landmarks_api():
+    if request.method == "GET":
+        return jsonify({"landmarks": calib_store.list_landmarks()})
+    try:
+        landmark = calib_store.upsert_landmark(request.get_json(silent=True) or {})
+        return jsonify({"status": "ok", "landmark": landmark, "landmarks": calib_store.list_landmarks()})
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/landmarks/<dictionary>/<int:marker_id>", methods=["DELETE"])
+def delete_landmark_api(dictionary, marker_id):
+    removed = calib_store.delete_landmark(dictionary, marker_id)
+    return jsonify({"status": "ok", "removed": removed, "landmarks": calib_store.list_landmarks()})
 
 @app.route("/charuco_target", methods=["POST"])
 def set_charuco_target():
@@ -1534,6 +1580,96 @@ def run_reconstruction():
     with open(rec_file, 'w') as f: json.dump(history[-100:], f, indent=4)
 
     return jsonify(vol_data)
+
+
+@app.route("/volumetric/capture", methods=["POST"])
+def capture_volumetric_set():
+    data = request.get_json(silent=True) or {}
+    requested = [str(device).strip() for device in data.get("devices", []) if str(device).strip()]
+    connected = set(detect_connected_devices())
+    devices = [device for device in requested if device in connected]
+    if len(devices) < 2:
+        return jsonify({"status": "error", "message": "Select at least two connected Android phones."}), 400
+
+    settings_by_device = {}
+    try:
+        for device_id in devices:
+            ensure_device_profile(device_id)
+            if not capture.ensure_installed(device_id):
+                raise RuntimeError(f"PTCapture could not be installed on {device_id}")
+            logger = PhoneLogger(device_id)
+            local_device_dir = os.path.join(CAPTURES_DIR, device_id)
+            if not _load_sync_state(local_device_dir).get("initial_backup_complete"):
+                sync_device(device_id, logger)
+            settings_by_device[device_id] = effective_capture_settings(device_id)
+
+        settle_ms = max(settings["delay_ms"] for settings in settings_by_device.values())
+        timing = capture.synchronized_device_targets(devices, lead_ms=settle_ms + 5000)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+    shot_id = datetime.now().strftime("volume_%Y%m%d_%H%M%S")
+    filename = f"{shot_id}.jpg"
+    results = {}
+
+    def capture_phone(device_id):
+        lock = _device_lock(device_id)
+        if not lock.acquire(blocking=False):
+            results[device_id] = {"ok": False, "message": "A capture is already running."}
+            return
+        try:
+            settings = settings_by_device[device_id]
+            ok = capture.capture_on_device(
+                device_id,
+                filename,
+                zoom_percent=settings["zoom_percent"],
+                delay=settings["delay_ms"],
+                exposure=settings["exposure_compensation"],
+                iso=settings["iso"],
+                focus_mode=settings["focus_mode"],
+                antibanding=settings["antibanding"],
+                white_balance=settings["white_balance"],
+                target_elapsed_realtime_ms=timing["device_target_ms"][device_id],
+            )
+            if ok:
+                sync_device(device_id, PhoneLogger(device_id))
+                last_capture[device_id] = time.strftime("%Y-%m-%d %H:%M:%S")
+            results[device_id] = {
+                "ok": bool(ok),
+                "target_elapsed_realtime_ms": timing["device_target_ms"][device_id],
+                "monotonic_offset_ms": timing["clock_offset_ms"][device_id],
+            }
+        except Exception as exc:
+            results[device_id] = {"ok": False, "message": str(exc)}
+        finally:
+            lock.release()
+
+    threads = [threading.Thread(target=capture_phone, args=(device_id,)) for device_id in devices]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    successful = [device for device, result in results.items() if result.get("ok")]
+    if successful:
+        try:
+            process_latest_captures(CAPTURES_DIR)
+        except Exception as exc:
+            return jsonify({
+                "status": "error",
+                "message": f"Capture completed, but analysis failed: {exc}",
+                "shot_id": shot_id,
+                "results": results,
+            }), 500
+    status_code = 200 if len(successful) == len(devices) else 502
+    return jsonify({
+        "status": "ok" if status_code == 200 else "partial",
+        "shot_id": shot_id,
+        "filename": filename,
+        "host_target_ms": timing["host_target_ms"],
+        "successful_devices": successful,
+        "results": results,
+    }), status_code
 
 @app.route("/")
 def dashboard():
@@ -2324,7 +2460,7 @@ def build_experiment_export():
     with zipfile.ZipFile(memory_file, "w", zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("README.txt", readme)
         write_csv_to_zip(bundle, "experiments.csv", experiments, ["id", "name", "status", "hypothesis", "devices", "plants", "started_at", "notes"])
-        write_csv_to_zip(bundle, "trays.csv", tray_rows, ["tray_id", "name", "variety", "experiment_id", "device_id", "rows", "cols", "planted_at", "notes", "cell_count", "created_at", "updated_at"])
+        write_csv_to_zip(bundle, "trays.csv", tray_rows, ["tray_id", "name", "variety", "experiment_id", "device_id", "layout_type", "target_count", "center_feature", "rows", "cols", "planted_at", "notes", "cell_count", "created_at", "updated_at"])
         write_csv_to_zip(bundle, "tray_cells.csv", cell_rows, ["tray_id", "tray_name", "cell_id", "plant_id", "name", "status", "device_id", "segment_id", "roi", "candidate_count", "first_seen_at", "last_seen_at", "last_area_mm2", "last_coverage"])
         write_csv_to_zip(bundle, "plant_records.csv", plants, ["plant_id", "experiment_id", "tray_id", "device_id", "segment_id", "cell_id", "plant_name", "variety", "parent_mother", "parent_father", "planted_date", "first_germination_at", "irrigation", "fertilizer", "harvest", "other", "created_at", "updated_at"])
         write_csv_to_zip(bundle, "experiment_events.csv", events, ["id", "experiment_id", "timestamp", "type", "device_id", "plant_id", "tray_id", "segment_id", "cell_id", "value", "fresh_weight_g", "dry_weight_g", "cut_height_mm", "area_removed_mm2", "notes", "data"])
@@ -2350,6 +2486,27 @@ def experiments_api():
         return jsonify({"status": "ok", "experiment": upsert_experiment(request.get_json(silent=True) or {})})
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route("/experiments/<experiment_id>/devices", methods=["POST"])
+def experiment_devices_api(experiment_id):
+    data = request.get_json(silent=True) or {}
+    device_id = str(data.get("device_id") or "").strip()
+    if not device_id:
+        return jsonify({"status": "error", "message": "device_id is required"}), 400
+    experiment = next((item for item in load_experiments() if item.get("id") == experiment_id), None)
+    if not experiment:
+        return jsonify({"status": "error", "message": f"Unknown experiment: {experiment_id}"}), 404
+    devices = list(dict.fromkeys([*(experiment.get("devices") or []), device_id]))
+    updated = upsert_experiment({**experiment, "id": experiment_id, "devices": devices})
+    if data.get("log_event", True):
+        add_event({
+            "experiment_id": experiment_id,
+            "type": "camera_added",
+            "device_id": device_id,
+            "notes": f"Camera {device_id} added to trial coverage retroactively.",
+        })
+    return jsonify({"status": "ok", "experiment": updated})
 
 
 @app.route("/experiments/export.zip")
@@ -3283,6 +3440,10 @@ OBSERVATORY_DASHBOARD_HTML = """
                         <article class="device-card" data-device="{{ d }}" data-live-stream="{{ '1' if d in network_stream_ids else '0' }}">
                             <div class="device-title"><div class="device-id" id="title-{{ d }}">{{ device_aliases.get(d, d) }}</div><span class="badge" id="badge-{{ d }}" style="display:none">Fastest</span></div>
                             <div class="muted">Last sync: <span id="last-{{ d }}">{{ last.get(d, 'Initializing') }}</span></div>
+                            {% if d in network_camera_statuses %}
+                            {% set camera_status = network_camera_statuses.get(d, {}) %}
+                            <div class="muted">Network: {{ 'online' if camera_status.get('reachable') else 'offline' }}{% if camera_status.get('host') %} at {{ camera_status.get('host') }}:{{ camera_status.get('rtsp_port') }}{% endif %}</div>
+                            {% endif %}
                             <div class="image-wrap mission-image-wrap" id="image-wrap-{{d}}" style="--rotation:0deg">
                                 <img id="analysis-{{d}}" src="/analysis_debug/{{d}}" onload="renderCalibrationOverlays('{{d}}', (latestStats['{{d}}'] || {}).data || {}); renderAllSegmentOverlays()" onpointerdown="startIgnoreDrag(event, '{{d}}')" onpointermove="moveIgnoreDrag(event, '{{d}}')" onpointerup="finishIgnoreDrag(event, '{{d}}')" onpointercancel="cancelIgnoreDrag('{{d}}')" onerror="handleMissionImageError(this, '{{d}}')">
                                 <div class="calib-overlay" id="segment-overlay-{{d}}"></div>
@@ -3321,7 +3482,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                         {% endfor %}
                     </div>
                     {% else %}
-                    <div class="empty">No ADB cameras are online. Connect the Galaxy S5 Neo and keep USB debugging enabled.</div>
+                    <div class="empty">No cameras are available yet. Connect a USB/ADB phone or add a network camera in configs/network_cameras.local.yaml.</div>
                     {% endif %}
                 </section>
                 <aside class="panel">
@@ -3399,7 +3560,8 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="muted">Define trays/plants and exclude false green areas.</div>
                             <div class="controls">
                                 <select id="setup-tray-select"></select>
-                                <button data-locked-edit onclick="enableTrayCellMode()" title="Drag a fixed tray cell for germination and per-plant tracking.">Add Tray Cell</button>
+                                <button data-locked-edit onclick="enableTrayCellMode()" title="Drag a fixed plant/cell region for germination and per-plant tracking.">Cell Box</button>
+                                <button data-locked-edit onclick="enableTrayCellPolygonMode()" title="Click around one plant/cell region, then double-click.">Cell Polygon</button>
                                 <button data-locked-edit onclick="enableSegmentMode()" title="Drag a rectangular tray or plant region.">Segment Box</button>
                                 <button data-locked-edit onclick="enablePolygonSegmentMode()" title="Click around a skewed tray, then double-click.">Segment Polygon</button>
                                 <button data-locked-edit onclick="enableIgnoreEditorMode('ignore-box')" title="Drag over false green/artifact space.">Ignore Box</button>
@@ -3505,6 +3667,13 @@ OBSERVATORY_DASHBOARD_HTML = """
                 </div>
                 <div class="controls" id="experiment-device-list" style="margin-top:8px"></div>
                 <div class="timeline" id="experiments-list"></div>
+                <h3 style="margin-top:18px">Add Camera To Existing Trial</h3>
+                <div class="controls" style="margin-top:8px">
+                    <select id="experiment-camera-add-id"></select>
+                    <input id="experiment-camera-add-device" type="text" placeholder="device_id, USB serial, or IP:port">
+                    <button onclick="addCameraToExperiment()">Add Camera</button>
+                </div>
+                <div class="muted" style="margin-top:6px">Use this when a camera comes online after the trial has already started. Existing frames and tray records stay intact.</div>
                 <h3 style="margin-top:18px">2. Map Trays And Varieties</h3>
                 <div class="controls" style="margin-top:8px">
                     <select id="tray-experiment-id"></select>
@@ -3512,8 +3681,11 @@ OBSERVATORY_DASHBOARD_HTML = """
                     <input id="tray-name" type="text" placeholder="Tray name">
                     <input id="tray-variety" type="text" placeholder="variety">
                     <select id="tray-device"><option value="">Device</option>{% for d in devices %}<option value="{{d}}">{{ device_aliases.get(d, d) }}</option>{% endfor %}</select>
-                    <input id="tray-rows" type="number" min="1" max="50" value="4" title="Rows">
-                    <input id="tray-cols" type="number" min="1" max="50" value="6" title="Columns">
+                    <select id="tray-layout" title="Planting layout" onchange="updateTrayLayoutFields()"><option value="radial" selected>Radial around center</option><option value="freeform">Freeform drawn cells</option><option value="grid">Grid rows x cols</option></select>
+                    <input id="tray-target-count" type="number" min="0" max="500" value="8" title="Expected plant count">
+                    <input id="tray-center-feature" type="text" value="Blumat" placeholder="center feature">
+                    <input id="tray-rows" type="number" min="1" max="50" value="1" title="Rows" style="display:none" onchange="updateTrayLayoutFields()">
+                    <input id="tray-cols" type="number" min="1" max="50" value="8" title="Columns" style="display:none" onchange="updateTrayLayoutFields()">
                     <input id="tray-planted" type="date" title="planted date">
                     <button class="primary" onclick="saveTrayRecord()">Save Tray</button>
                 </div>
@@ -3582,11 +3754,30 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <div class="muted" style="margin-top:6px">Select cameras seeing the same plants and calibration target, confirm target dimensions, then calibrate and reconstruct.</div>
                 <div class="timeline" id="volume-camera-list"></div>
                 <div class="controls" style="max-width:520px">
+                    <button class="primary" onclick="captureVolumetricShot()">Capture + Reconstruct</button>
                     <button onclick="calibrateMulti()">Calibrate 3D</button>
                     <button onclick="reconstruct3D()">Run Volumetric</button>
                 </div>
                 <canvas id="volume-preview" style="margin-top:12px; height:320px !important; background:#070908; border:1px solid #26302c; border-radius:6px"></canvas>
                 <div class="timeline" id="calibration-list"><div class="event"><time>Ready</time><div>Use the red marker editors on Mission Control to confirm ArUco/ChArUco dimensions first.</div></div></div>
+                <h3 style="margin-top:18px">6×6 Spatial Landmarks</h3>
+                <div class="muted">Register each installed tag by dictionary, printed size, center position, and XYZ rotation in the shared millimeter coordinate system.</div>
+                <div class="controls" style="margin-top:8px">
+                    <select id="landmark-dictionary"><option value="6X6_250">6X6_250</option></select>
+                    <input id="landmark-id" type="number" min="0" max="249" placeholder="Tag ID">
+                    <input id="landmark-label" type="text" placeholder="Location label">
+                    <input id="landmark-size" type="number" min="10" step="0.1" value="52" placeholder="Size mm">
+                </div>
+                <div class="controls" style="margin-top:8px">
+                    <input id="landmark-x" type="number" step="0.1" value="0" placeholder="X mm">
+                    <input id="landmark-y" type="number" step="0.1" value="0" placeholder="Y mm">
+                    <input id="landmark-z" type="number" step="0.1" value="0" placeholder="Z mm">
+                    <input id="landmark-rx" type="number" step="0.1" value="0" placeholder="Rot X°">
+                    <input id="landmark-ry" type="number" step="0.1" value="0" placeholder="Rot Y°">
+                    <input id="landmark-rz" type="number" step="0.1" value="0" placeholder="Rot Z°">
+                    <button class="primary" onclick="saveLandmark()">Save Landmark</button>
+                </div>
+                <div class="timeline" id="landmark-list"><div class="event"><time>None</time><div>No spatial landmarks mapped yet.</div></div></div>
             </section>
             <section class="panel view-section" id="view-settings">
                 <h2>Settings</h2>
@@ -3597,22 +3788,22 @@ OBSERVATORY_DASHBOARD_HTML = """
                         <time>Optional</time>
                         <div>
                             <strong>Connect Android phones through the PC hotspot</strong><br>
-                            USB remains the setup and recovery path. Enter the phone's hotspot address for direct connection without relying on network discovery.
+                            Old phones: plug in USB first, choose the phone, then prepare it for Wi-Fi. New Android 11+ phones: pair with the short pairing port and code, then connect with the normal Wi-Fi debugging address.
                             <div class="controls" style="margin-top:8px">
                                 <input id="adb-wifi-name" type="text" placeholder="Camera name">
-                                <input id="adb-wifi-endpoint" type="text" placeholder="192.168.137.42:5555">
+                                <input id="adb-wifi-endpoint" type="text" placeholder="phone IP:port, usually 192.168.137.x:5555">
                                 <button class="primary" onclick="connectWifiAdb()">Connect and Save</button>
                                 <button class="warn" onclick="disconnectWifiAdb()">Disconnect and Forget</button>
                                 <button onclick="reconnectWifiAdb()">Reconnect Saved</button>
                             </div>
                             <div class="controls" style="margin-top:8px">
                                 <select id="adb-usb-serial"><option value="">Select USB phone</option></select>
-                                <button onclick="prepareLegacyWifiAdb()">Prepare USB Phone for Wi-Fi</button>
+                                <button onclick="prepareLegacyWifiAdb()">Old Phone: Use USB First</button>
                             </div>
                             <div class="controls" style="margin-top:8px">
-                                <input id="adb-pair-endpoint" type="text" placeholder="Android 11+ pairing IP:port">
+                                <input id="adb-pair-endpoint" type="text" placeholder="pairing IP:port from phone screen">
                                 <input id="adb-pair-code" type="text" inputmode="numeric" placeholder="Pairing code">
-                                <button onclick="pairWifiAdb()">Pair Android 11+</button>
+                                <button onclick="pairWifiAdb()">New Phone: Pair Code</button>
                             </div>
                             <div class="muted" id="adb-transport-status" style="margin-top:8px">Loading ADB transports...</div>
                         </div>
@@ -3823,6 +4014,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 renderMovementWorkspace(latestStats);
                 loadVideoImports();
             }
+            if (name === 'volume') loadLandmarks();
             if (name === 'segmentation') loadSegments();
             if (name === 'segmentation' && !segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
@@ -3838,7 +4030,8 @@ OBSERVATORY_DASHBOARD_HTML = """
                     return body;
                 }).then(d => {
                     const calibrated = d.calibrated || [];
-                    showOperation('Calibration complete', calibrated.length ? `Camera poses saved for: ${calibrated.join(', ')}` : 'No cameras produced a valid ChArUco pose. Check marker visibility, focus, and lighting.', calibrated.length ? 'normal' : 'warn');
+                    const details = calibrated.map(device => `${device} via ${((d.poses || {})[device] || {}).source || 'calibration target'}`).join(', ');
+                    showOperation('Calibration complete', calibrated.length ? `Camera poses saved for: ${details}` : 'No cameras produced a valid ChArUco or mapped-landmark pose. Check tag registration, visibility, focus, and lighting.', calibrated.length ? 'normal' : 'warn');
                 }).catch(e => showOperation('Calibration failed', e.message, 'bad'));
             }
         }
@@ -3853,6 +4046,64 @@ OBSERVATORY_DASHBOARD_HTML = """
                 showOperation('Volumetric reconstruction complete', `Volume: ${cm3} cm3. Occupied voxels: ${d.occupied_voxels || 0}. Grid: ${(d.grid_shape || []).join(' x ')}`);
                 renderVolumePreview(d);
             }).catch(e => showOperation('Reconstruction failed', e.message, 'bad'));
+        }
+        function captureVolumetricShot() {
+            const devices = Array.from(document.querySelectorAll('.volume-camera-check:checked')).map(el => el.value);
+            if (devices.length < 2) {
+                showOperation('Volumetric capture needs more cameras', 'Select at least two connected Android phones.', 'warn');
+                return;
+            }
+            showOperation('Synchronized capture preparing', 'Checking APKs, measuring each phone clock, and warming the cameras...');
+            fetch('/volumetric/capture', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({devices})
+            }).then(async response => {
+                const body = await response.json();
+                if (!response.ok) throw new Error(body.message || 'Synchronized capture failed');
+                return body;
+            }).then(body => {
+                showOperation('Synchronized capture complete', `${body.shot_id}: ${(body.successful_devices || []).join(', ')}. Reconstructing this camera set...`);
+                return fetch('/reconstruct?devices=' + encodeURIComponent((body.successful_devices || devices).join(',')));
+            }).then(async response => {
+                const body = response.headers.get('content-type')?.includes('application/json') ? await response.json() : {error: await response.text()};
+                if (!response.ok) throw new Error(body.error || body.message || 'Reconstruction failed');
+                const cm3 = body.volume_mm3 ? (body.volume_mm3 / 1000).toFixed(2) : '0.00';
+                showOperation('Volumetric shot complete', `Volume: ${cm3} cm3 from synchronized phone images.`);
+                renderVolumePreview(body);
+            }).catch(error => showOperation('Volumetric shot failed', error.message, 'bad'));
+        }
+        function loadLandmarks() {
+            fetch('/landmarks').then(r => r.json()).then(body => renderLandmarks(body.landmarks || []));
+        }
+        function renderLandmarks(landmarks) {
+            const root = document.getElementById('landmark-list');
+            if (!root) return;
+            root.innerHTML = landmarks.length ? landmarks.map(item => {
+                const position = (item.position_mm || [0, 0, 0]).join(', ');
+                const rotation = (item.rotation_deg || [0, 0, 0]).join(', ');
+                return `<div class="event"><time>${item.dictionary}:${item.id}</time><div><strong>${item.label || 'Spatial landmark'}</strong><br>${item.size_mm} mm; position ${position} mm; rotation ${rotation}° <button class="danger" onclick="deleteLandmark('${item.dictionary}', ${item.id})">Delete</button></div></div>`;
+            }).join('') : '<div class="event"><time>None</time><div>No spatial landmarks mapped yet.</div></div>';
+        }
+        function saveLandmark() {
+            const value = id => Number(document.getElementById(id).value || 0);
+            const payload = {
+                dictionary: document.getElementById('landmark-dictionary').value,
+                id: value('landmark-id'),
+                label: document.getElementById('landmark-label').value.trim(),
+                size_mm: value('landmark-size'),
+                position_mm: [value('landmark-x'), value('landmark-y'), value('landmark-z')],
+                rotation_deg: [value('landmark-rx'), value('landmark-ry'), value('landmark-rz')],
+                enabled: true
+            };
+            fetch('/landmarks', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+                .then(async response => { const body = await response.json(); if (!response.ok) throw new Error(body.message || 'Could not save landmark'); return body; })
+                .then(body => { renderLandmarks(body.landmarks || []); showOperation('Spatial landmark saved', `${payload.dictionary}:${payload.id} is available for camera-pose calibration.`); })
+                .catch(error => showOperation('Landmark save failed', error.message, 'bad'));
+        }
+        function deleteLandmark(dictionary, markerId) {
+            fetch(`/landmarks/${encodeURIComponent(dictionary)}/${markerId}`, {method: 'DELETE'})
+                .then(r => r.json()).then(body => renderLandmarks(body.landmarks || []));
         }
         function renderVolumePreview(data) {
             const canvas = document.getElementById('volume-preview');
@@ -4599,6 +4850,23 @@ OBSERVATORY_DASHBOARD_HTML = """
             document.getElementById('segment-image')?.classList.add('draw-segment-active');
             showOperation('Tray cell draw mode', `${tray.tray_id}: drag across one planted cell.`);
         }
+        function enableTrayCellPolygonMode() {
+            if (!segmentState.deviceId) {
+                const first = Object.keys(latestStats || {})[0];
+                if (first) selectSegmentationDevice(first);
+            }
+            if (selectedSetupIsLocked()) return;
+            const tray = activeTrayForSetup();
+            if (!tray) {
+                showOperation('Choose tray first', 'Create or select a tray in Trial Management before drawing a cell.', 'warn');
+                return;
+            }
+            segmentState.enabled = true;
+            segmentState.mode = 'tray-cell-polygon';
+            segmentState.points = [];
+            document.getElementById('segment-image')?.classList.add('draw-segment-active');
+            showOperation('Tray cell polygon mode', `${tray.tray_id}: click around one planted cell, then double-click the image to finish.`);
+        }
         function enablePolygonSegmentMode() {
             if (!segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
@@ -4680,7 +4948,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             if (selectedSetupIsLocked()) return;
             event.preventDefault();
             const point = segmentImagePoint(event, event.target);
-            if (segmentState.mode === 'polygon' || segmentState.mode === 'ignore-polygon' || segmentState.mode === 'color-patch') {
+            if (segmentState.mode === 'polygon' || segmentState.mode === 'tray-cell-polygon' || segmentState.mode === 'ignore-polygon' || segmentState.mode === 'color-patch') {
                 segmentState.points.push(point);
                 renderPointModeOverlay();
                 updateColorPatchStatus();
@@ -4781,6 +5049,15 @@ OBSERVATORY_DASHBOARD_HTML = """
                 saveIgnoreFromEditor({ polygon });
                 return;
             }
+            if (segmentState.mode === 'tray-cell-polygon') {
+                if (segmentState.points.length < 3) {
+                    showOperation('Tray cell skipped', 'A polygon cell needs at least 3 points.', 'warn');
+                    return;
+                }
+                const polygon = segmentState.points.map(p => [Math.round(p.x), Math.round(p.y)]);
+                saveTrayCellFromEditor(null, polygon);
+                return;
+            }
             if (segmentState.mode === 'color-patch') {
                 saveColorPatchFromPoints();
                 return;
@@ -4857,7 +5134,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 updateStats();
             });
         }
-        function saveTrayCellFromEditor(region) {
+        function saveTrayCellFromEditor(region, polygon = null) {
             const tray = activeTrayForSetup();
             if (!tray) {
                 showOperation('Tray cell skipped', 'Select a tray before drawing cells.', 'warn');
@@ -4865,13 +5142,18 @@ OBSERVATORY_DASHBOARD_HTML = """
             }
             const cells = tray.cells || [];
             const index = cells.length;
-            const row = Math.floor(index / Math.max(1, Number(tray.cols || 1)));
-            const col = index % Math.max(1, Number(tray.cols || 1));
-            const name = prompt('Cell name', `R${row + 1}C${col + 1}`) || `R${row + 1}C${col + 1}`;
+            const layout = tray.layout_type || 'freeform';
+            const row = layout === 'grid' ? Math.floor(index / Math.max(1, Number(tray.cols || 1))) : 0;
+            const col = layout === 'grid' ? index % Math.max(1, Number(tray.cols || 1)) : index;
+            const defaultName = layout === 'grid' ? `R${row + 1}C${col + 1}` : `P${index + 1}`;
+            const name = prompt('Plant/cell name', defaultName) || defaultName;
+            const payload = { device_id: segmentState.deviceId, row, col, position_index: index, name };
+            if (polygon) payload.polygon = polygon;
+            else payload.region = region;
             fetch(`/trays/${encodeURIComponent(tray.tray_id)}/cells`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ device_id: segmentState.deviceId, row, col, name, region })
+                body: JSON.stringify(payload)
             }).then(async r => {
                 const body = await r.json();
                 if (!r.ok) throw new Error(body.message || 'Cell save failed');
@@ -5007,6 +5289,15 @@ OBSERVATORY_DASHBOARD_HTML = """
                     (highlightedPlant.plant_id && highlightedPlant.plant_id === cell.plant_id) ||
                     (highlightedPlant.tray_id === cell.tray_id && highlightedPlant.cell_id === cell.cell_id)
                 );
+                if (cell.polygon && cell.polygon.length >= 3) {
+                    const xs = cell.polygon.map(p => p[0]);
+                    const ys = cell.polygon.map(p => p[1]);
+                    const minX = Math.min(...xs), minY = Math.min(...ys);
+                    const width = Math.max(...xs) - minX;
+                    const height = Math.max(...ys) - minY;
+                    const points = cell.polygon.map(p => `${(p[0] - minX) * sx},${(p[1] - minY) * sy}`).join(' ');
+                    return `<svg class="segment-box ${highlighted ? 'highlighted-plant' : ''}" style="left:${minX * sx}px;top:${minY * sy}px;width:${width * sx}px;height:${height * sy}px;padding:0;border-color:${color};background:transparent" viewBox="0 0 ${width * sx} ${height * sy}" preserveAspectRatio="none"><polygon points="${points}" fill="rgba(255,255,255,.04)" stroke="${color}" stroke-width="2"></polygon><text x="4" y="14" fill="#fff">${cell.name || cell.cell_id}</text></svg>`;
+                }
                 return `<div class="segment-box ${highlighted ? 'highlighted-plant' : ''}" title="${cell.name || cell.cell_id}" style="left:${x1 * sx}px;top:${y1 * sy}px;width:${(x2 - x1) * sx}px;height:${(y2 - y1) * sy}px;border-color:${color};background:rgba(255,255,255,.04)">${cell.name || cell.cell_id}</div>`;
             }).join('');
             container.innerHTML = segmentHtml + colorHtml + cellHtml;
@@ -5035,9 +5326,11 @@ OBSERVATORY_DASHBOARD_HTML = """
             const deviceId = segmentState.deviceId || Object.keys(segmentState.segments || {})[0];
             const segments = (segmentState.segments || {})[deviceId] || [];
             const markers = (segmentState.manualMarkers || {})[deviceId] || [];
+            const cells = trayCellsForDevice(deviceId);
             const segmentHtml = segments.length ? segments.map(seg => `<div class="event"><time>${deviceId}</time><div><strong>${seg.name}</strong><br>${(seg.polygon ? 'polygon' : (seg.region || []).join(', '))}<br><button type="button" onclick="deleteSegment(${JSON.stringify(deviceId)},${JSON.stringify(seg.id)})">Delete</button></div></div>`).join('') : '<div class="event"><time>None</time><div>No segments saved for the selected camera.</div></div>';
+            const cellHtml = cells.length ? cells.map(cell => `<div class="event"><time>${cell.tray_name || cell.tray_id}</time><div><strong>${cell.name || cell.cell_id}</strong><br>${cell.polygon ? 'polygon cell' : (cell.region || []).join(', ')}<br><button type="button" onclick="highlightPlant(${JSON.stringify(deviceId)},${JSON.stringify(cell.tray_id)},${JSON.stringify(cell.cell_id)},${JSON.stringify(cell.plant_id || '')})">Highlight</button><button class="warn" type="button" onclick="deleteTrayCell(${JSON.stringify(cell.tray_id)},${JSON.stringify(cell.cell_id)})">Delete Cell</button></div></div>`).join('') : '<div class="event"><time>Cells</time><div>No tray cells saved for the selected camera.</div></div>';
             const markerHtml = markers.length ? markers.map((marker, idx) => `<div class="event"><time>Tag</time><div><strong>${marker.id || 'manual'}</strong><br>${marker.size_mm} mm manual marker<br><button onclick="deleteManualMarker('${deviceId}','${marker.uid || idx}')">Remove Tag</button></div></div>`).join('') : '';
-            list.innerHTML = segmentHtml + markerHtml;
+            list.innerHTML = cellHtml + segmentHtml + markerHtml;
         }
         function renderColorPatchList() {
             const list = document.getElementById('color-patch-list');
@@ -5771,7 +6064,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         function updateStats() {
             fetch('/stats').then(r => r.json()).then(stats => {
                 latestStats = stats || {};
-                const entries = Object.entries(stats || {});
+                const entries = Object.entries(stats || {}).filter(([id]) => connectedDevices.has(id));
                 if (entries.length === 0) return;
                 let fastest = null, calibrated = 0, latest = '';
                 const events = [];
@@ -5847,7 +6140,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         function renderMovementWorkspace(stats) {
             const root = document.getElementById('movement-list');
             if (!root) return;
-            const entries = Object.entries(stats || {});
+            const entries = Object.entries(stats || {}).filter(([id]) => connectedDevices.has(id));
             fetch('/biology_state').then(r => r.json()).then(body => renderRhythmList(body.rhythms || {})).catch(() => {});
             root.innerHTML = entries.length ? entries.map(([id, info]) => {
                 const history = info.history || [];
@@ -5934,8 +6227,12 @@ OBSERVATORY_DASHBOARD_HTML = """
                 renderExperimentDeviceList(experiments);
                 renderTrayRecords(trays);
                 renderSetupTraySelect();
+                renderSegmentList();
+                renderAllSegmentOverlays();
                 const select = document.getElementById('experiment-event-id');
                 if (select) select.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
+                const addCameraSelect = document.getElementById('experiment-camera-add-id');
+                if (addCameraSelect) addCameraSelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
                 const traySelect = document.getElementById('tray-experiment-id');
                 if (traySelect) traySelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
                 const harvestSelect = document.getElementById('harvest-experiment-id');
@@ -6016,13 +6313,32 @@ OBSERVATORY_DASHBOARD_HTML = """
                 const cells = tray.cells || [];
                 const germinated = cells.filter(cell => cell.status === 'germinated').length;
                 const candidates = cells.filter(cell => Number(cell.candidate_count || 0) > 0 && cell.status !== 'germinated').length;
+                const layoutLabel = tray.layout_type === 'grid'
+                    ? `grid ${tray.rows || 1}x${tray.cols || 1}`
+                    : tray.layout_type === 'radial'
+                        ? `radial ${tray.target_count || cells.length || 0} around ${tray.center_feature || 'center'}`
+                        : `freeform ${tray.target_count || cells.length || 0} plants`;
                 const cellRows = cells.length ? cells.map(cell => {
                     const count = Number(cell.candidate_count || 0);
                     const metrics = cell.last_seen_at ? `Area ${fmt(Number(cell.last_area_mm2 || 0), 1)} mm2, green ${fmt(Number(cell.last_coverage || 0) * 100, 1)}%, confidence ${count}/3` : 'Awaiting baseline frame';
                     return `<div class="event"><time>${cell.status || 'empty'}</time><div><strong>${cell.name || cell.cell_id}</strong> ${cell.plant_id ? `(${cell.plant_id})` : ''}<br>${metrics}<br><button onclick="highlightPlant(${JSON.stringify(tray.device_id || '')},${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},${JSON.stringify(cell.plant_id || '')})">Highlight</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'empty')">Empty</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'failed')">Failed</button><button onclick="setTrayCellStatus(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)},'germinated', ${JSON.stringify(cell.plant_id || `${tray.tray_id}_${cell.cell_id}`)})">Confirm Germinated</button><button class="warn" onclick="deleteTrayCell(${JSON.stringify(tray.tray_id)},${JSON.stringify(cell.cell_id)})">Delete</button></div></div>`;
                 }).join('') : '<div class="event"><time>Cells</time><div>No cells drawn yet. Select this tray in Setup and use Add Tray Cell.</div></div>';
-                return `<div class="event"><time>${germinated}/${cells.length}</time><div><strong>${tray.name || tray.tray_id}</strong> ${tray.variety ? `(${tray.variety})` : ''}<br>Device ${tray.device_id || '--'}, planted ${tray.planted_at || '--'}, layout ${tray.rows || 1}x${tray.cols || 1}, candidates ${candidates}<br><span class="muted">${tray.notes || ''}</span><br><button onclick="goSegmentTray(${JSON.stringify(tray.device_id || '')},${JSON.stringify(tray.tray_id)})">Segment This Tray</button></div></div>${cellRows}`;
+                return `<div class="event"><time>${germinated}/${cells.length}</time><div><strong>${tray.name || tray.tray_id}</strong> ${tray.variety ? `(${tray.variety})` : ''}<br>Device ${tray.device_id || '--'}, planted ${tray.planted_at || '--'}, layout ${layoutLabel}, candidates ${candidates}<br><span class="muted">${tray.notes || ''}</span><br><button onclick="goSegmentTray(${JSON.stringify(tray.device_id || '')},${JSON.stringify(tray.tray_id)})">Draw Plant Cells</button></div></div>${cellRows}`;
             }).join('') : '<div class="event"><time>Ready</time><div>Create a tray, then draw fixed cells in Setup for automatic germination locking.</div></div>';
+        }
+        function updateTrayLayoutFields() {
+            const layout = document.getElementById('tray-layout')?.value || 'freeform';
+            const rows = document.getElementById('tray-rows');
+            const cols = document.getElementById('tray-cols');
+            const center = document.getElementById('tray-center-feature');
+            if (rows) rows.style.display = layout === 'grid' ? '' : 'none';
+            if (cols) cols.style.display = layout === 'grid' ? '' : 'none';
+            if (center) center.style.display = layout === 'radial' ? '' : 'none';
+            const count = document.getElementById('tray-target-count');
+            if (count && layout === 'grid') {
+                const total = Number(rows?.value || 1) * Number(cols?.value || 1);
+                if (total > 0) count.value = total;
+            }
         }
         function saveTrayRecord() {
             const experimentId = document.getElementById('tray-experiment-id')?.value || document.getElementById('experiment-id')?.value || '';
@@ -6032,6 +6348,9 @@ OBSERVATORY_DASHBOARD_HTML = """
                 variety: document.getElementById('tray-variety').value.trim(),
                 experiment_id: experimentId,
                 device_id: document.getElementById('tray-device').value,
+                layout_type: document.getElementById('tray-layout').value,
+                target_count: document.getElementById('tray-target-count').value,
+                center_feature: document.getElementById('tray-center-feature').value.trim(),
                 rows: document.getElementById('tray-rows').value,
                 cols: document.getElementById('tray-cols').value,
                 planted_at: document.getElementById('tray-planted').value,
@@ -6081,6 +6400,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 .then(() => {
                     showOperation('Cell deleted', `${trayId}: ${cellId}`);
                     loadExperiments();
+                    updateStats();
                 });
         }
         function renderPlantRecords(plants, rhythms) {
@@ -6200,6 +6520,28 @@ OBSERVATORY_DASHBOARD_HTML = """
                 loadExperiments();
             }).catch(error => showOperation('Experiment save failed', error.message, 'bad'));
         }
+        function addCameraToExperiment() {
+            const experimentId = document.getElementById('experiment-camera-add-id')?.value || document.getElementById('experiment-event-id')?.value || '';
+            const input = document.getElementById('experiment-camera-add-device');
+            const deviceId = input?.value.trim() || '';
+            if (!experimentId || !deviceId) {
+                showOperation('Camera not added', 'Choose an experiment and enter the camera device_id.', 'warn');
+                return;
+            }
+            fetch(`/experiments/${encodeURIComponent(experimentId)}/devices`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({device_id: deviceId, log_event: true})
+            }).then(async r => {
+                const body = await r.json();
+                if (!r.ok) throw new Error(body.message || 'Camera add failed');
+                return body;
+            }).then(body => {
+                if (input) input.value = '';
+                showOperation('Camera added to trial', `${deviceId}: experiment ${experimentId} now tracks ${(body.experiment.devices || []).length} camera(s).`);
+                loadExperiments();
+            }).catch(error => showOperation('Camera add failed', error.message, 'bad'));
+        }
         function downloadExperimentExport() {
             showOperation('Export started', 'Building trial CSV bundle.');
             window.location.href = '/experiments/export.zip';
@@ -6318,6 +6660,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         loadExperiments();
         loadActivity();
         loadSegments();
+        updateTrayLayoutFields();
         updateStats();
         setInterval(loadActivity, 2500);
         window.addEventListener('resize', () => {
