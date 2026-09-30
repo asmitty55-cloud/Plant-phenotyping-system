@@ -24,6 +24,7 @@ dependencies = [
 [project.scripts]
 pt-dashboard = "pt.api.app:run_app"
 pt-run-pipeline = "pt.pipeline.run_pipeline:main"
+pt-validate = "pt.validation:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

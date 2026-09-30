@@ -70,6 +70,7 @@ ptcapture.apk.idsig
 plant_stats.json
 output-metadata.json
 reconstruction.json
+validation/validation_report.json
 
 # =========================
 # local experiment overrides

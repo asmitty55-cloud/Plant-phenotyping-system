@@ -213,7 +213,7 @@ def _parse_device_uptime_ms(value):
     return int(round(float(first) * 1000))
 
 
-def measure_device_clock_offset_ms(device, samples=5):
+def measure_device_clock_offset_ms(device, samples=5, return_details=False):
     """Estimate Android monotonic uptime offset using midpoint RTT sampling."""
     readings = []
     for _ in range(max(1, int(samples))):
@@ -231,17 +231,27 @@ def measure_device_clock_offset_ms(device, samples=5):
     readings.sort(key=lambda item: item[0])
     best = readings[:max(1, min(3, len(readings)))]
     offsets = sorted(item[1] for item in best)
-    return int(round(offsets[len(offsets) // 2]))
+    offset_ms = int(round(offsets[len(offsets) // 2]))
+    if return_details:
+        return {
+            "offset_ms": offset_ms,
+            "min_rtt_ms": float(best[0][0]),
+            "uncertainty_ms": float(best[0][0]) / 2.0,
+        }
+    return offset_ms
 
 
 def synchronized_device_targets(devices, lead_ms=12000):
     """Return one host target and the corresponding wall-clock target per phone."""
     offsets = {}
+    uncertainties = {}
     errors = {}
 
     def measure(device):
         try:
-            offsets[device] = measure_device_clock_offset_ms(device)
+            reading = measure_device_clock_offset_ms(device, return_details=True)
+            offsets[device] = reading["offset_ms"]
+            uncertainties[device] = reading["uncertainty_ms"]
         except Exception as exc:
             errors[device] = str(exc)
 
@@ -253,6 +263,7 @@ def synchronized_device_targets(devices, lead_ms=12000):
     if errors:
         raise RuntimeError("; ".join(f"{device}: {message}" for device, message in errors.items()))
     host_target_ms = int(time.monotonic_ns() / 1_000_000) + max(3000, int(lead_ms))
+    worst_uncertainties = sorted(uncertainties.values(), reverse=True)[:2]
     return {
         "host_target_ms": host_target_ms,
         "device_target_ms": {
@@ -260,6 +271,8 @@ def synchronized_device_targets(devices, lead_ms=12000):
             for device in devices
         },
         "clock_offset_ms": offsets,
+        "clock_uncertainty_ms": uncertainties,
+        "sync_quality_ms": float(sum(worst_uncertainties)),
     }
 
 def wait_for_capture_complete(device, filename):

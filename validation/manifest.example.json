@@ -1,0 +1,29 @@
+{
+  "schema_version": "plant_validation.v1",
+  "dataset_name": "greenhouse-canopy-reference-v1",
+  "calibration_snapshot": "calibration_snapshot.json",
+  "samples": [
+    {
+      "id": "camera_a_day_001",
+      "image": "canopy_masks/source_images/camera_a_day_001.jpg",
+      "validated_mask": "canopy_masks/reference_masks/camera_a_day_001.png",
+      "device_id": "camera_a",
+      "true_area_cm2": 123.4,
+      "reference_coverage": 0.42,
+      "color_reference": {
+        "green_index": 0.31,
+        "chlorosis_ratio": 0.08
+      }
+    }
+  ],
+  "reconstructions": [
+    {
+      "id": "tray_01_observation_001",
+      "images": [
+        {"device_id": "camera_a", "image": "reconstruction_reference/camera_a_001.jpg"},
+        {"device_id": "camera_b", "image": "reconstruction_reference/camera_b_001.jpg"}
+      ],
+      "reference_volume_cm3": 38.2
+    }
+  ]
+}

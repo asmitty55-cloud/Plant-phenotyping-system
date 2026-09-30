@@ -1,0 +1,10 @@
+{
+  "mask_iou_min": 0.9,
+  "mask_precision_min": 0.9,
+  "mask_recall_min": 0.9,
+  "area_mean_absolute_percent_error_max": 5.0,
+  "coverage_mae_max": 0.05,
+  "color_mean_absolute_percent_error_max": 10.0,
+  "volume_mean_absolute_percent_error_max": 10.0,
+  "threshold_status": "provisional"
+}
