@@ -1,0 +1,7 @@
+{
+  "schema_version": "plant_validation.v1",
+  "dataset_name": "plant-phenotyping-reference",
+  "calibration_snapshot": null,
+  "samples": [],
+  "reconstructions": []
+}

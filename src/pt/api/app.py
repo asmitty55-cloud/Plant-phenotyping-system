@@ -8,13 +8,19 @@ import shutil
 import csv
 import io
 import zipfile
+import uuid
 import cv2
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from flask import Flask, render_template_string, jsonify, send_from_directory, request, Response, stream_with_context, send_file
 
 from pt.core.analysis import process_latest_captures
 from pt.core.analysis.calibration_store import calib_store
+from pt.core.analysis.modules import AnalysisObservation
+from pt.core.analysis.registry import ANALYSIS_REGISTRY
+from pt.core.analysis.circadian import dominant_frequency_hz
+from pt.core.analysis.metrics import SCHEMA_VERSION
 import pt.core.analysis.metric_store as metric_store
 from pt.core.analysis.segmentation_store import segmentation_store
 from pt.core.analysis.tray_store import add_cell, delete_cell, list_trays, set_cell_status, upsert_tray
@@ -26,14 +32,18 @@ from pt.device.calibration.phone_logger import PhoneLogger
 from pt.device import adb_transport
 from pt.device.capture_service import capture
 from pt.device.network_camera import (
+    camera_by_id,
     camera_has_live_stream,
     capture_network_camera,
     configured_camera_ids,
     mjpeg_live_frames,
     network_camera_status,
+    set_network_camera_mac,
     ptz_move,
     ptz_stop,
+    update_discovered_network_camera,
 )
+from pt.device.network_camera_discovery import discover_camera, normalize_mac, read_neighbor_macs
 
 
 # Get paths
@@ -61,6 +71,7 @@ os.makedirs(WORKING_VIDEOS_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 app = Flask(__name__)
+metric_store.ensure_db()
 
 # Global state
 phone_profiles = {}
@@ -79,6 +90,12 @@ video_locks = {}
 night_skip_started = {}
 operation_jobs = {}
 operation_jobs_lock = threading.Lock()
+network_camera_discovery_lock = threading.Lock()
+network_camera_discovery_scan_gate = threading.Lock()
+network_camera_discovery_active = {}
+network_camera_discovery_operations = {}
+network_camera_discovery_last_started = {}
+NETWORK_CAMERA_AUTO_SCAN_COOLDOWN_SECONDS = 90
 activity_lines = []
 activity_lock = threading.Lock()
 
@@ -189,10 +206,95 @@ def _frame_timestamp(filename):
 
 
 def network_camera_statuses(probe=False):
-    return {
+    statuses = {
         camera_id: network_camera_status(camera_id, probe=probe)
         for camera_id in configured_camera_ids()
     }
+    for camera_id, status in statuses.items():
+        if probe and not status.get("reachable") and status.get("mac_address"):
+            start_network_camera_discovery(camera_id, automatic=True)
+        with network_camera_discovery_lock:
+            status["discovery_operation"] = network_camera_discovery_operations.get(camera_id)
+    return statuses
+
+
+def _run_network_camera_discovery(camera_id, expected_mac, operation_id):
+    last_reported = [0]
+
+    def report_progress(completed, total):
+        progress = int(10 + 80 * completed / max(1, total))
+        if completed == total or progress >= last_reported[0] + 10:
+            last_reported[0] = progress
+            update_operation(operation_id, f"Scanned {completed} of {total} local addresses.", progress)
+
+    try:
+        with network_camera_discovery_scan_gate:
+            result = discover_camera(expected_mac, progress_callback=report_progress)
+        match = result.get("match")
+        if match:
+            updated = update_discovered_network_camera(camera_id, match)
+            status = network_camera_status(camera_id, probe=True)
+            response = {
+                "status": "matched",
+                "updated": True,
+                "host": updated["host"],
+                "rtsp_port": updated["rtsp_port"],
+                "mac_address": updated["mac_address"],
+                "reachable": bool(status.get("reachable")),
+            }
+            message = f"Camera found at {updated['host']}:{updated['rtsp_port']} by MAC address."
+        else:
+            response = {
+                "status": result.get("status", "not_found"),
+                "updated": False,
+                "candidates": [
+                    candidate for candidate in result.get("candidates", [])
+                    if candidate.get("mac_address") == expected_mac
+                ],
+            }
+            message = "Camera address was not changed; no unique RTSP camera matched the paired MAC."
+        update_operation(operation_id, message, 100, "complete", response)
+    except Exception as exc:
+        update_operation(operation_id, f"Camera discovery failed: {exc}", 100, "error", {"status": "error"})
+    finally:
+        with network_camera_discovery_lock:
+            network_camera_discovery_active.pop(camera_id, None)
+
+
+def start_network_camera_discovery(camera_id, automatic=False):
+    camera = camera_by_id(camera_id)
+    mac_address = (camera or {}).get("mac_address")
+    if not mac_address:
+        return None
+    now = time.monotonic()
+    with network_camera_discovery_lock:
+        active = network_camera_discovery_active.get(camera_id)
+        if active:
+            return active
+        last_started = network_camera_discovery_last_started.get(camera_id, 0.0)
+        if automatic and now - last_started < NETWORK_CAMERA_AUTO_SCAN_COOLDOWN_SECONDS:
+            return None
+        operation_id = f"network-camera-{uuid.uuid4().hex}"
+        network_camera_discovery_active[camera_id] = operation_id
+        network_camera_discovery_operations[camera_id] = operation_id
+        network_camera_discovery_last_started[camera_id] = now
+    update_operation(operation_id, f"Searching local networks for {camera.get('name') or camera_id}.", 1)
+    threading.Thread(
+        target=_run_network_camera_discovery,
+        args=(camera_id, mac_address, operation_id),
+        daemon=True,
+    ).start()
+    return operation_id
+
+
+def same_origin_mutation():
+    origin = request.headers.get("Origin")
+    if not origin:
+        return False
+    try:
+        return urlsplit(origin).netloc.lower() == request.host.lower()
+    except ValueError:
+        return False
 
 
 def reachable_network_camera_ids(statuses=None, probe=False):
@@ -876,8 +978,14 @@ def capture_and_sync(device_id):
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
+        capture_set_id = f"CS_{uuid.uuid4().hex}"
 
         settings = effective_capture_settings(device_id)
+        assigned_experiments = [
+            experiment for experiment in load_experiments()
+            if experiment.get("status") == "active" and device_id in experiment.get("devices", [])
+        ]
+        experiment_id = assigned_experiments[0]["id"] if len(assigned_experiments) == 1 else None
         logger.log(
             f"Triggering capture: {filename} light={settings['active_light_mode']} mode={settings['light_mode']} luma={settings['latest_luminance']} collect_night={settings['collect_night_frames']} zoom={settings['zoom_percent']}% focus={settings['focus_mode']} white_balance={settings['white_balance']} antibanding={settings['antibanding']}",
             major=True,
@@ -894,8 +1002,15 @@ def capture_and_sync(device_id):
             log_activity("Night capture skipped; waiting to summarize this night interval.", device_id)
             return True
 
+        metric_store.create_capture_set(
+            capture_set_id,
+            experiment_id=experiment_id,
+            captured_at_utc=datetime.strptime(timestamp, "%Y%m%d_%H%M%S").astimezone(timezone.utc).isoformat(),
+            source="scheduled_android",
+        )
         finish_night_skip(device_id, logger, daylight_timestamp=timestamp)
         log_activity("Sending capture command to phone.", device_id)
+        capture_started_ns = time.monotonic_ns()
         if capture.capture_on_device(
             device_id,
             filename,
@@ -909,20 +1024,38 @@ def capture_and_sync(device_id):
         ):
             log_activity("Capture complete; starting device sync.", device_id)
             sync_device(device_id, logger)
+            capture_duration_ms = (time.monotonic_ns() - capture_started_ns) / 1_000_000.0
             last_capture[device_id] = time.strftime("%Y-%m-%d %H:%M:%S")
 
             try:
                 log_activity("Analyzing greenspace, ChArUco scale, color reference, and movement.", device_id)
-                process_latest_captures(CAPTURES_DIR)
+                capture_metadata = {
+                    "source": "scheduled_android",
+                    "experiment_id": experiment_id,
+                    "camera_settings": settings,
+                }
+                process_latest_captures(
+                    CAPTURES_DIR,
+                    capture_set_ids={device_id: capture_set_id},
+                    capture_metadata_by_device={device_id: capture_metadata},
+                    device_ids=[device_id],
+                )
                 log_activity("Analysis complete.", device_id)
             except Exception as e:
                 print(f"[ANALYSIS] Error: {e}")
                 log_activity(f"Analysis failed: {e}", device_id)
+            metric_store.update_capture_set_qc(
+                capture_set_id, 1, [device_id], [], capture_duration_ms=capture_duration_ms
+            )
 
             log_activity("Updating timelapse video if enough new frames are available.", device_id)
             assemble_video(device_id)
             return True
         log_activity("Capture command failed or timed out.", device_id)
+        capture_duration_ms = (time.monotonic_ns() - capture_started_ns) / 1_000_000.0
+        metric_store.update_capture_set_qc(
+            capture_set_id, 1, [], [device_id], capture_duration_ms=capture_duration_ms
+        )
         return False
     finally:
         lock.release()
@@ -942,9 +1075,17 @@ def capture_network_and_analyze(camera_id):
             return False
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"capture_{timestamp}.jpg"
+        capture_set_id = f"CS_{uuid.uuid4().hex}"
         settings = effective_capture_settings(camera_id)
+        metric_store.create_capture_set(
+            capture_set_id,
+            captured_at_utc=datetime.strptime(timestamp, "%Y%m%d_%H%M%S").astimezone(timezone.utc).isoformat(),
+            source="network_camera",
+        )
         log_activity(f"Requesting network camera frame {filename}.", camera_id)
+        capture_started_ns = time.monotonic_ns()
         capture_path = capture_network_camera(camera_id, filename)
+        capture_duration_ms = (time.monotonic_ns() - capture_started_ns) / 1_000_000.0
         if capture_path:
             actual_luma = frame_luminance(capture_path)
             actual_mode = (
@@ -970,15 +1111,29 @@ def capture_network_and_analyze(camera_id):
             last_capture[camera_id] = time.strftime("%Y-%m-%d %H:%M:%S")
             try:
                 log_activity("Analyzing network frame greenspace, markers, color, and movement.", camera_id)
-                process_latest_captures(CAPTURES_DIR)
+                process_latest_captures(
+                    CAPTURES_DIR,
+                    capture_set_ids={camera_id: capture_set_id},
+                    capture_metadata_by_device={camera_id: {
+                        "source": "network_camera",
+                        "camera_settings": settings,
+                    }},
+                    device_ids=[camera_id],
+                )
                 log_activity("Network frame analysis complete.", camera_id)
             except Exception as e:
                 print(f"[ANALYSIS] Error: {e}")
                 log_activity(f"Network frame analysis failed: {e}", camera_id)
+            metric_store.update_capture_set_qc(
+                capture_set_id, 1, [camera_id], [], capture_duration_ms=capture_duration_ms
+            )
             log_activity("Updating network camera timelapse if needed.", camera_id)
             assemble_video(camera_id)
             return True
         log_activity("Network camera did not provide a fresh frame.", camera_id)
+        metric_store.update_capture_set_qc(
+            capture_set_id, 1, [], [camera_id], capture_duration_ms=capture_duration_ms
+        )
         return False
     finally:
         lock.release()
@@ -1535,61 +1690,220 @@ def lock_setup(device_id):
     update_operation(operation_id, f"{device_id}: setup lock complete.", 100, "complete", result)
     return jsonify(result)
 
-@app.route("/reconstruct")
-def run_reconstruction():
-    stats_file = os.path.join(DATA_ROOT, "plant_stats.json")
-    if not os.path.exists(stats_file):
-        return "No stats found", 404
+def reconstruct_capture_set(capture_set_id):
+    from pt.core.analysis.image_analysis import analyze_image
 
-    with open(stats_file, 'r') as f:
-        stats = json.load(f)
+    capture_set = metric_store.capture_set_detail(capture_set_id)
+    if capture_set is None:
+        return jsonify({"status": "not_found", "message": "CaptureSet not found."}), 404
 
     device_masks = {}
-    selected = request.args.get("devices", "")
-    allowed_devices = set([d for d in selected.split(",") if d]) if selected else None
-    for device_id, info in stats.items():
-        if allowed_devices and device_id not in allowed_devices:
-            continue
-        # This is a bit tricky as masks are not saved to disk by default
-        # We might need to re-run analysis or save masks
-        device_dir = os.path.join(CAPTURES_DIR, device_id)
-        latest = _latest_capture_file(os.listdir(device_dir))
-        if latest:
-            from pt.core.analysis.image_analysis import analyze_image
-            res = analyze_image(os.path.join(device_dir, latest), device_id=device_id)
-            if res and "mask" in res:
-                device_masks[device_id] = res["mask"]
+    image_failures = []
+    for image in capture_set["images"]:
+        result = analyze_image(image["image_path"], device_id=image["device_id"])
+        if result and result.get("mask") is not None:
+            device_masks[image["device_id"]] = result["mask"]
+        else:
+            image_failures.append(image["device_id"])
 
     if len(device_masks) < 2:
-        return "Need at least 2 masks for reconstruction", 400
+        result = {
+            "status": "invalid",
+            "message": "This CaptureSet needs at least two analyzable images.",
+            "capture_set_id": capture_set_id,
+            "images_used": sorted(device_masks),
+            "image_failures": image_failures,
+        }
+        metric_store.record_capture_set_reconstruction(capture_set_id, "invalid", result)
+        return jsonify(result), 400
 
-    vol_data = reconstruct_visual_hull(device_masks)
-    if vol_data.get("status") != "ok":
-        return jsonify(vol_data), 400
+    if not ANALYSIS_REGISTRY.is_enabled("volumetric"):
+        return jsonify({
+            "status": "disabled",
+            "message": "The volumetric analysis module is disabled.",
+            "capture_set_id": capture_set_id,
+        }), 409
+    volume_observation = AnalysisObservation(
+        device_id="capture_set",
+        context={"device_masks": device_masks, "reconstruct": reconstruct_visual_hull},
+    )
+    ANALYSIS_REGISTRY.run(volume_observation, {"volumetric"})
+    volume = volume_observation.metrics.get("volumetric")
+    if volume is None:
+        return jsonify({"status": "disabled", "capture_set_id": capture_set_id}), 409
+    if volume.get("status") != "ok" or len(volume.get("cameras_used", [])) < 2:
+        result = {
+            **volume,
+            "status": "invalid",
+            "message": volume.get("message") or "At least two calibrated cameras from this CaptureSet are required.",
+            "capture_set_id": capture_set_id,
+            "image_failures": image_failures,
+        }
+        metric_store.record_capture_set_reconstruction(capture_set_id, "invalid", result)
+        return jsonify(result), 400
 
-    # Save to a global reconstruction log
+    calibration_snapshot_id = metric_store.create_calibration_snapshot(calib_store.data)
+    reconstruction_parameters = {
+        "analysis_revision": "visual-hull.v1",
+        "voxel_size": [100, 100, 100],
+        "world_bounds_mm": [-200, -200, 0, 200, 200, 400],
+        "capture_set_id": capture_set_id,
+    }
+    analysis_run_id = metric_store.create_analysis_run(
+        capture_set_id,
+        calibration_snapshot_id,
+        "visual-hull.v1",
+        reconstruction_parameters,
+        enabled_modules=ANALYSIS_REGISTRY.names(enabled_only=True),
+        module_versions=ANALYSIS_REGISTRY.module_versions(),
+    )
+    result = {
+        **volume,
+        "capture_set_id": capture_set_id,
+        "analysis_run_id": analysis_run_id,
+        "calibration_snapshot_id": calibration_snapshot_id,
+        "enabled_modules": ANALYSIS_REGISTRY.names(enabled_only=True),
+        "module_versions": ANALYSIS_REGISTRY.module_versions(),
+        "parameters": reconstruction_parameters,
+        "images_used": sorted(device_masks),
+        "image_failures": image_failures,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    metric_store.record_capture_set_reconstruction(capture_set_id, "complete", result)
     rec_file = os.path.join(DATA_ROOT, "reconstruction.json")
     history = []
     if os.path.exists(rec_file):
         try:
-            with open(rec_file, 'r') as f: history = json.load(f)
-        except: pass
+            with open(rec_file, "r", encoding="utf-8") as handle:
+                history = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            history = []
+    history.append(result)
+    with open(rec_file, "w", encoding="utf-8") as handle:
+        json.dump(history[-100:], handle, indent=2)
+    return jsonify(result)
 
-    vol_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    history.append(vol_data)
-    with open(rec_file, 'w') as f: json.dump(history[-100:], f, indent=4)
 
-    return jsonify(vol_data)
+@app.route("/api/capture-sets")
+def capture_sets_api():
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "limit must be an integer."}), 400
+    return jsonify({"capture_sets": metric_store.list_capture_sets(limit)})
+
+
+@app.route("/api/system/manifest")
+def system_manifest_api():
+    from pt.core.analysis.image_analysis import _pipeline_version
+
+    experiments = load_experiments()
+    active_experiments = [item for item in experiments if item.get("status") == "active"]
+    module_versions = ANALYSIS_REGISTRY.module_versions()
+    calibration_summary = metric_store.calibration_counts()
+    return jsonify({
+        "pipeline_version": _pipeline_version(),
+        "schema_version": SCHEMA_VERSION,
+        "analysis_modules": [
+            {
+                "name": name,
+                "enabled": ANALYSIS_REGISTRY.is_enabled(name),
+                "version": module_versions[name],
+            }
+            for name in ANALYSIS_REGISTRY.names()
+        ],
+        "calibration_count": calibration_summary["snapshots"],
+        "calibrations": {
+            "snapshots": calibration_summary["snapshots"],
+            "camera_devices": len((calib_store.data.get("camera_params") or {})),
+            "landmarks": len((calib_store.data.get("landmarks") or {})),
+        },
+        "active_experiment_count": len(active_experiments),
+        "active_experiments": [
+            {"id": item.get("id"), "name": item.get("name"), "devices": item.get("devices", [])}
+            for item in active_experiments
+        ],
+    })
+
+
+@app.route("/api/analysis-runs/<analysis_run_id>")
+def analysis_run_detail_api(analysis_run_id):
+    record = metric_store.analysis_run_detail(analysis_run_id)
+    if record is None:
+        return jsonify({"status": "not_found", "analysis_run_id": analysis_run_id}), 404
+    return jsonify(record)
+
+
+@app.route("/api/capture-sets/<capture_set_id>")
+def capture_set_detail_api(capture_set_id):
+    record = metric_store.capture_set_detail(capture_set_id)
+    if record is None:
+        return jsonify({"status": "not_found", "capture_set_id": capture_set_id}), 404
+    return jsonify(record)
+
+
+@app.route("/api/capture-sets/<capture_set_id>/reconstruct", methods=["POST"])
+def capture_set_reconstruction_api(capture_set_id):
+    return reconstruct_capture_set(capture_set_id)
+
+
+@app.route("/api/capture-images/<device_id>/<path:filename>")
+def capture_image_api(device_id, filename):
+    record = metric_store.provenance_for_image(device_id, filename)
+    if record is None or not os.path.isfile(record["image_path"]):
+        return jsonify({"status": "not_found"}), 404
+    return send_file(record["image_path"], conditional=True)
+
+
+@app.route("/reconstruct")
+def run_reconstruction():
+    capture_set_id = request.args.get("capture_set_id")
+    if not capture_set_id:
+        latest = metric_store.list_capture_sets(limit=1000)
+        reconstructable = next((item for item in latest if item["image_count"] >= 2), None)
+        if not reconstructable:
+            return jsonify({"status": "not_found", "message": "No multi-image CaptureSet is available."}), 404
+        capture_set_id = reconstructable["capture_set_id"]
+    return reconstruct_capture_set(capture_set_id)
+
+
+@app.route("/api/provenance/<device_id>/<path:filename>")
+def image_provenance_api(device_id, filename):
+    record = metric_store.provenance_for_image(device_id, filename)
+    if record is None:
+        return jsonify({"status": "not_found", "device_id": device_id, "filename": filename}), 404
+    return jsonify(record)
 
 
 @app.route("/volumetric/capture", methods=["POST"])
 def capture_volumetric_set():
     data = request.get_json(silent=True) or {}
-    requested = [str(device).strip() for device in data.get("devices", []) if str(device).strip()]
+    requested = list(dict.fromkeys(str(device).strip() for device in data.get("devices", []) if str(device).strip()))
+    if len(requested) < 2:
+        return jsonify({"status": "error", "message": "Select at least two Android phones."}), 400
     connected = set(detect_connected_devices())
     devices = [device for device in requested if device in connected]
     if len(devices) < 2:
-        return jsonify({"status": "error", "message": "Select at least two connected Android phones."}), 400
+        shot_id = f"CS_VOLUME_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        metric_store.create_capture_set(
+            shot_id,
+            experiment_id=str(data.get("experiment_id") or "").strip() or None,
+            captured_at_utc=datetime.now(timezone.utc).isoformat(),
+            source="synchronized_android",
+        )
+        metric_store.update_capture_set_qc(
+            shot_id,
+            device_count=len(requested),
+            successful_devices=[],
+            failed_devices=requested,
+        )
+        return jsonify({
+            "status": "error",
+            "message": "Fewer than two selected Android phones are connected; no exposure was triggered.",
+            "shot_id": shot_id,
+            "successful_devices": [],
+            "failed_devices": requested,
+        }), 502
 
     settings_by_device = {}
     try:
@@ -1608,8 +1922,18 @@ def capture_volumetric_set():
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
 
-    shot_id = datetime.now().strftime("volume_%Y%m%d_%H%M%S")
-    filename = f"{shot_id}.jpg"
+    shot_id = f"CS_VOLUME_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    filename = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    target_utc = datetime.now(timezone.utc) + timedelta(
+        milliseconds=timing["host_target_ms"] - int(time.monotonic_ns() / 1_000_000)
+    )
+    experiment_id = str(data.get("experiment_id") or "").strip() or None
+    metric_store.create_capture_set(
+        shot_id,
+        experiment_id=experiment_id,
+        captured_at_utc=target_utc.isoformat(),
+        source="synchronized_android",
+    )
     results = {}
 
     def capture_phone(device_id):
@@ -1638,22 +1962,61 @@ def capture_volumetric_set():
                 "ok": bool(ok),
                 "target_elapsed_realtime_ms": timing["device_target_ms"][device_id],
                 "monotonic_offset_ms": timing["clock_offset_ms"][device_id],
+                "clock_uncertainty_ms": timing["clock_uncertainty_ms"][device_id],
             }
         except Exception as exc:
             results[device_id] = {"ok": False, "message": str(exc)}
         finally:
             lock.release()
 
+    capture_started_ns = time.monotonic_ns()
     threads = [threading.Thread(target=capture_phone, args=(device_id,)) for device_id in devices]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+    capture_duration_ms = (time.monotonic_ns() - capture_started_ns) / 1_000_000.0
 
     successful = [device for device, result in results.items() if result.get("ok")]
+    failed = sorted(set(requested) - set(successful))
+    metric_store.update_capture_set_qc(
+        shot_id,
+        device_count=len(requested),
+        successful_devices=successful,
+        failed_devices=failed,
+        sync_quality_ms=timing["sync_quality_ms"],
+        capture_duration_ms=capture_duration_ms,
+    )
     if successful:
         try:
-            process_latest_captures(CAPTURES_DIR)
+            capture_metadata_by_device = {
+                device_id: {
+                    "source": "synchronized_android",
+                    "experiment_id": experiment_id,
+                    "captured_at_utc": target_utc.isoformat(),
+                    "camera_settings": {
+                        **settings_by_device[device_id],
+                        "capture_target_elapsed_realtime_ms": results[device_id].get("target_elapsed_realtime_ms"),
+                        "monotonic_offset_ms": results[device_id].get("monotonic_offset_ms"),
+                        "clock_uncertainty_ms": results[device_id].get("clock_uncertainty_ms"),
+                    },
+                }
+                for device_id in successful
+            }
+            process_latest_captures(
+                CAPTURES_DIR,
+                capture_set_ids={device_id: shot_id for device_id in successful},
+                capture_metadata_by_device=capture_metadata_by_device,
+                device_ids=successful,
+            )
+            metric_store.update_capture_set_qc(
+                shot_id,
+                device_count=len(requested),
+                successful_devices=successful,
+                failed_devices=failed,
+                sync_quality_ms=timing["sync_quality_ms"],
+                capture_duration_ms=capture_duration_ms,
+            )
         except Exception as exc:
             return jsonify({
                 "status": "error",
@@ -1667,7 +2030,9 @@ def capture_volumetric_set():
         "shot_id": shot_id,
         "filename": filename,
         "host_target_ms": timing["host_target_ms"],
+        "sync_quality_ms": timing["sync_quality_ms"],
         "successful_devices": successful,
+        "failed_devices": failed,
         "results": results,
     }), status_code
 
@@ -1941,64 +2306,7 @@ def _import_video_job(video_name, device_id=None, sample_seconds=60, max_frames=
 
 
 def _dominant_frequency_hz(history):
-    samples = []
-    for entry in history or []:
-        movement = entry.get("movement") or {}
-        centroid = movement.get("centroid_px")
-        value = None
-        if isinstance(centroid, list) and len(centroid) == 2:
-            value = float(centroid[1])
-        elif movement.get("displacement_mm") is not None:
-            value = float(movement.get("displacement_mm") or 0)
-        timestamp = None
-        try:
-            timestamp = datetime.strptime(entry.get("timestamp") or "", "%Y-%m-%d %H:%M:%S").timestamp()
-        except (TypeError, ValueError):
-            pass
-        if timestamp and value is not None and np.isfinite(value):
-            samples.append((timestamp, value))
-    if len(samples) < 8:
-        return None
-    samples.sort()
-    times = np.asarray([item[0] for item in samples], dtype=np.float64)
-    values = np.asarray([item[1] for item in samples], dtype=np.float64)
-    span = float(times[-1] - times[0])
-    if span < 2 * 3600:
-        return None
-    deltas = np.diff(times)
-    step = float(np.median(deltas[deltas > 0])) if np.any(deltas > 0) else 0
-    if step <= 0:
-        return None
-    step = max(60.0, min(step, 3600.0))
-    uniform_times = np.arange(times[0], times[-1] + step, step)
-    if len(uniform_times) < 8:
-        return None
-    uniform_values = np.interp(uniform_times, times, values)
-    uniform_values = uniform_values - np.mean(uniform_values)
-    amplitude = float(np.std(uniform_values))
-    if amplitude <= 0:
-        return None
-    spectrum = np.abs(np.fft.rfft(uniform_values))
-    freqs = np.fft.rfftfreq(len(uniform_values), d=step)
-    min_freq = 1.0 / (48 * 3600)
-    max_freq = 1.0 / (2 * 3600)
-    mask = (freqs >= min_freq) & (freqs <= max_freq)
-    if not np.any(mask):
-        return None
-    masked_spectrum = spectrum[mask]
-    masked_freqs = freqs[mask]
-    index = int(np.argmax(masked_spectrum))
-    freq = float(masked_freqs[index])
-    strength = float(masked_spectrum[index] / max(1e-9, np.sum(masked_spectrum)))
-    return {
-        "frequency_hz": freq,
-        "period_hours": (1.0 / freq) / 3600.0 if freq > 0 else None,
-        "amplitude_px": amplitude,
-        "strength": strength,
-        "samples": len(samples),
-        "span_hours": span / 3600.0,
-        "fingerprint": f"{freq:.9g}Hz:{amplitude:.2f}px:{strength:.2f}",
-    }
+    return dominant_frequency_hz(history)
 
 
 def _biology_state():
@@ -2007,61 +2315,41 @@ def _biology_state():
     alerts = []
     for device_id, info in stats.items():
         history = info.get("history") or []
-        rhythm = _dominant_frequency_hz(history)
+        observation = AnalysisObservation(device_id=device_id, history=history)
+        module_results = ANALYSIS_REGISTRY.run(
+            observation,
+            {"circadian", "color_index", "growth"},
+        )
+        circadian_result = module_results.get("circadian")
+        rhythm = circadian_result.metrics.get("rhythm") if circadian_result else None
         if rhythm:
             rhythms[device_id] = rhythm
-            midpoint = len(history) // 2
-            if midpoint >= 8:
-                old = _dominant_frequency_hz(history[:midpoint])
-                new = _dominant_frequency_hz(history[midpoint:])
-                if old and new and old.get("frequency_hz"):
-                    shift = abs(new["frequency_hz"] - old["frequency_hz"]) / old["frequency_hz"]
-                    if shift >= 0.25:
-                        alerts.append({
-                            "severity": "warn",
-                            "type": "rhythm_shift",
-                            "device_id": device_id,
-                            "message": f"Circadian rhythm shifted {shift * 100:.0f}% ({old['frequency_hz']:.3g} Hz to {new['frequency_hz']:.3g} Hz).",
-                        })
-        recent = [entry for entry in history[-12:] if not entry.get("ignored")]
-        baseline = [entry for entry in history[-60:-12] if not entry.get("ignored")]
-        recent_green = [value for value in [
-            ((entry.get("color_metrics") or {}).get("green_index"))
-            for entry in recent
-        ] if isinstance(value, (int, float))]
-        baseline_green = [value for value in [
-            ((entry.get("color_metrics") or {}).get("green_index"))
-            for entry in baseline
-        ] if isinstance(value, (int, float))]
-        if recent_green and baseline_green:
-            recent_avg = float(np.mean(recent_green))
-            baseline_avg = float(np.mean(baseline_green))
-            if baseline_avg and recent_avg < baseline_avg * 0.85:
-                alerts.append({
-                    "severity": "warn",
-                    "type": "green_index_drop",
-                    "device_id": device_id,
-                    "message": f"Green index dropped {((baseline_avg - recent_avg) / abs(baseline_avg)) * 100:.0f}% from recent baseline.",
-                })
-        latest = (history[-1] if history else {}).get("movement") or {}
-        previous = (history[-6] if len(history) >= 6 else {}).get("movement") or {}
-        latest_centroid = latest.get("centroid_px")
-        previous_centroid = previous.get("centroid_px")
-        if isinstance(latest_centroid, list) and isinstance(previous_centroid, list) and len(latest_centroid) == 2 and len(previous_centroid) == 2:
-            y_shift = float(latest_centroid[1]) - float(previous_centroid[1])
-            speed = float(latest.get("speed_mm_hr") or 0)
-            if y_shift > 10 and speed > 0.5:
-                alerts.append({
-                    "severity": "warn",
-                    "type": "droop",
-                    "device_id": device_id,
-                    "message": f"Canopy centroid moved downward {y_shift:.0f}px with {speed:.2f} mm/hr movement speed.",
-                })
+        for module_name in ("circadian", "color_index", "growth"):
+            result = module_results.get(module_name)
+            if result:
+                module_alerts = result.alerts
+                if module_alerts:
+                    latest_metric = history[-1] if history else {}
+                    provenance = None
+                    filename = latest_metric.get("filename")
+                    if filename:
+                        provenance = metric_store.provenance_for_image(device_id, filename)
+                    for alert in module_alerts:
+                        alert.setdefault("analysis_run_id", latest_metric.get("analysis_run_id"))
+                        alert.setdefault("capture_set_id", latest_metric.get("capture_set_id"))
+                        alert.setdefault("experiment_id", (provenance or {}).get("experiment_id"))
+                        alert.setdefault("plant_ids", [
+                            plant.get("plant_id")
+                            for plant in (provenance or {}).get("plants", [])
+                            if plant.get("plant_id")
+                        ])
+                        alert.setdefault("observed_at", latest_metric.get("timestamp"))
+                    alerts.extend(module_alerts)
     return {"rhythms": rhythms, "alerts": alerts[-100:]}
 
 
 def _backfill_metric_history():
-    from pt.core.analysis.image_analysis import analyze_image, is_capture_image
+    from pt.core.analysis.image_analysis import analyze_image, is_capture_image, record_analysis_provenance
 
     jobs = []
     for device_id in sorted(os.listdir(CAPTURES_DIR)) if os.path.exists(CAPTURES_DIR) else []:
@@ -2118,6 +2406,13 @@ def _backfill_metric_history():
                             ))
                             movement["displacement_mm"] = displacement_px / active_scale
                             movement["speed_mm_hr"] = movement["displacement_mm"] / dt
+                capture_set_id, analysis_run_id = record_analysis_provenance(
+                    device_id,
+                    filename,
+                    os.path.join(device_path, filename),
+                    source="historical_backfill",
+                    camera_metadata={"capture_settings_status": "not_recorded_for_historical_image"},
+                )
                 entry = {
                     "timestamp": timestamp,
                     "filename": filename,
@@ -2131,8 +2426,18 @@ def _backfill_metric_history():
                     "color_metrics": result.get("color_metrics"),
                     "movement": movement,
                     "nutrient_deficiency": {},
+                    "capture_set_id": capture_set_id,
+                    "analysis_run_id": analysis_run_id,
                 }
                 metric_store.upsert_history_point(device_id, entry)
+                metric_store.upsert_plant_metric_points(
+                    device_id,
+                    timestamp,
+                    filename,
+                    result.get("tray_cells", []),
+                    capture_set_id=capture_set_id,
+                    analysis_run_id=analysis_run_id,
+                )
                 previous[device_id] = {"timestamp": timestamp, "area": area, "centroid_px": movement.get("centroid_px")}
             processed += 1
         for device_id in {job[0] for job in jobs}:
@@ -2394,6 +2699,35 @@ def get_device_capabilities():
 def get_network_camera_status():
     probe = request.args.get("probe", "0") == "1"
     return jsonify(network_camera_statuses(probe=probe))
+
+
+@app.route("/network_camera_discovery/<camera_id>/identify", methods=["POST"])
+def save_network_camera_identity(camera_id):
+    if not same_origin_mutation():
+        return jsonify({"message": "Same-origin request required."}), 403
+    payload = request.get_json(silent=True) or {}
+    try:
+        saved = set_network_camera_mac(camera_id, payload.get("mac_address"))
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+    operation_id = start_network_camera_discovery(camera_id)
+    if not operation_id:
+        return jsonify({"message": "MAC was saved but discovery could not be started."}), 409
+    return jsonify({**saved, "operation_id": operation_id}), 202
+
+
+@app.route("/network_camera_discovery/<camera_id>/scan", methods=["POST"])
+def scan_network_camera_for_discovery(camera_id):
+    if not same_origin_mutation():
+        return jsonify({"message": "Same-origin request required."}), 403
+    if camera_id not in configured_camera_ids():
+        return jsonify({"message": "Unknown or disabled network camera."}), 404
+    if not (camera_by_id(camera_id) or {}).get("mac_address"):
+        return jsonify({"message": "Pair this camera with its MAC address first."}), 400
+    operation_id = start_network_camera_discovery(camera_id)
+    if not operation_id:
+        return jsonify({"message": "Camera discovery could not be started."}), 409
+    return jsonify({"operation_id": operation_id}), 202
 
 
 def csv_value(value):
@@ -3380,6 +3714,16 @@ OBSERVATORY_DASHBOARD_HTML = """
         .chart-controls input { min-height: 34px; border-radius: 6px; border: 1px solid #3a4541; background: #101514; color: var(--text); padding: 0 8px; }
         .chart-controls input[type="range"] { padding: 0; min-height: 28px; }
         .timeline { display: grid; gap: 10px; margin-top: 12px; }
+        .capture-set-table-wrap { overflow-x: auto; margin-top: 14px; }
+        .capture-set-table { width: 100%; border-collapse: collapse; min-width: 820px; }
+        .capture-set-table th, .capture-set-table td { border: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }
+        .capture-set-table th { background: var(--panel-2); color: var(--muted); font-size: .76rem; text-transform: uppercase; }
+        .capture-set-table td { overflow-wrap: anywhere; }
+        .capture-set-detail { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }
+        .capture-set-status { font-weight: 700; text-transform: uppercase; font-size: .76rem; }
+        .capture-set-status.good { color: var(--green); }
+        .capture-set-status.marginal, .capture-set-status.not_assessed { color: var(--amber); }
+        .capture-set-status.invalid { color: var(--red); }
         .event { display: grid; grid-template-columns: 82px 1fr; gap: 10px; border-top: 1px solid #26302c; padding-top: 10px; color: #c9d3ce; }
         .event time { color: var(--muted); font-size: .78rem; }
         .log { font-family: Consolas, monospace; font-size: .76rem; white-space: pre-wrap; background: #070908; border: 1px solid #202824; border-radius: 6px; padding: 10px; max-height: 130px; overflow: auto; color: #aab7b0; }
@@ -3406,6 +3750,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             <div class="nav-item" data-view="growth" onclick="showSection('growth', this)">Growth Analytics</div>
             <div class="nav-item" data-view="movement" onclick="showSection('movement', this)">Movement</div>
             <div class="nav-item" data-view="experiments" onclick="showSection('experiments', this)">Trial Management</div>
+            <div class="nav-item" data-view="capture-sets" onclick="showSection('capture-sets', this)">Capture Sets</div>
             <div class="nav-section">Operations</div>
             <div class="nav-item" data-view="volume" onclick="showSection('volume', this)">Canopy Volume</div>
             <div class="nav-item" data-view="settings" onclick="showSection('settings', this)">Settings</div>
@@ -3749,11 +4094,21 @@ OBSERVATORY_DASHBOARD_HTML = """
                 <h3 style="margin-top:18px">Circadian Fingerprints</h3>
                 <div class="timeline" id="rhythm-list"></div>
             </section>
+            <section class="panel view-section" id="view-capture-sets">
+                <div class="panel-head">
+                    <div><h2>Capture Sets</h2><div class="muted">Observation events grouped across source images and analysis runs.</div></div>
+                    <button onclick="loadCaptureSets()" title="Refresh the observation list.">Refresh</button>
+                </div>
+                <div class="muted">Sync quality is a clock-probe uncertainty estimate, not a direct measurement of shutter skew. QC thresholds are operational indicators.</div>
+                <div id="capture-set-list" class="capture-set-table-wrap"><div class="empty">Loading CaptureSets...</div></div>
+                <div id="capture-set-detail" class="capture-set-detail"><div class="muted">Select an observation to inspect its images, metrics, analysis runs, and reconstruction status.</div></div>
+            </section>
             <section class="panel view-section" id="view-volume">
                 <h2>Canopy Volume</h2>
                 <div class="muted" style="margin-top:6px">Select cameras seeing the same plants and calibration target, confirm target dimensions, then calibrate and reconstruct.</div>
                 <div class="timeline" id="volume-camera-list"></div>
                 <div class="controls" style="max-width:520px">
+                    <select id="volume-experiment-id"><option value="">No experiment</option></select>
                     <button class="primary" onclick="captureVolumetricShot()">Capture + Reconstruct</button>
                     <button onclick="calibrateMulti()">Calibrate 3D</button>
                     <button onclick="reconstruct3D()">Run Volumetric</button>
@@ -3808,6 +4163,27 @@ OBSERVATORY_DASHBOARD_HTML = """
                             <div class="muted" id="adb-transport-status" style="margin-top:8px">Loading ADB transports...</div>
                         </div>
                     </div>
+                </div>
+                <h3 style="margin-top:18px">Network Camera Recovery</h3>
+                <div class="timeline">
+                    {% for camera_id, camera_status in network_camera_statuses.items() %}
+                    <div class="event">
+                        <time>RTSP</time>
+                        <div>
+                            <strong>{{ camera_status.name }}</strong><br>
+                            <span class="muted" id="network-camera-info-{{ camera_id }}">{{ 'Online' if camera_status.reachable else 'Offline' }}: {{ camera_status.host }}:{{ camera_status.rtsp_port }}</span>
+                            <div class="controls" style="margin-top:8px">
+                                <input id="network-camera-mac-{{ camera_id }}" type="text" maxlength="17" value="{{ camera_status.mac_address or '' }}" placeholder="Camera MAC address">
+                                <button class="primary" onclick='saveNetworkCameraMac({{ camera_id|tojson }})'>Save MAC &amp; Find</button>
+                                <button onclick='scanNetworkCamera({{ camera_id|tojson }})' {{ '' if camera_status.mac_address else 'disabled' }}>Find Camera</button>
+                            </div>
+                            <progress id="network-camera-progress-{{ camera_id }}" max="100" value="0" style="width:100%;height:8px"></progress>
+                            <div class="muted" id="network-camera-discovery-{{ camera_id }}" aria-live="polite">{{ 'MAC saved; automatic rediscovery is enabled.' if camera_status.mac_address else 'MAC not saved.' }}</div>
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="event"><time>None</time><div>No enabled network cameras are configured.</div></div>
+                    {% endfor %}
                 </div>
                 <h3 style="margin-top:18px">Long-Term Metrics</h3>
                 <div class="timeline">
@@ -4015,6 +4391,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 loadVideoImports();
             }
             if (name === 'volume') loadLandmarks();
+            if (name === 'capture-sets') loadCaptureSets();
             if (name === 'segmentation') loadSegments();
             if (name === 'segmentation' && !segmentState.deviceId) {
                 const first = Object.keys(latestStats || {})[0];
@@ -4035,9 +4412,51 @@ OBSERVATORY_DASHBOARD_HTML = """
                 }).catch(e => showOperation('Calibration failed', e.message, 'bad'));
             }
         }
-        function reconstruct3D() {
-            showOperation('Volumetric reconstruction running', 'Projecting silhouettes into the calibrated volume...');
-            fetch('/reconstruct' + selectedVolumeQuery()).then(async r => {
+        function loadCaptureSets() {
+            const root = document.getElementById('capture-set-list');
+            if (!root) return;
+            fetch('/api/capture-sets').then(async response => {
+                const body = await response.json();
+                if (!response.ok) throw new Error(body.message || 'Could not load CaptureSets');
+                return body;
+            }).then(body => renderCaptureSets(body.capture_sets || []))
+                .catch(error => { root.textContent = `CaptureSet list failed: ${error.message}`; });
+        }
+        function renderCaptureSets(captureSets) {
+            const root = document.getElementById('capture-set-list');
+            if (!root) return;
+            if (!captureSets.length) {
+                root.innerHTML = '<div class="empty">No CaptureSets have been recorded yet.</div>';
+                return;
+            }
+            root.innerHTML = `<table class="capture-set-table"><thead><tr><th>Capture Set</th><th>Time (UTC)</th><th>Experiment</th><th>Devices / Images</th><th>Sync estimate</th><th>Capture duration</th><th>QC</th><th>Runs / Reconstruction</th></tr></thead><tbody>${captureSets.map(item => `<tr><td><button class="capture-set-open" data-capture-set="${escapeAttr(item.capture_set_id)}">${escapeAttr(item.capture_set_id)}</button></td><td>${escapeAttr(item.captured_at_utc || item.created_at_utc || '--')}</td><td>${escapeAttr(item.experiment_id || 'Unassigned')}</td><td>${escapeAttr((item.successful_devices || []).join(', ') || '--')}<br>${Number(item.image_count || 0)} image(s)</td><td>${item.sync_quality_ms == null ? 'Not assessed' : `${fmt(Number(item.sync_quality_ms), 1)} ms`}</td><td>${item.capture_duration_ms == null ? 'Not recorded' : `${fmt(Number(item.capture_duration_ms), 0)} ms`}</td><td><span class="capture-set-status ${escapeAttr(item.qc_status || 'not_assessed')}">${escapeAttr(item.qc_status || 'not_assessed')}</span>${item.failed_devices?.length ? `<br>Failed: ${escapeAttr(item.failed_devices.join(', '))}` : ''}</td><td>${Number(item.analysis_run_count || 0)} run(s)<br>${escapeAttr(item.reconstruction_status || 'not_run')}</td></tr>`).join('')}</tbody></table>`;
+            root.querySelectorAll('.capture-set-open').forEach(button => button.addEventListener('click', () => openCaptureSet(button.dataset.captureSet)));
+        }
+        function openCaptureSet(captureSetId) {
+            fetch(`/api/capture-sets/${encodeURIComponent(captureSetId)}`).then(async response => {
+                const body = await response.json();
+                if (!response.ok) throw new Error(body.message || 'Could not load CaptureSet');
+                return body;
+            }).then(renderCaptureSetDetail).catch(error => {
+                const root = document.getElementById('capture-set-detail');
+                if (root) root.textContent = `CaptureSet detail failed: ${error.message}`;
+            });
+        }
+        function renderCaptureSetDetail(item) {
+            const root = document.getElementById('capture-set-detail');
+            if (!root) return;
+            const images = item.images || [];
+            const runs = item.analysis_runs || [];
+            const imageRows = images.length ? images.map(image => `<tr><td>${escapeAttr(image.device_id)}</td><td><a href="/api/capture-images/${encodeURIComponent(image.device_id)}/${encodeURIComponent(image.filename)}" target="_blank" rel="noopener">${escapeAttr(image.filename)}</a></td><td>${escapeAttr(image.captured_at_utc || '--')}</td><td>${image.area == null ? '--' : `${fmt(Number(image.area), 1)} mm²`}<br>${image.growth_rate_mm2_hr == null ? '--' : `${fmt(Number(image.growth_rate_mm2_hr), 2)} mm²/hr`}<br>${image.canopy_coverage == null ? '--' : `${fmt(Number(image.canopy_coverage) * 100, 1)}% coverage`}<br>Prior: ${image.previous_capture_set_id ? `<button class="capture-set-open" data-capture-set="${escapeAttr(image.previous_capture_set_id)}">${escapeAttr(image.previous_capture_set_id)}</button>` : '--'}</td><td>${escapeAttr((image.plants || []).map(plant => `${plant.plant_id} (${plant.tray_id || '--'}/${plant.cell_id || '--'})`).join(', ') || '--')}</td><td>${escapeAttr(image.analysis_run_id || 'No metric run')}</td></tr>`).join('') : '<tr><td colspan="6">No source images registered.</td></tr>';
+            const runRows = runs.length ? runs.map(run => `<div class="event"><time>${escapeAttr(run.created_at_utc)}</time><div><strong>${escapeAttr(run.analysis_run_id)}</strong><br>Pipeline ${escapeAttr(run.pipeline_version)}<br>Modules: ${escapeAttr((run.enabled_modules || []).map(name => `${name}@${(run.module_versions || {})[name] || 'unknown'}`).join(', ') || 'none recorded')}<br>Calibration ${escapeAttr(run.calibration_snapshot_id)} (${escapeAttr(run.calibration_hash || 'hash unavailable')})<details><summary>Calibration snapshot payload</summary><pre>${escapeAttr(JSON.stringify(run.calibration_snapshot || {}, null, 2))}</pre></details><br>Parameters ${escapeAttr(run.parameter_hash)}</div></div>`).join('') : '<div class="muted">No analysis runs yet.</div>';
+            root.innerHTML = `<div class="panel-head"><div><h3>${escapeAttr(item.capture_set_id)}</h3><div class="muted">Experiment: ${escapeAttr(item.experiment_id || 'Unassigned')} · Source: ${escapeAttr(item.source)} · QC: ${escapeAttr(item.qc_status)}</div></div><button class="primary" id="capture-set-reconstruct" ${images.length < 2 ? 'disabled' : ''}>Reconstruct this set</button></div><div class="muted">${images.length} image(s) · ${Number(item.analysis_run_count || 0)} run(s) · Reconstruction: ${escapeAttr(item.reconstruction_status || 'not_run')}</div><div class="capture-set-table-wrap"><table class="capture-set-table"><thead><tr><th>Device</th><th>Image</th><th>Captured (UTC)</th><th>Canopy metric</th><th>Plant / tray / cell</th><th>Analysis run</th></tr></thead><tbody>${imageRows}</tbody></table></div><h3 style="margin-top:18px">Analysis Runs</h3><div class="timeline">${runRows}</div>`;
+            document.getElementById('capture-set-reconstruct')?.addEventListener('click', () => reconstruct3D(item.capture_set_id));
+            root.querySelectorAll('.capture-set-open').forEach(button => button.addEventListener('click', () => openCaptureSet(button.dataset.captureSet)));
+        }
+        function reconstruct3D(captureSetId = null) {
+            showOperation('Volumetric reconstruction running', captureSetId ? `Using images from ${captureSetId}.` : 'Selecting the latest CaptureSet, then projecting its silhouettes...');
+            const url = captureSetId ? `/api/capture-sets/${encodeURIComponent(captureSetId)}/reconstruct` : '/reconstruct';
+            fetch(url, captureSetId ? {method: 'POST'} : {}).then(async r => {
                 const body = r.headers.get('content-type')?.includes('application/json') ? await r.json() : { error: await r.text() };
                 if (!r.ok) throw new Error(body.error || body.message || 'Reconstruction failed');
                 return body;
@@ -4049,6 +4468,7 @@ OBSERVATORY_DASHBOARD_HTML = """
         }
         function captureVolumetricShot() {
             const devices = Array.from(document.querySelectorAll('.volume-camera-check:checked')).map(el => el.value);
+            const experimentId = document.getElementById('volume-experiment-id')?.value || '';
             if (devices.length < 2) {
                 showOperation('Volumetric capture needs more cameras', 'Select at least two connected Android phones.', 'warn');
                 return;
@@ -4057,20 +4477,27 @@ OBSERVATORY_DASHBOARD_HTML = """
             fetch('/volumetric/capture', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({devices})
+                body: JSON.stringify({devices, experiment_id: experimentId})
             }).then(async response => {
                 const body = await response.json();
-                if (!response.ok) throw new Error(body.message || 'Synchronized capture failed');
+                if (!response.ok) {
+                    if (body.shot_id) {
+                        loadCaptureSets();
+                        openCaptureSet(body.shot_id);
+                    }
+                    throw new Error(body.message || 'Synchronized capture failed');
+                }
                 return body;
             }).then(body => {
-                showOperation('Synchronized capture complete', `${body.shot_id}: ${(body.successful_devices || []).join(', ')}. Reconstructing this camera set...`);
-                return fetch('/reconstruct?devices=' + encodeURIComponent((body.successful_devices || devices).join(',')));
+                showOperation('Synchronized capture complete', `${body.shot_id}: ${(body.successful_devices || []).join(', ')}. Estimated sync uncertainty ${fmt(Number(body.sync_quality_ms), 1)} ms. Reconstructing this set...`);
+                return fetch(`/api/capture-sets/${encodeURIComponent(body.shot_id)}/reconstruct`, {method: 'POST'});
             }).then(async response => {
                 const body = response.headers.get('content-type')?.includes('application/json') ? await response.json() : {error: await response.text()};
                 if (!response.ok) throw new Error(body.error || body.message || 'Reconstruction failed');
                 const cm3 = body.volume_mm3 ? (body.volume_mm3 / 1000).toFixed(2) : '0.00';
                 showOperation('Volumetric shot complete', `Volume: ${cm3} cm3 from synchronized phone images.`);
                 renderVolumePreview(body);
+                loadCaptureSets();
             }).catch(error => showOperation('Volumetric shot failed', error.message, 'bad'));
         }
         function loadLandmarks() {
@@ -6122,9 +6549,70 @@ OBSERVATORY_DASHBOARD_HTML = """
                 if (volumeCameras) volumeCameras.innerHTML = entries.map(([id, info]) => `<div class="event"><time><input class="volume-camera-check" type="checkbox" value="${id}" checked></time><div><strong>${id}</strong><br>${((info.data || {}).markers_found || 0)} markers, ChArUco corners ${((info.data || {}).charuco_corners_found || 0)}</div></div>`).join('');
             }).catch(e => console.error("Update Stats Error:", e));
         }
+        const networkDiscoveryPolls = new Set();
+        const networkDiscoveryFinished = new Set();
+        function networkCameraDiscoveryRequest(path, payload) {
+            return fetch(path, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload || {})
+            }).then(async response => {
+                const body = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(body.message || 'Camera discovery request failed');
+                return body;
+            });
+        }
+        function watchNetworkCameraDiscovery(cameraId, operationId) {
+            if (!operationId || networkDiscoveryPolls.has(operationId) || networkDiscoveryFinished.has(operationId)) return;
+            networkDiscoveryPolls.add(operationId);
+            const progress = document.getElementById('network-camera-progress-' + cameraId);
+            const message = document.getElementById('network-camera-discovery-' + cameraId);
+            const poll = () => fetch('/operations/' + encodeURIComponent(operationId)).then(response => response.ok ? response.json() : null).then(job => {
+                if (!job) return;
+                if (progress) progress.value = Number(job.progress || 0);
+                if (message && job.lines && job.lines.length) message.textContent = job.lines[job.lines.length - 1].replace(/^\[[^\]]+\]\s*/, '');
+                if (job.status === 'complete' || job.status === 'error') {
+                    clearInterval(timer);
+                    networkDiscoveryPolls.delete(operationId);
+                    networkDiscoveryFinished.add(operationId);
+                    const result = job.result || {};
+                    if (message) {
+                        if (job.status === 'error') message.textContent = (result.message || 'Camera discovery failed. Check the app log.');
+                        else if (result.status === 'matched') message.textContent = `Found ${result.host}:${result.rtsp_port}; address updated${result.reachable ? ' and RTSP is reachable.' : '. RTSP reachability check is pending.'}`;
+                        else if (result.status === 'ambiguous') message.textContent = 'Multiple devices matched this MAC; address was not changed.';
+                        else message.textContent = 'Camera not found; saved address was left unchanged.';
+                    }
+                    if (result.status === 'matched') loadNetworkCameraStatus(true);
+                }
+            }).catch(() => {});
+            const timer = setInterval(poll, 900);
+            poll();
+        }
+        function saveNetworkCameraMac(cameraId) {
+            const input = document.getElementById('network-camera-mac-' + cameraId);
+            const message = document.getElementById('network-camera-discovery-' + cameraId);
+            const macAddress = input ? input.value.trim() : '';
+            if (message) message.textContent = 'Saving MAC address and starting a local scan...';
+            networkCameraDiscoveryRequest('/network_camera_discovery/' + encodeURIComponent(cameraId) + '/identify', {mac_address: macAddress}).then(body => {
+                if (input) input.value = body.mac_address;
+                watchNetworkCameraDiscovery(cameraId, body.operation_id);
+            }).catch(error => { if (message) message.textContent = error.message; });
+        }
+        function scanNetworkCamera(cameraId) {
+            const message = document.getElementById('network-camera-discovery-' + cameraId);
+            if (message) message.textContent = 'Searching local private networks for the paired camera...';
+            networkCameraDiscoveryRequest('/network_camera_discovery/' + encodeURIComponent(cameraId) + '/scan', {}).then(body => {
+                watchNetworkCameraDiscovery(cameraId, body.operation_id);
+            }).catch(error => { if (message) message.textContent = error.message; });
+        }
         function loadNetworkCameraStatus(probe = false) {
             fetch('/network_camera_status' + (probe ? '?probe=1' : '')).then(r => r.json()).then(statuses => {
                 Object.assign(networkCameraStatus, statuses || {});
+                Object.entries(statuses || {}).forEach(([cameraId, status]) => {
+                    const info = document.getElementById('network-camera-info-' + cameraId);
+                    if (info) info.textContent = `${status.reachable ? 'Online' : 'Offline'}: ${status.host || 'no address'}:${status.rtsp_port || 554}`;
+                    if (status.discovery_operation) watchNetworkCameraDiscovery(cameraId, status.discovery_operation);
+                });
                 renderMovementWorkspace(latestStats);
             }).catch(() => {});
         }
@@ -6237,6 +6725,12 @@ OBSERVATORY_DASHBOARD_HTML = """
                 if (traySelect) traySelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
                 const harvestSelect = document.getElementById('harvest-experiment-id');
                 if (harvestSelect) harvestSelect.innerHTML = experiments.map(item => `<option value="${item.id}">${item.name || item.id}</option>`).join('');
+                const volumeExperimentSelect = document.getElementById('volume-experiment-id');
+                if (volumeExperimentSelect) {
+                    const selectedVolumeExperiment = volumeExperimentSelect.value;
+                    volumeExperimentSelect.innerHTML = '<option value="">No experiment</option>' + experiments.filter(item => item.status === 'active').map(item => `<option value="${escapeAttr(item.id)}">${escapeAttr(item.name || item.id)}</option>`).join('');
+                    if (experiments.some(item => item.id === selectedVolumeExperiment)) volumeExperimentSelect.value = selectedVolumeExperiment;
+                }
                 const root = document.getElementById('experiments-list');
                 if (root) root.innerHTML = experiments.length ? experiments.map(item => {
                     const related = events.filter(event => event.experiment_id === item.id).slice(-5).reverse();
@@ -6644,6 +7138,7 @@ OBSERVATORY_DASHBOARD_HTML = """
             refreshVisibleFrames();
             updateStats();
             loadActivity();
+            loadNetworkCameraStatus(false);
             if (activeView === 'experiments') loadExperiments();
         }, 30000);
         document.addEventListener('visibilitychange', () => {
@@ -6652,6 +7147,7 @@ OBSERVATORY_DASHBOARD_HTML = """
                 refreshVisibleFrames();
                 updateStats();
                 loadActivity();
+                loadNetworkCameraStatus(false);
             }
         });
         loadDeviceSettings();
@@ -6671,6 +7167,28 @@ OBSERVATORY_DASHBOARD_HTML = """
 </html>
 """
 
+def network_camera_discovery_monitor():
+    while True:
+        try:
+            if configured_camera_ids():
+                statuses = network_camera_statuses(probe=True)
+                neighbors = read_neighbor_macs()
+                for camera_id, status in statuses.items():
+                    current_mac = neighbors.get(status.get("host"))
+                    expected_mac = status.get("mac_address")
+                    if not current_mac or not expected_mac:
+                        continue
+                    try:
+                        identity_changed = normalize_mac(current_mac) != normalize_mac(expected_mac)
+                    except ValueError:
+                        identity_changed = False
+                    if identity_changed:
+                        start_network_camera_discovery(camera_id, automatic=True)
+        except Exception as exc:
+            print(f"[NETWORK_CAMERA] Discovery monitor error: {exc}")
+        time.sleep(30)
+
+
 def run_app():
     load_profiles()
     load_device_settings()
@@ -6681,6 +7199,8 @@ def run_app():
     # Start the timelapse thread immediately
     t = threading.Thread(target=timelapse_loop, daemon=True)
     t.start()
+    discovery_monitor = threading.Thread(target=network_camera_discovery_monitor, daemon=True)
+    discovery_monitor.start()
     print(f"[SERVER] Data root: {DATA_ROOT}")
     print(f"[SERVER] Captures: {CAPTURES_DIR}")
     print(f"[SERVER] Videos: {VIDEOS_DIR}")

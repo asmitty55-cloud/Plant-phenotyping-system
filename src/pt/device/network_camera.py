@@ -1,23 +1,30 @@
 import os
+import ipaddress
+import json
 import socket
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import cv2
 import numpy as np
 import yaml
 
 from pt.core.utils.path_utils import get_captures_dir, get_data_root
+from pt.device.network_camera_discovery import normalize_mac
 
 
 CONFIG_DIR = os.path.join(get_data_root(), "configs")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.yaml")
 LOCAL_CONFIG_PATH = os.path.join(CONFIG_DIR, "network_cameras.local.yaml")
+DISCOVERY_STATE_PATH = os.path.join(CONFIG_DIR, "network_camera_discovery.json")
 DEFAULT_RTSP_PATHS = ("onvif1", "onvif2")
 CAMERA_STATUS = {}
+DISCOVERY_STATE_LOCK = threading.Lock()
 
 
 def hidden_subprocess_flags():
@@ -31,7 +38,160 @@ def load_network_cameras():
     with open(config_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     cameras = data.get("network_cameras", [])
+    discovery = _load_discovery_state()
+    for camera in cameras:
+        _apply_discovery_override(camera, discovery.get(camera.get("id")))
     return [camera for camera in cameras if camera.get("enabled", True)]
+
+
+def _load_discovery_state():
+    try:
+        with open(DISCOVERY_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cameras = data.get("cameras", {}) if isinstance(data, dict) else {}
+    return cameras if isinstance(cameras, dict) else {}
+
+
+def _save_discovery_state(cameras):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    handle, temporary_path = tempfile.mkstemp(prefix="network_camera_discovery_", suffix=".tmp", dir=CONFIG_DIR)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as f:
+            json.dump({"cameras": cameras}, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, DISCOVERY_STATE_PATH)
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def _rewrite_url_host(value, old_host, new_host, old_port=None, new_port=None):
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+        if parsed.hostname != old_host:
+            return value
+        userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+        port = parsed.port
+        if parsed.scheme.lower() == "rtsp" and port in (None, old_port):
+            port = new_port if new_port != old_port else port
+        netloc = f"{userinfo}{new_host}" + (f":{port}" if port is not None else "")
+        return urlunsplit(parsed._replace(netloc=netloc))
+    except ValueError:
+        return value
+
+
+def _apply_discovery_override(camera, state):
+    if not isinstance(state, dict):
+        return
+    camera["mac_address"] = state.get("mac_address", "")
+    configured_host = state.get("configured_host")
+    discovered_host = state.get("host")
+    if not configured_host or not discovered_host or camera.get("host") != configured_host:
+        return
+    configured_port = int(state.get("configured_rtsp_port", camera.get("rtsp_port", 554)))
+    discovered_port = int(state.get("rtsp_port", configured_port))
+    camera["host"] = discovered_host
+    if int(camera.get("rtsp_port", 554)) == configured_port:
+        camera["rtsp_port"] = discovered_port
+    for key in ("stream_url", "live_stream_url", "mjpeg_url", "onvif_url"):
+        camera[key] = _rewrite_url_host(
+            camera.get(key), configured_host, discovered_host, configured_port, discovered_port
+        )
+
+
+def set_network_camera_mac(camera_id, mac_address):
+    normalized_mac = normalize_mac(mac_address)
+    config_path = LOCAL_CONFIG_PATH if os.path.exists(LOCAL_CONFIG_PATH) else CONFIG_PATH
+    if not os.path.exists(config_path):
+        raise ValueError("Network camera configuration was not found.")
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    camera = next(
+        (item for item in data.get("network_cameras", []) if item.get("id") == camera_id and item.get("enabled", True)),
+        None,
+    )
+    if camera is None:
+        raise ValueError("Unknown or disabled network camera.")
+    configured_host = str(camera.get("host") or "")
+    configured_port = int(camera.get("rtsp_port", 554))
+    with DISCOVERY_STATE_LOCK:
+        cameras = _load_discovery_state()
+        previous = cameras.get(camera_id, {})
+        if previous.get("mac_address") == normalized_mac:
+            previous.setdefault("configured_host", configured_host)
+            previous.setdefault("configured_rtsp_port", configured_port)
+        else:
+            previous = {
+                "configured_host": configured_host,
+                "configured_rtsp_port": configured_port,
+                "host": configured_host,
+                "rtsp_port": configured_port,
+            }
+        previous["mac_address"] = normalized_mac
+        cameras[camera_id] = previous
+        _save_discovery_state(cameras)
+    CAMERA_STATUS.pop(camera_id, None)
+    return {"id": camera_id, "mac_address": normalized_mac, "host": previous.get("host", configured_host)}
+
+
+def _configured_camera_from_file(camera_id):
+    config_path = LOCAL_CONFIG_PATH if os.path.exists(LOCAL_CONFIG_PATH) else CONFIG_PATH
+    if not os.path.exists(config_path):
+        return None
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return next(
+        (item for item in data.get("network_cameras", []) if item.get("id") == camera_id and item.get("enabled", True)),
+        None,
+    )
+
+
+def update_discovered_network_camera(camera_id, candidate):
+    if not isinstance(candidate, dict):
+        raise ValueError("A discovered camera candidate is required.")
+    host = str(candidate.get("host") or "")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError("The discovered camera address is invalid.") from exc
+    if address.version != 4 or not address.is_private or address.is_loopback or address.is_link_local:
+        raise ValueError("The discovered camera must use a private IPv4 address.")
+    mac_address = normalize_mac(candidate.get("mac_address"))
+    rtsp_port = int(candidate.get("rtsp_port", 0))
+    if rtsp_port not in (554, 8554):
+        raise ValueError("The discovered RTSP port is not supported.")
+    configured_camera = _configured_camera_from_file(camera_id)
+    if configured_camera is None:
+        raise ValueError("Unknown or disabled network camera.")
+    configured_host = str(configured_camera.get("host") or "")
+    configured_port = int(configured_camera.get("rtsp_port", 554))
+
+    with DISCOVERY_STATE_LOCK:
+        cameras = _load_discovery_state()
+        state = cameras.get(camera_id)
+        if not isinstance(state, dict) or state.get("mac_address") != mac_address:
+            raise ValueError("Discovered MAC address does not match the paired camera.")
+        if (
+            state.get("configured_host") != configured_host
+            or int(state.get("configured_rtsp_port", configured_port)) != configured_port
+        ):
+            state["configured_host"] = configured_host
+            state["configured_rtsp_port"] = configured_port
+        state["host"] = host
+        state["rtsp_port"] = rtsp_port
+        state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        cameras[camera_id] = state
+        _save_discovery_state(cameras)
+    CAMERA_STATUS.pop(camera_id, None)
+    return {"id": camera_id, "host": host, "rtsp_port": rtsp_port, "mac_address": mac_address}
 
 
 def configured_camera_ids():
@@ -106,6 +266,7 @@ def network_camera_status(camera_id, probe=False):
         "name": camera.get("name") or camera_id,
         "host": camera.get("host"),
         "rtsp_port": int(camera.get("rtsp_port", 554)),
+        "mac_address": camera.get("mac_address") or "",
     })
     CAMERA_STATUS[camera_id] = cached
     return cached

@@ -4,11 +4,25 @@ import os
 import json
 import time
 import re
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pt.core.utils.path_utils import get_data_root
 from pt.core.analysis.metrics import build_metrics_snapshot
+from pt.core.analysis.modules import AnalysisObservation
+from pt.core.analysis.registry import ANALYSIS_REGISTRY
 from pt.core.analysis.calibration_store import calib_store
 from pt.core.analysis.charuco_catalog import default_target, load_catalog
-from pt.core.analysis.metric_store import refresh_rollups, upsert_history_point, upsert_plant_metric_points
+from pt.core.analysis.metric_store import (
+    create_analysis_run,
+    create_calibration_snapshot,
+    capture_set_context,
+    ensure_capture_image,
+    previous_metric_in_experiment,
+    provenance_for_image,
+    refresh_rollups,
+    upsert_history_point,
+    upsert_plant_metric_points,
+)
 from pt.core.analysis.segmentation_store import segmentation_store
 from pt.core.analysis.tray_store import analyze_device_cells
 
@@ -26,6 +40,91 @@ CAPTURE_IMAGE_RE = re.compile(r"^capture_\d{8}_\d{6}\.(jpg|jpeg|png)$", re.IGNOR
 MAX_HISTORY_ENTRIES = 10000
 SCALE_REJECT_RATIO_LOW = 0.65
 SCALE_REJECT_RATIO_HIGH = 1.55
+CANOPY_SEGMENTATION_PARAMETERS = {
+    "green_hsv_lower": [25, 20, 20],
+    "green_hsv_upper": [95, 255, 255],
+    "broad_vegetation_hsv_lower": [18, 35, 35],
+    "broad_vegetation_hsv_upper": [105, 255, 255],
+    "excess_green_threshold": "otsu_after_minmax_normalization",
+    "morphology_kernel_px": 5,
+}
+IMAGE_PREPROCESSING_PARAMETERS = {
+    "channels": ["green", "blue", "grayscale", "inverted_grayscale"],
+    "clahe_clip_limit": 3.0,
+    "clahe_grid_size": [8, 8],
+    "gaussian_blur_kernel_px": [3, 3],
+    "sharpen_kernel": [[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]],
+    "adaptive_threshold": {"method": "gaussian", "block_size_px": 41, "constant": 5},
+}
+DETECTOR_PARAMETERS = {
+    "adaptive_thresh_window_min": 3,
+    "adaptive_thresh_window_max": 23,
+    "adaptive_thresh_window_step": 10,
+    "adaptive_thresh_constant": 7,
+    "min_marker_perimeter_rate": 0.04,
+    "max_marker_perimeter_rate": 4.0,
+    "polygonal_approximation_rate": 0.03,
+    "perspective_remove_margin": 0.13,
+    "max_erroneous_bits_border_rate": 0.25,
+    "error_correction_rate": 0.6,
+}
+
+
+def _pipeline_version():
+    try:
+        return version("plant-phenotyping-system")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _capture_time_utc(filename):
+    match = CAPTURE_IMAGE_RE.match(filename)
+    if not match:
+        return None
+    timestamp_text = filename.rsplit("_", 1)[-1].rsplit(".", 1)[0]
+    date_text = filename.split("_", 1)[1][:8]
+    try:
+        local_time = datetime.strptime(f"{date_text}_{timestamp_text}", "%Y%m%d_%H%M%S")
+        return local_time.astimezone(timezone.utc).isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+
+def analysis_parameter_snapshot():
+    return {
+        "analysis_revision": "image-analysis.v1",
+        "metrics_schema": "plant_metrics.v1",
+        "preprocessing": IMAGE_PREPROCESSING_PARAMETERS,
+        "aruco_detector": DETECTOR_PARAMETERS,
+        "canopy_segmentation": CANOPY_SEGMENTATION_PARAMETERS,
+        "scale_rejection_ratio": [SCALE_REJECT_RATIO_LOW, SCALE_REJECT_RATIO_HIGH],
+        "runtime": {"opencv": cv2.__version__, "numpy": np.__version__},
+    }
+
+
+def record_analysis_provenance(device_id, filename, image_path, capture_set_id=None,
+                               experiment_id=None, captured_at_utc=None,
+                               camera_metadata=None, source="analysis"):
+    capture_set_id = ensure_capture_image(
+        device_id,
+        filename,
+        image_path,
+        capture_set_id=capture_set_id,
+        experiment_id=experiment_id,
+        captured_at_utc=captured_at_utc or _capture_time_utc(filename),
+        camera_metadata=camera_metadata,
+        source=source,
+    )
+    calibration_snapshot_id = create_calibration_snapshot(calib_store.data)
+    analysis_run_id = create_analysis_run(
+        capture_set_id,
+        calibration_snapshot_id,
+        _pipeline_version(),
+        analysis_parameter_snapshot(),
+        enabled_modules=ANALYSIS_REGISTRY.names(enabled_only=True),
+        module_versions=ANALYSIS_REGISTRY.module_versions(),
+    )
+    return capture_set_id, analysis_run_id
 
 
 def get_charuco_target(device_id=None):
@@ -46,16 +145,16 @@ def is_capture_image(filename):
 def get_detector_params():
     params = cv2.aruco.DetectorParameters()
     # Balanced for 3D prints: allow some error but keep geometry strict
-    params.adaptiveThreshWinSizeMin = 3
-    params.adaptiveThreshWinSizeMax = 23
-    params.adaptiveThreshWinSizeStep = 10
-    params.adaptiveThreshConstant = 7
-    params.minMarkerPerimeterRate = 0.04
-    params.maxMarkerPerimeterRate = 4.0
-    params.polygonalApproxAccuracyRate = 0.03
-    params.perspectiveRemoveIgnoredMarginPerCell = 0.13
-    params.maxErroneousBitsInBorderRate = 0.25 # Balanced for 3D print artifacts
-    params.errorCorrectionRate = 0.6
+    params.adaptiveThreshWinSizeMin = DETECTOR_PARAMETERS["adaptive_thresh_window_min"]
+    params.adaptiveThreshWinSizeMax = DETECTOR_PARAMETERS["adaptive_thresh_window_max"]
+    params.adaptiveThreshWinSizeStep = DETECTOR_PARAMETERS["adaptive_thresh_window_step"]
+    params.adaptiveThreshConstant = DETECTOR_PARAMETERS["adaptive_thresh_constant"]
+    params.minMarkerPerimeterRate = DETECTOR_PARAMETERS["min_marker_perimeter_rate"]
+    params.maxMarkerPerimeterRate = DETECTOR_PARAMETERS["max_marker_perimeter_rate"]
+    params.polygonalApproxAccuracyRate = DETECTOR_PARAMETERS["polygonal_approximation_rate"]
+    params.perspectiveRemoveIgnoredMarginPerCell = DETECTOR_PARAMETERS["perspective_remove_margin"]
+    params.maxErroneousBitsInBorderRate = DETECTOR_PARAMETERS["max_erroneous_bits_border_rate"]
+    params.errorCorrectionRate = DETECTOR_PARAMETERS["error_correction_rate"]
     return params
 
 def try_detect(img, dict_name, aruco_dict, params):
@@ -293,17 +392,18 @@ def calculate_canopy_metrics(frame, px_per_mm, device_id=None, auto_ignore_mask=
     exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, exg_mask = cv2.threshold(exg_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    lower_green = np.array([25, 20, 20])
-    upper_green = np.array([95, 255, 255])
+    lower_green = np.array(CANOPY_SEGMENTATION_PARAMETERS["green_hsv_lower"])
+    upper_green = np.array(CANOPY_SEGMENTATION_PARAMETERS["green_hsv_upper"])
     green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    lower_yellow_green = np.array([18, 35, 35])
-    upper_yellow_green = np.array([105, 255, 255])
+    lower_yellow_green = np.array(CANOPY_SEGMENTATION_PARAMETERS["broad_vegetation_hsv_lower"])
+    upper_yellow_green = np.array(CANOPY_SEGMENTATION_PARAMETERS["broad_vegetation_hsv_upper"])
     broad_vegetation_mask = cv2.inRange(hsv, lower_yellow_green, upper_yellow_green)
 
     mask = cv2.bitwise_or(green_mask, cv2.bitwise_and(exg_mask, broad_vegetation_mask))
 
-    kernel = np.ones((5, 5), np.uint8)
+    kernel_size = CANOPY_SEGMENTATION_PARAMETERS["morphology_kernel_px"]
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
@@ -704,94 +804,21 @@ def calculate_segment_metrics(mask, px_per_mm, device_id):
 
 
 def median_metric(entries, path):
-    values = []
-    for entry in entries:
-        current = entry
-        for key in path:
-            if not isinstance(current, dict) or key not in current:
-                current = None
-                break
-            current = current[key]
-        if isinstance(current, (int, float)):
-            values.append(float(current))
-    return float(np.median(values)) if values else None
+    from pt.core.analysis.color_index import median_metric as module_median_metric
+
+    return module_median_metric(entries, path)
 
 
 def build_color_baseline(history, existing_baseline=None, max_samples=8):
-    valid = [
-        entry for entry in history
-        if entry.get("color_metrics") and entry.get("area", 0) > 0
-    ]
-    if len(valid) < 3:
-        return existing_baseline or {"status": "collecting", "samples": len(valid)}
+    from pt.core.analysis.color_index import build_color_baseline as module_build_color_baseline
 
-    samples = valid[:max_samples]
-    baseline = {
-        "status": "ready",
-        "samples": len(samples),
-        "canopy_area_mm2": median_metric(samples, ["area"]),
-        "green_index": median_metric(samples, ["color_metrics", "green_index"]),
-        "chlorosis_ratio": median_metric(samples, ["color_metrics", "chlorosis_ratio"]),
-        "mean_hue": median_metric(samples, ["color_metrics", "mean_hue"]),
-        "mean_saturation": median_metric(samples, ["color_metrics", "mean_saturation"]),
-        "mean_value": median_metric(samples, ["color_metrics", "mean_value"]),
-    }
-    return baseline
+    return module_build_color_baseline(history, existing_baseline, max_samples)
 
 
 def evaluate_nutrient_flags(color_metrics, baseline):
-    if not color_metrics or not baseline or baseline.get("status") != "ready":
-        return {
-            "status": "baseline_collecting",
-            "severity": "none",
-            "score": 0.0,
-            "flags": [],
-            "deltas": {},
-        }
+    from pt.core.analysis.color_index import evaluate_nutrient_flags as module_evaluate_nutrient_flags
 
-    deltas = {}
-    flags = []
-    score = 0.0
-
-    green_base = baseline.get("green_index")
-    if green_base not in (None, 0):
-        green_drop = (green_base - color_metrics.get("green_index", green_base)) / max(abs(green_base), 0.01)
-        deltas["green_index_drop_fraction"] = float(green_drop)
-        if green_drop > 0.18:
-            flags.append("green_index_drop")
-            score += min(green_drop, 0.5)
-
-    chlorosis_base = baseline.get("chlorosis_ratio")
-    if chlorosis_base is not None:
-        chlorosis_rise = color_metrics.get("chlorosis_ratio", chlorosis_base) - chlorosis_base
-        deltas["chlorosis_ratio_delta"] = float(chlorosis_rise)
-        if chlorosis_rise > 0.12:
-            flags.append("chlorosis_increase")
-            score += min(chlorosis_rise * 2.5, 0.5)
-
-    saturation_base = baseline.get("mean_saturation")
-    if saturation_base not in (None, 0):
-        saturation_drop = (saturation_base - color_metrics.get("mean_saturation", saturation_base)) / saturation_base
-        deltas["saturation_drop_fraction"] = float(saturation_drop)
-        if saturation_drop > 0.15:
-            flags.append("desaturation")
-            score += min(saturation_drop, 0.35)
-
-    severity = "none"
-    if score >= 0.55:
-        severity = "high"
-    elif score >= 0.3:
-        severity = "medium"
-    elif flags:
-        severity = "low"
-
-    return {
-        "status": "ready",
-        "severity": severity,
-        "score": float(min(score, 1.0)),
-        "flags": flags,
-        "deltas": deltas,
-    }
+    return module_evaluate_nutrient_flags(color_metrics, baseline)
 
 
 def make_json_safe(value):
@@ -832,7 +859,7 @@ def summarize_charuco_detections(detections):
         })
     return summaries
 
-def analyze_image(image_path, device_id=None):
+def analyze_image(image_path, device_id=None, persist_artifacts=True, persist_state=True):
     """
     Detects ArUco markers with aggressive multi-channel fallback for 3D prints & grow lights.
     """
@@ -864,7 +891,10 @@ def analyze_image(image_path, device_id=None):
         used_method = None
         charuco_detection = None
 
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        clahe = cv2.createCLAHE(
+            clipLimit=IMAGE_PREPROCESSING_PARAMETERS["clahe_clip_limit"],
+            tileGridSize=tuple(IMAGE_PREPROCESSING_PARAMETERS["clahe_grid_size"]),
+        )
 
         # Create a persistent debug frame for drawing
         debug_frame = frame.copy()
@@ -877,15 +907,22 @@ def analyze_image(image_path, device_id=None):
 
             # 2. Smooth 3D Print Noise (striations)
             # A slight blur helps remove layer lines that look like false "bits"
-            blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            blurred = cv2.GaussianBlur(enhanced, tuple(IMAGE_PREPROCESSING_PARAMETERS["gaussian_blur_kernel_px"]), 0)
 
             # 3. Sharpen Edges
-            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            kernel = np.array(IMAGE_PREPROCESSING_PARAMETERS["sharpen_kernel"])
             sharpened = cv2.filter2D(blurred, -1, kernel)
 
             attempt_images = [
                 ("", sharpened),
-                (" threshold", cv2.adaptiveThreshold(sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 5)),
+                (" threshold", cv2.adaptiveThreshold(
+                    sharpened,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    IMAGE_PREPROCESSING_PARAMETERS["adaptive_threshold"]["block_size_px"],
+                    IMAGE_PREPROCESSING_PARAMETERS["adaptive_threshold"]["constant"],
+                )),
             ]
 
             if charuco_detection is None:
@@ -1020,22 +1057,40 @@ def analyze_image(image_path, device_id=None):
                 all_charuco_detections,
                 results.get("color_boards") or [],
             )
-            canopy = calculate_canopy_metrics(
-                frame,
-                results["scale_px_per_mm"],
-                device_id,
-                auto_ignore_mask=auto_ignore_mask,
+            canopy_observation = AnalysisObservation(
+                device_id=device_id or "",
+                frame=frame,
+                context={
+                    "scale_px_per_mm": results["scale_px_per_mm"],
+                    "auto_ignore_mask": auto_ignore_mask,
+                    "canopy_calculator": calculate_canopy_metrics,
+                },
             )
+            ANALYSIS_REGISTRY.run(canopy_observation, {"canopy"})
+            canopy = canopy_observation.metrics.get("canopy")
+            if canopy is None:
+                canopy = {
+                    "canopy_area_mm2": 0.0,
+                    "canopy_pixels": 0,
+                    "canopy_coverage": 0.0,
+                    "bounding_box": None,
+                    "color_metrics": {},
+                    "mask": None,
+                    "auto_ignore": {},
+                }
             plant_area = canopy["canopy_area_mm2"]
             plant_mask = canopy["mask"]
-            color_correction = calculate_color_correction(frame, plant_mask, device_id, results.get("color_boards", []))
+            color_correction = (
+                calculate_color_correction(frame, plant_mask, device_id, results.get("color_boards", []))
+                if ANALYSIS_REGISTRY.is_enabled("color_index") else {}
+            )
             tray_cells = analyze_device_cells(
                 device_id,
                 plant_mask,
                 results["scale_px_per_mm"],
                 time.strftime("%Y-%m-%d %H:%M:%S"),
                 os.path.basename(image_path),
-            ) if device_id else []
+            ) if device_id and persist_state else []
             results.update({
                 "plant_area_mm2": plant_area,
                 "canopy_area_mm2": plant_area,
@@ -1088,14 +1143,15 @@ def analyze_image(image_path, device_id=None):
             print(f"[ANALYSIS] Failed to find markers in {image_path} after trying Green, Blue, and Gray channels.")
 
         # Save debug
-        debug_dir = os.path.join(get_data_root(), "analysis_debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        debug_path = os.path.join(debug_dir, os.path.basename(image_path))
-        cv2.imwrite(debug_path, debug_frame)
-        results["debug_image"] = debug_path
+        if persist_artifacts:
+            debug_dir = os.path.join(get_data_root(), "analysis_debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, os.path.basename(image_path))
+            cv2.imwrite(debug_path, debug_frame)
+            results["debug_image"] = debug_path
 
         # Save mask for volumetric reconstruction
-        if results.get("mask") is not None:
+        if persist_artifacts and results.get("mask") is not None:
             mask_path = image_path.rsplit(".", 1)[0] + "_mask.png"
             cv2.imwrite(mask_path, results["mask"])
             results["mask_path"] = mask_path
@@ -1107,7 +1163,7 @@ def analyze_image(image_path, device_id=None):
         traceback.print_exc()
         return None
 
-def process_latest_captures(captures_dir):
+def process_latest_captures(captures_dir, capture_set_ids=None, capture_metadata_by_device=None, device_ids=None):
     stats_file = os.path.join(get_data_root(), "plant_stats.json")
     all_stats = {}
     if os.path.exists(stats_file):
@@ -1119,7 +1175,12 @@ def process_latest_captures(captures_dir):
     fastest_rate = -1.0
     winner_id = None
 
+    capture_set_ids = capture_set_ids or {}
+    capture_metadata_by_device = capture_metadata_by_device or {}
+    selected_devices = set(device_ids) if device_ids is not None else None
     for device_id in os.listdir(captures_dir):
+        if selected_devices is not None and device_id not in selected_devices:
+            continue
         device_path = os.path.join(captures_dir, device_id)
         if not os.path.isdir(device_path): continue
         files = sorted([f for f in os.listdir(device_path) if is_capture_image(f)])
@@ -1133,6 +1194,33 @@ def process_latest_captures(captures_dir):
             all_stats[device_id]["is_fastest"] = False
 
             history = all_stats[device_id].get("history", [])
+            capture_metadata = capture_metadata_by_device.get(device_id, {})
+            capture_path = os.path.join(device_path, files[-1])
+            capture_set_id = ensure_capture_image(
+                device_id,
+                files[-1],
+                capture_path,
+                capture_set_id=capture_set_ids.get(device_id),
+                experiment_id=capture_metadata.get("experiment_id"),
+                captured_at_utc=capture_metadata.get("captured_at_utc") or _capture_time_utc(files[-1]),
+                camera_metadata=capture_metadata.get("camera_settings"),
+                source=capture_metadata.get("source", "analysis"),
+            )
+            capture_context = capture_set_context(capture_set_id) or {}
+            capture_time_utc = capture_context.get("captured_at_utc") or _capture_time_utc(files[-1])
+            experiment_id = capture_context.get("experiment_id")
+            previous_observation = (
+                previous_metric_in_experiment(capture_set_id, device_id)
+                if experiment_id else None
+            )
+            previous_history = history[-1] if history and not experiment_id else None
+            previous_capture_set_id = (
+                previous_observation.get("capture_set_id") if previous_observation else None
+            )
+            if capture_time_utc:
+                history_timestamp = datetime.fromisoformat(capture_time_utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                history_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             current_area = float(results.get("plant_area_mm2", 0))
             detected_scale = float(results["scale_px_per_mm"]) if results.get("scale_px_per_mm") else None
             stable_scale = all_stats[device_id].get("stable_scale_px_per_mm")
@@ -1172,40 +1260,46 @@ def process_latest_captures(captures_dir):
                         ],
                         detected_scale,
                     ]))
-            baseline = build_color_baseline(history, all_stats[device_id].get("baseline"))
-            deficiency = evaluate_nutrient_flags(results.get("color_metrics"), baseline)
-
-            # Calculate Growth Rate (mm2 / hour)
-            growth_rate = 0.0
-            movement = {
+            previous_measurement = previous_observation or previous_history
+            observation = AnalysisObservation(
+                device_id=device_id,
+                history=history,
+                previous=previous_measurement,
+                metrics={
+                    "plant_area_mm2": current_area,
+                    "scale_px_per_mm": results.get("scale_px_per_mm"),
+                    "canopy_bounding_box": results.get("canopy_bounding_box"),
+                    "color_metrics": results.get("color_metrics"),
+                },
+                context={
+                    "previous_observation": previous_observation,
+                    "capture_time_utc": capture_time_utc,
+                    "now_timestamp": time.time(),
+                    "existing_baseline": all_stats[device_id].get("baseline"),
+                },
+            )
+            module_results = ANALYSIS_REGISTRY.run(observation, {"growth", "color_index"})
+            growth_result = module_results.get("growth")
+            color_result = module_results.get("color_index")
+            growth_metrics = growth_result.metrics if growth_result else {}
+            color_metrics = color_result.metrics if color_result else {}
+            growth_rate = growth_metrics.get("growth_rate_mm2_hr", 0.0)
+            movement = growth_metrics.get("movement", {
                 "centroid_px": (results.get("canopy_bounding_box") or {}).get("center"),
                 "displacement_mm": 0.0,
                 "speed_mm_hr": 0.0,
-            }
-            if len(history) >= 1:
-                last_entry = history[-1]
-                try:
-                    t1 = time.mktime(time.strptime(last_entry["timestamp"], "%Y-%m-%d %H:%M:%S"))
-                    t2 = time.time()
-                    hours = (t2 - t1) / 3600.0
-                    if hours > 0.01:
-                        growth_rate = (current_area - (last_entry.get("area") or 0)) / hours
-                        current_centroid = movement.get("centroid_px")
-                        previous_centroid = (last_entry.get("movement") or {}).get("centroid_px")
-                        active_scale = float(results.get("scale_px_per_mm") or 0)
-                        if current_centroid and previous_centroid and active_scale > 0:
-                            displacement_px = float(np.linalg.norm(
-                                np.asarray(current_centroid, dtype=np.float32)
-                                - np.asarray(previous_centroid, dtype=np.float32)
-                            ))
-                            displacement_mm = displacement_px / active_scale
-                            movement["displacement_mm"] = displacement_mm
-                            movement["speed_mm_hr"] = displacement_mm / hours
-                except: pass
+            })
+            baseline = color_metrics.get("baseline", all_stats[device_id].get("baseline", {"status": "collecting", "samples": 0}))
+            deficiency = color_metrics.get("nutrient_deficiency", {
+                "status": "baseline_collecting", "severity": "none", "score": 0.0, "flags": [], "deltas": {},
+            })
             results["movement"] = movement
 
+            existing_provenance = provenance_for_image(device_id, files[-1])
+            needs_provenance = not existing_provenance or not existing_provenance.get("analysis_run_id")
+
             all_stats[device_id].update({
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": history_timestamp,
                 "filename": files[-1],
                 "data": serialize_analysis_results(results),
                 "growth_rate_mm2_hr": growth_rate,
@@ -1220,9 +1314,9 @@ def process_latest_captures(captures_dir):
                 )
             })
 
-            if not history or history[-1]["filename"] != files[-1]:
-                history_entry = {
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            is_new_history = not history or history[-1]["filename"] != files[-1]
+            history_entry = {
+                    "timestamp": history_timestamp,
                     "filename": files[-1],
                     "scale": float(results["scale_px_per_mm"]) if results["scale_px_per_mm"] else None,
                     "detected_scale": detected_scale,
@@ -1237,11 +1331,34 @@ def process_latest_captures(captures_dir):
                     "color_boards": results.get("color_boards", []),
                     "nutrient_deficiency": deficiency,
                     "movement": movement,
+                    "previous_capture_set_id": previous_capture_set_id,
                 }
+            if is_new_history:
                 history.append(history_entry)
+            if is_new_history or needs_provenance:
+                _, analysis_run_id = record_analysis_provenance(
+                    device_id,
+                    files[-1],
+                    os.path.join(device_path, files[-1]),
+                    capture_set_id=capture_set_id,
+                    experiment_id=capture_metadata.get("experiment_id"),
+                    captured_at_utc=capture_metadata.get("captured_at_utc"),
+                    camera_metadata=capture_metadata.get("camera_settings"),
+                    source=capture_metadata.get("source", "analysis"),
+                )
+                history_entry["capture_set_id"] = capture_set_id
+                history_entry["analysis_run_id"] = analysis_run_id
                 upsert_history_point(device_id, history_entry)
-                upsert_plant_metric_points(device_id, history_entry["timestamp"], files[-1], results.get("tray_cells", []))
+                upsert_plant_metric_points(
+                    device_id,
+                    history_entry["timestamp"],
+                    files[-1],
+                    results.get("tray_cells", []),
+                    capture_set_id=capture_set_id,
+                    analysis_run_id=analysis_run_id,
+                )
                 refresh_rollups(device_id)
+            if is_new_history:
                 all_stats[device_id]["history"] = history[-MAX_HISTORY_ENTRIES:]
 
             if growth_rate > fastest_rate:
